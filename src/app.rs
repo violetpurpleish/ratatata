@@ -22,8 +22,16 @@ use crate::sidebar::{Kind, Sidebar};
 const MESSAGE_TTL: Duration = Duration::from_secs(4);
 
 /// Max interval between two clicks on the same sidebar entry for them to
-/// count as a double-click.
-const DOUBLE_CLICK_TTL: Duration = Duration::from_millis(400);
+/// count as a double-click (which opens the entry).
+const SIDEBAR_CLICK_TTL: Duration = Duration::from_millis(400);
+
+/// Max interval between consecutive editor clicks at the same position for
+/// them to count as a double- (word) or triple-click (line). Deliberately
+/// shorter than the OS double-click window: a single click followed by a
+/// separate double-click (a very common habit) would otherwise drift into a
+/// triple-click and select the whole line. Genuine double- and triple-clicks
+/// are almost always much faster than this.
+const EDITOR_CLICK_TTL: Duration = Duration::from_millis(250);
 
 const SIDEBAR_WIDTH: u16 = 28;
 const STATUS_HEIGHT: u16 = 1;
@@ -33,6 +41,10 @@ pub enum Focus {
     Sidebar,
     Editor,
 }
+
+/// A click on the editor: (time, buffer position, consecutive-click count).
+/// The position is `None` when the click misses the text area.
+type EditorClick = (Instant, Option<(usize, usize)>, u32);
 
 pub struct App {
     pub buffer: Buffer,
@@ -55,6 +67,9 @@ pub struct App {
     editor_area: Rect,
     /// Last click on the sidebar, for double-click detection.
     last_sidebar_click: Option<(Instant, usize)>,
+    /// Last click in the editor, for double-click (word) and triple-click
+    /// (line) selection.
+    last_editor_click: Option<EditorClick>,
 }
 
 impl App {
@@ -89,6 +104,7 @@ impl App {
             sidebar_area: Rect::default(),
             editor_area: Rect::default(),
             last_sidebar_click: None,
+            last_editor_click: None,
         })
     }
 
@@ -310,17 +326,45 @@ impl App {
                     }
                 } else if self.in_editor(pos) {
                     self.focus = Focus::Editor;
-                    if event.modifiers.contains(KeyModifiers::SHIFT) {
-                        if !self.buffer.selecting {
-                            self.buffer.begin_selection();
+                    let click = self.editor_cursor_at(pos);
+                    // consecutive clicks on the same position within
+                    // EDITOR_CLICK_TTL count up: 2 = double-click (select
+                    // word), 3 = triple-click (select line); a different
+                    // position or a pause resets, and a 4th rapid click
+                    // starts a fresh sequence (so extra clicks never get
+                    // stuck selecting the line)
+                    let count = match self.last_editor_click {
+                        Some((t, p, c)) if t.elapsed() < EDITOR_CLICK_TTL && p == click => {
+                            if c >= 3 { 1 } else { c + 1 }
                         }
-                    } else {
-                        self.buffer.clear_selection();
+                        _ => 1,
+                    };
+                    self.last_editor_click = Some((Instant::now(), click, count));
+                    match count {
+                        2 => {
+                            if let Some((line, col)) = click {
+                                self.buffer.select_word_at((col, line));
+                            }
+                        }
+                        3 => {
+                            if let Some((line, _)) = click {
+                                self.buffer.select_line(line);
+                            }
+                        }
+                        _ => {
+                            if event.modifiers.contains(KeyModifiers::SHIFT) {
+                                if !self.buffer.selecting {
+                                    self.buffer.begin_selection();
+                                }
+                            } else {
+                                self.buffer.clear_selection();
+                            }
+                            if let Some((line, col)) = click {
+                                self.buffer.cursor = (col, line);
+                            }
+                        }
                     }
-                    if let Some((line, col)) = self.editor_cursor_at(pos) {
-                        self.buffer.cursor = (col, line);
-                        self.ensure_cursor_visible();
-                    }
+                    self.ensure_cursor_visible();
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -332,7 +376,7 @@ impl App {
                     let entry = self.sidebar.selected;
                     let double = self
                         .last_sidebar_click
-                        .is_some_and(|(t, i)| i == entry && t.elapsed() < DOUBLE_CLICK_TTL);
+                        .is_some_and(|(t, i)| i == entry && t.elapsed() < SIDEBAR_CLICK_TTL);
                     self.last_sidebar_click = Some((Instant::now(), entry));
                     if double {
                         self.open_selected();
@@ -344,12 +388,28 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.in_editor(pos) {
                     self.focus = Focus::Editor;
-                    if !self.buffer.selecting {
-                        self.buffer.begin_selection();
-                    }
-                    if let Some((line, col)) = self.editor_cursor_at(pos) {
-                        self.buffer.cursor = (col, line);
-                        self.ensure_cursor_visible();
+                    // a drag right after a double-/triple-click extends the
+                    // selection word-/line-wise (like most editors); it also
+                    // means small hand jitter while clicking snaps back to
+                    // the same word instead of growing the selection
+                    let click_count = self.last_editor_click.map_or(1, |(_, _, c)| c);
+                    if click_count >= 2 {
+                        if let Some((line, col)) = self.editor_cursor_at(pos) {
+                            if click_count == 2 {
+                                self.buffer.extend_selection_word_at((col, line));
+                            } else {
+                                self.buffer.extend_selection_line_at((col, line));
+                            }
+                            self.ensure_cursor_visible();
+                        }
+                    } else {
+                        if !self.buffer.selecting {
+                            self.buffer.begin_selection();
+                        }
+                        if let Some((line, col)) = self.editor_cursor_at(pos) {
+                            self.buffer.cursor = (col, line);
+                            self.ensure_cursor_visible();
+                        }
                     }
                 } else if self.in_sidebar(pos) {
                     self.focus = Focus::Sidebar;
@@ -1334,6 +1394,179 @@ mod tests {
         };
         app.handle_mouse(shift_click);
         assert_eq!(app.buffer.selection_range(), Some(((2, 0), (5, 0))));
+    }
+
+    #[test]
+    fn double_click_selects_word() {
+        let dir = scratch("mdblword");
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello brave world\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+
+        // terminal col 37 = char 6 = 'b' of "brave"
+        let click = |kind| mouse(kind, 37, 1);
+        // first click just places the cursor
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.buffer.has_selection());
+        assert_eq!(app.buffer.cursor, (6, 0));
+
+        // second click on the same spot within the TTL selects the word
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        assert_eq!(app.buffer.selected_text().as_deref(), Some("brave"));
+        // selecting is finished (mouse released)
+        assert!(!app.buffer.selecting);
+    }
+
+    #[test]
+    fn triple_click_selects_line() {
+        let dir = scratch("mtriple");
+        let file = dir.join("a.txt");
+        fs::write(&file, "one two three\nfour five\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+
+        let click = |kind| mouse(kind, 31, 1); // char 0 of line 0
+        for _ in 0..3 {
+            app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+            app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        }
+        assert_eq!(app.buffer.selected_text().as_deref(), Some("one two three"));
+        assert_eq!(app.buffer.selection_range(), Some(((0, 0), (13, 0))));
+
+        // a fourth rapid click starts a fresh sequence: it's a plain click
+        // and clears the line selection (extra clicks never get stuck)
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.buffer.has_selection());
+    }
+
+    #[test]
+    fn single_click_then_double_click_selects_word_not_line() {
+        let dir = scratch("mdblafterclick");
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello brave world\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+
+        let click = |kind| mouse(kind, 37, 1); // char 6 = 'b' of "brave"
+        // the user clicks once to place the cursor...
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        // ...hesitates longer than the editor click window...
+        app.last_editor_click =
+            Some((Instant::now() - Duration::from_millis(300), Some((6, 0)), 1));
+        // ...then double-clicks the same word
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        // the double-click selects the word, not the whole line
+        assert_eq!(app.buffer.selected_text().as_deref(), Some("brave"));
+    }
+
+    #[test]
+    fn drag_after_double_click_extends_by_word() {
+        let dir = scratch("mdblworddrag");
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello brave new world\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+
+        let click = |kind| mouse(kind, 37, 1); // char 6 = 'b' of "brave"
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        // drag into "world" (char 16) -> extends word-wise
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 47, 1));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        assert_eq!(
+            app.buffer.selected_text().as_deref(),
+            Some("brave new world")
+        );
+    }
+
+    #[test]
+    fn drag_jitter_inside_word_keeps_word_selection() {
+        let dir = scratch("mdbljitter");
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello brave world\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+
+        let click = |kind| mouse(kind, 37, 1); // char 6 = 'b' of "brave"
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        // hand jitter while holding the second click: still inside "brave"
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 39, 1));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        assert_eq!(app.buffer.selected_text().as_deref(), Some("brave"));
+    }
+
+    #[test]
+    fn drag_after_triple_click_extends_by_line() {
+        let dir = scratch("mtripledrag");
+        let file = dir.join("a.txt");
+        fs::write(&file, "one two three\nfour five\nsix\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+
+        let click = |kind| mouse(kind, 31, 1); // char 0 of line 0
+        for _ in 0..3 {
+            app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+            app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        }
+        // drag to line 2 (terminal row 3) -> extends line-wise
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 31, 3));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        assert_eq!(
+            app.buffer.selected_text().as_deref(),
+            Some("one two three\nfour five\nsix")
+        );
+    }
+
+    #[test]
+    fn multi_click_count_resets_on_new_position() {
+        let dir = scratch("mmulticlick");
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello brave world\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+
+        // double-click "brave" -> word selected
+        let click = |kind| mouse(kind, 37, 1);
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        assert_eq!(app.buffer.selected_text().as_deref(), Some("brave"));
+
+        // clicking a different position right away is a plain click again
+        let other = mouse(MouseEventKind::Down(MouseButton::Left), 31, 1);
+        app.handle_mouse(other);
+        assert!(!app.buffer.has_selection());
+        assert_eq!(app.buffer.cursor, (0, 0));
+    }
+
+    #[test]
+    fn double_click_on_whitespace_selects_nothing() {
+        let dir = scratch("mdblspace");
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello world\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+
+        // terminal col 36 = char 5 = the space between the words
+        let click = |kind| mouse(kind, 36, 1);
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.buffer.has_selection());
+        assert_eq!(app.buffer.cursor, (5, 0));
     }
 
     #[test]

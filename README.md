@@ -22,7 +22,7 @@ Two panes, one goal: a small, dependency-light editor that stays out of your way
 - **Sidebar + editor split** — browse directories on the left, edit files on the right
 - **Syntax highlighting** — Sublime Text grammars via [syntect](https://github.com/trishume/syntect), detected by extension and first-line heuristics; re-highlights incrementally as you type, only re-parsing lines from the edit point onward
 - **Clipboard integration** — copy/cut/paste through the system clipboard ([arboard](https://github.com/1Password/arboard)), with bracketed-paste support for terminals that send it
-- **Full mouse support** — click to place the cursor, drag or Shift+click to select, scroll wheel to move through text and directories
+- **Full mouse support** — click to place the cursor, drag or Shift+click to select, double-click to select a word, triple-click to select a line, scroll wheel to move through text and directories
 - **macOS-friendly keys** — on terminals supporting the kitty keyboard protocol, Cmd+key works like Ctrl (unsupported terminals just ignore the request)
 - **Safe file handling** — a dirty buffer blocks opening another file, and Ctrl+Q asks for confirmation before discarding unsaved changes
 - **Unicode-aware editing** — the cursor tracks *characters*, not bytes, so wide characters and non-ASCII text render and edit correctly
@@ -55,7 +55,7 @@ rat [path]
 
 **Editor:** type to insert, `←`/`→`/`↑`/`↓` move (hold `Shift` to extend the selection), `Home`/`End`, `PgUp`/`PgDn`, `Backspace`, `Delete`, `Tab` inserts four spaces.
 
-**Mouse:** click the editor to move the cursor, drag or Shift+click to select, scroll to move; single-click the sidebar to select, double-click to open, scroll to browse.
+**Mouse:** click the editor to move the cursor, drag or Shift+click to select, double-click selects the word under the cursor, triple-click selects the whole line, scroll to move; single-click the sidebar to select, double-click to open, scroll to browse.
 
 ## Installation
 

@@ -232,6 +232,107 @@ impl Buffer {
         self.selecting = false;
     }
 
+    /// The char range of the "word" at `(x, y)` (`x` is a char index), or
+    /// `None` when the char under the cursor is whitespace or the line is
+    /// empty. A word is a run of alphanumeric/underscore chars; when the
+    /// char under the cursor is punctuation, the adjacent run of punctuation
+    /// is the "word" instead (so `->` is one). Clicks past the end of the
+    /// line look at the last char.
+    fn word_range_at(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
+        let line = self.lines.get(y)?;
+        let chars: Vec<char> = line.chars().collect();
+        let len = chars.len();
+        if len == 0 {
+            return None;
+        }
+        let x = x.min(len);
+        let i = if x == len { len - 1 } else { x };
+        if chars[i].is_whitespace() {
+            return None;
+        }
+        let word_like = chars[i].is_alphanumeric() || chars[i] == '_';
+        let matches = |c: char| {
+            if word_like {
+                c.is_alphanumeric() || c == '_'
+            } else {
+                !c.is_whitespace() && !c.is_alphanumeric() && c != '_'
+            }
+        };
+        let mut start = i;
+        while start > 0 && matches(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = i + 1;
+        while end < len && matches(chars[end]) {
+            end += 1;
+        }
+        Some((start, end))
+    }
+
+    /// Select the "word" at `(x, y)` (`x` is a char index). A word is a
+    /// run of alphanumeric/underscore chars; when the char under the cursor
+    /// is punctuation, the adjacent run of punctuation is selected instead
+    /// (so double-clicking `->` selects `->`). Clicking whitespace or an
+    /// empty line selects nothing — the cursor just moves there.
+    pub fn select_word_at(&mut self, (x, y): (usize, usize)) {
+        match self.word_range_at((x, y)) {
+            Some((start, end)) => {
+                self.selection_anchor = Some((start, y));
+                self.cursor = (end, y);
+                self.selecting = true;
+            }
+            None => {
+                let len = self.lines.get(y).map_or(0, |l| char_count(l));
+                self.cursor = (x.min(len), y);
+                self.clear_selection();
+            }
+        }
+    }
+
+    /// Extend the selection so its moving end lands at the end of the word
+    /// at `(x, y)` (used when dragging after a double-click). Dragging onto
+    /// whitespace just moves the cursor there.
+    pub fn extend_selection_word_at(&mut self, (x, y): (usize, usize)) {
+        if self.selection_anchor.is_none() {
+            self.begin_selection();
+        }
+        match self.word_range_at((x, y)) {
+            Some((_, end)) => {
+                self.cursor = (end, y);
+            }
+            None => {
+                let len = self.lines.get(y).map_or(0, |l| char_count(l));
+                self.cursor = (x.min(len), y);
+            }
+        }
+        self.selecting = true;
+    }
+
+    /// Extend the selection so its moving end lands at the end of line `y`
+    /// (used when dragging after a triple-click).
+    pub fn extend_selection_line_at(&mut self, (_x, y): (usize, usize)) {
+        if y >= self.lines.len() {
+            return;
+        }
+        if self.selection_anchor.is_none() {
+            self.begin_selection();
+        }
+        self.cursor = (self.line_len(y), y);
+        self.selecting = true;
+    }
+
+    /// Select the whole line `y` (the line content, not the trailing
+    /// newline).
+    pub fn select_line(&mut self, y: usize) {
+        if y >= self.lines.len() {
+            return;
+        }
+        let len = self.line_len(y);
+        self.selection_anchor = Some((0, y));
+        self.cursor = (len, y);
+        self.selecting = true;
+    }
+
     /// The selected text, if any. Positions are `(char, line)` tuples.
     pub fn selected_text(&self) -> Option<String> {
         let (start, end) = self.selection_range()?;
@@ -265,7 +366,11 @@ impl Buffer {
             return None;
         }
         let from = if y == start_line { start_char } else { 0 };
-        let to = if y == end_line { end_char } else { self.line_len(y) };
+        let to = if y == end_line {
+            end_char
+        } else {
+            self.line_len(y)
+        };
         Some((from, to))
     }
 
@@ -684,10 +789,7 @@ mod tests {
         b.move_right();
         b.move_right();
         b.move_right();
-        assert_eq!(
-            b.selected_text().as_deref(),
-            Some("two\nsecond\nthird")
-        );
+        assert_eq!(b.selected_text().as_deref(), Some("two\nsecond\nthird"));
     }
 
     #[test]
@@ -797,6 +899,106 @@ mod tests {
         // select all + type replaces everything
         b.insert_char('z');
         assert_eq!(b.lines, vec!["z"]);
+    }
+
+    #[test]
+    fn select_word_at_selects_alphanumeric_run() {
+        let mut b = empty();
+        typed(&mut b, "foo_bar baz");
+        b.select_word_at((4, 0)); // inside foo_bar
+        assert_eq!(b.selected_text().as_deref(), Some("foo_bar"));
+        // the next word
+        b.select_word_at((8, 0)); // inside baz
+        assert_eq!(b.selected_text().as_deref(), Some("baz"));
+        // clicking past the end of the line selects the last word
+        b.select_word_at((11, 0));
+        assert_eq!(b.selected_text().as_deref(), Some("baz"));
+    }
+
+    #[test]
+    fn select_word_at_selects_punctuation_run() {
+        let mut b = empty();
+        typed(&mut b, "a -> b");
+        b.select_word_at((3, 0)); // on '-'
+        assert_eq!(b.selected_text().as_deref(), Some("->"));
+        // punctuation runs stop at word chars: clicking '.' in a.b.c
+        let mut b = empty();
+        typed(&mut b, "a.b.c");
+        b.select_word_at((1, 0));
+        assert_eq!(b.selected_text().as_deref(), Some("."));
+    }
+
+    #[test]
+    fn select_word_at_whitespace_selects_nothing() {
+        let mut b = empty();
+        typed(&mut b, "hello world");
+        b.select_word_at((1, 0));
+        assert!(b.has_selection());
+        // clicking the space between words clears the selection
+        b.select_word_at((5, 0));
+        assert!(!b.has_selection());
+        assert_eq!(b.cursor, (5, 0));
+        // an empty line selects nothing either
+        let mut b = empty();
+        b.newline();
+        b.select_word_at((0, 1));
+        assert!(!b.has_selection());
+    }
+
+    #[test]
+    fn select_word_at_handles_unicode() {
+        let mut b = empty();
+        typed(&mut b, "héllo wörld");
+        b.select_word_at((3, 0)); // inside héllo
+        assert_eq!(b.selected_text().as_deref(), Some("héllo"));
+        b.select_word_at((7, 0)); // inside wörld
+        assert_eq!(b.selected_text().as_deref(), Some("wörld"));
+    }
+
+    #[test]
+    fn select_line_selects_whole_line() {
+        let mut b = empty();
+        typed(&mut b, "one two");
+        b.newline();
+        typed(&mut b, "three");
+        b.select_line(1);
+        assert_eq!(b.selected_text().as_deref(), Some("three"));
+        assert_eq!(b.selection_range(), Some(((0, 1), (5, 1))));
+        // an empty line still yields an empty (non-)selection
+        b.newline();
+        b.select_line(2);
+        assert!(!b.has_selection());
+        assert_eq!(b.cursor, (0, 2));
+    }
+
+    #[test]
+    fn extend_selection_word_at_moves_cursor_to_word_end() {
+        let mut b = empty();
+        typed(&mut b, "one two three");
+        b.select_word_at((0, 0)); // "one"
+        // drag into "three" -> the selection ends at its word end
+        b.extend_selection_word_at((8, 0));
+        assert_eq!(b.selected_text().as_deref(), Some("one two three"));
+        // dragging back into the first word shrinks it again
+        b.extend_selection_word_at((2, 0));
+        assert_eq!(b.selected_text().as_deref(), Some("one"));
+        // dragging onto whitespace just moves the cursor
+        b.extend_selection_word_at((3, 0));
+        assert_eq!(b.selected_text().as_deref(), Some("one"));
+        assert_eq!(b.cursor, (3, 0));
+    }
+
+    #[test]
+    fn extend_selection_line_at_moves_cursor_to_line_end() {
+        let mut b = empty();
+        typed(&mut b, "one");
+        b.newline();
+        typed(&mut b, "two");
+        b.newline();
+        typed(&mut b, "three");
+        b.select_line(0);
+        b.extend_selection_line_at((0, 2));
+        assert_eq!(b.selected_text().as_deref(), Some("one\ntwo\nthree"));
     }
 
     #[test]

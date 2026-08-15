@@ -148,7 +148,8 @@ fn print_usage() {
          \x20 Ctrl+C/X/V  copy / cut / paste\n\
          \x20 Ctrl+A   select all\n\
          \x20 Ctrl+Q   quit\n\
-         \x20 mouse:    click editor to move the cursor, drag to select, scroll to move,\n\
+         \x20 mouse:    click editor to move the cursor, drag to select, double-click\n\
+         \x20            selects a word, triple-click selects the line, scroll to move,\n\
          \x20            single-click sidebar to select, double-click to open, scroll to browse\n\
          \x20 sidebar:  arrows/Enter open, Backspace goes up\n\
          \x20 editor:   type, arrows (+Shift to select), Home/End, PgUp/PgDn, Backspace, Delete, Tab"
