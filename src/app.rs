@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -14,11 +14,16 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::buffer::Buffer;
+use crate::clipboard::{Clipboard, SystemClipboard};
 use crate::highlight::Highlighter;
 use crate::sidebar::{Kind, Sidebar};
 
 /// How long transient status messages stay visible.
 const MESSAGE_TTL: Duration = Duration::from_secs(4);
+
+/// Max interval between two clicks on the same sidebar entry for them to
+/// count as a double-click.
+const DOUBLE_CLICK_TTL: Duration = Duration::from_millis(400);
 
 const SIDEBAR_WIDTH: u16 = 28;
 const STATUS_HEIGHT: u16 = 1;
@@ -35,6 +40,7 @@ pub struct App {
     pub focus: Focus,
     pub should_quit: bool,
     highlighter: Highlighter,
+    pub clipboard: Box<dyn Clipboard>,
     /// Transient status message with expiry.
     message: Option<(String, Instant)>,
     /// Active "save as" input text, when the buffer has no file name.
@@ -44,6 +50,11 @@ pub struct App {
     /// Viewport sizes from the last draw, used for paging and scrolling.
     editor_text: (u16, u16),
     sidebar_height: u16,
+    /// Widget areas from the last draw, used for mouse hit-testing.
+    sidebar_area: Rect,
+    editor_area: Rect,
+    /// Last click on the sidebar, for double-click detection.
+    last_sidebar_click: Option<(Instant, usize)>,
 }
 
 impl App {
@@ -73,11 +84,15 @@ impl App {
             focus,
             should_quit: false,
             highlighter,
+            clipboard: Box::new(SystemClipboard::new()),
             message: None,
             save_as_input: None,
             quit_armed: false,
             editor_text: (0, 0),
             sidebar_height: 0,
+            sidebar_area: Rect::default(),
+            editor_area: Rect::default(),
+            last_sidebar_click: None,
         })
     }
 
@@ -89,7 +104,11 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         // Global shortcuts work everywhere, even inside the save-as prompt.
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        // On macOS, Cmd+key is reported as SUPER on terminals that speak the
+        // kitty keyboard protocol; plain Ctrl+key works everywhere.
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER);
+        if ctrl {
             match key.code {
                 KeyCode::Char('q') => {
                     if self.buffer.dirty && !self.quit_armed {
@@ -110,6 +129,28 @@ impl App {
                             Focus::Sidebar => Focus::Editor,
                             Focus::Editor => Focus::Sidebar,
                         };
+                    }
+                    return;
+                }
+                KeyCode::Char('c') => {
+                    if self.save_as_input.is_none() {
+                        self.copy_selection();
+                    }
+                    return;
+                }
+                KeyCode::Char('x') => {
+                    if self.save_as_input.is_none() {
+                        self.cut_selection();
+                    }
+                    return;
+                }
+                KeyCode::Char('v') => {
+                    self.paste_clipboard();
+                    return;
+                }
+                KeyCode::Char('a') => {
+                    if self.save_as_input.is_none() {
+                        self.buffer.select_all();
                     }
                     return;
                 }
@@ -159,6 +200,28 @@ impl App {
     fn handle_editor_key(&mut self, key: KeyEvent) {
         let (w, h) = self.editor_text;
         let page = h.max(1) as usize;
+        // shift+arrows extend the selection, plain arrows drop it
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let is_move = matches!(
+            key.code,
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        );
+        if is_move {
+            if shift {
+                if !self.buffer.selecting {
+                    self.buffer.begin_selection();
+                }
+            } else {
+                self.buffer.clear_selection();
+            }
+        }
         match key.code {
             KeyCode::Char(c)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
@@ -187,6 +250,200 @@ impl App {
             self.highlighter.invalidate_from(line);
         }
         self.buffer.ensure_visible(h as usize, w as usize);
+    }
+
+    // ---- clipboard ---------------------------------------------------------
+
+    fn copy_selection(&mut self) {
+        let Some(text) = self.buffer.selected_text() else {
+            return;
+        };
+        self.clipboard.set_text(&text);
+        self.set_message("copied");
+    }
+
+    fn cut_selection(&mut self) {
+        if !self.buffer.has_selection() {
+            return;
+        }
+        let text = self.buffer.selected_text().unwrap_or_default();
+        self.clipboard.set_text(&text);
+        self.buffer.delete_selection();
+        if let Some(line) = self.buffer.last_edit_line.take() {
+            self.highlighter.invalidate_from(line);
+        }
+        self.set_message("cut");
+    }
+
+    fn paste_clipboard(&mut self) {
+        let Some(text) = self.clipboard.get_text() else {
+            self.set_message("clipboard unavailable");
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        if let Some(input) = self.save_as_input.as_mut() {
+            input.push_str(&text);
+            return;
+        }
+        self.paste_text(text);
+    }
+
+    /// Insert pasted text (from Ctrl+V or bracketed paste) into the buffer.
+    pub fn paste_text(&mut self, text: String) {
+        self.focus = Focus::Editor;
+        self.buffer.insert_multiline(&text);
+        if let Some(line) = self.buffer.last_edit_line.take() {
+            self.highlighter.invalidate_from(line);
+        }
+        self.quit_armed = false;
+    }
+
+    // ---- mouse -------------------------------------------------------------
+
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        let pos = (event.column as usize, event.row as usize);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.quit_armed = false;
+                if self.in_sidebar(pos) {
+                    self.focus = Focus::Sidebar;
+                    if let Some(row) = self.sidebar_row_at(pos) {
+                        self.sidebar.selected = self.sidebar.scroll + row;
+                    }
+                } else if self.in_editor(pos) {
+                    self.focus = Focus::Editor;
+                    if event.modifiers.contains(KeyModifiers::SHIFT) {
+                        if !self.buffer.selecting {
+                            self.buffer.begin_selection();
+                        }
+                    } else {
+                        self.buffer.clear_selection();
+                    }
+                    if let Some((line, col)) = self.editor_cursor_at(pos) {
+                        self.buffer.cursor = (col, line);
+                        self.ensure_cursor_visible();
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.in_sidebar(pos) {
+                    if let Some(row) = self.sidebar_row_at(pos) {
+                        self.sidebar.selected = self.sidebar.scroll + row;
+                    }
+                    // double-click opens the entry
+                    let entry = self.sidebar.selected;
+                    let double = self
+                        .last_sidebar_click
+                        .is_some_and(|(t, i)| i == entry && t.elapsed() < DOUBLE_CLICK_TTL);
+                    self.last_sidebar_click = Some((Instant::now(), entry));
+                    if double {
+                        self.open_selected();
+                    }
+                } else {
+                    self.buffer.end_selection();
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.in_editor(pos) {
+                    self.focus = Focus::Editor;
+                    if !self.buffer.selecting {
+                        self.buffer.begin_selection();
+                    }
+                    if let Some((line, col)) = self.editor_cursor_at(pos) {
+                        self.buffer.cursor = (col, line);
+                        self.ensure_cursor_visible();
+                    }
+                } else if self.in_sidebar(pos) {
+                    self.focus = Focus::Sidebar;
+                    if let Some(row) = self.sidebar_row_at(pos) {
+                        self.sidebar.selected = self.sidebar.scroll + row;
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if self.in_sidebar(pos) {
+                    self.sidebar.move_selection(1);
+                } else {
+                    for _ in 0..3 {
+                        self.buffer.move_down();
+                    }
+                    self.ensure_cursor_visible();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if self.in_sidebar(pos) {
+                    self.sidebar.move_selection(-1);
+                } else {
+                    for _ in 0..3 {
+                        self.buffer.move_up();
+                    }
+                    self.ensure_cursor_visible();
+                }
+            }
+            MouseEventKind::ScrollLeft => {
+                self.buffer.scroll.0 = self.buffer.scroll.0.saturating_sub(3);
+            }
+            MouseEventKind::ScrollRight => {
+                self.buffer.scroll.0 += 3;
+            }
+            _ => {}
+        }
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        let (w, h) = self.editor_text;
+        self.buffer.ensure_visible(h as usize, w as usize);
+    }
+
+    fn in_sidebar(&self, pos: (usize, usize)) -> bool {
+        self.sidebar_area.contains(Position::new(pos.0 as u16, pos.1 as u16))
+    }
+
+    fn in_editor(&self, pos: (usize, usize)) -> bool {
+        self.editor_area.contains(Position::new(pos.0 as u16, pos.1 as u16))
+    }
+
+    /// Row within the sidebar's visible entries for a mouse position.
+    fn sidebar_row_at(&self, pos: (usize, usize)) -> Option<usize> {
+        let area = self.sidebar_area;
+        let inner_y = area.y + 1;
+        let inner_h = area.height.saturating_sub(2);
+        if pos.1 < inner_y as usize || pos.1 >= (inner_y + inner_h) as usize {
+            return None;
+        }
+        let row = pos.1 - inner_y as usize;
+        if row >= self.sidebar.entries.len() {
+            return None;
+        }
+        Some(row)
+    }
+
+    /// Buffer `(line, char)` position for a mouse position in the editor,
+    /// clamped into the visible text area.
+    fn editor_cursor_at(&self, pos: (usize, usize)) -> Option<(usize, usize)> {
+        let area = self.editor_area;
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if inner_w == 0 || inner_h == 0 || self.buffer.lines.is_empty() {
+            return None;
+        }
+        let rel_y = pos
+            .1
+            .saturating_sub(inner_y as usize)
+            .min(inner_h as usize - 1);
+        let rel_x = pos.0.saturating_sub(inner_x as usize);
+        let y = (self.buffer.scroll.1 + rel_y).min(self.buffer.lines.len() - 1);
+        // clicks in the line-number gutter land at column 0
+        let gutter_w = self.buffer.lines.len().to_string().len() + 1;
+        let col = rel_x.saturating_sub(gutter_w);
+        let line = &self.buffer.lines[y];
+        let visible: String = line.chars().skip(self.buffer.scroll.0).collect();
+        let x = self.buffer.scroll.0 + char_at_col(&visible, col);
+        Some((y, x))
     }
 
     // ---- file operations ---------------------------------------------------
@@ -277,6 +534,8 @@ impl App {
             Constraint::Min(0),
         ])
         .areas(main);
+        self.sidebar_area = side_area;
+        self.editor_area = edit_area;
 
         self.draw_sidebar(frame, side_area);
         self.draw_editor(frame, edit_area);
@@ -371,13 +630,13 @@ impl App {
                 Style::default().fg(Color::DarkGray),
             );
             let ops = self.highlighter.highlight_line(&self.buffer.lines, y);
+            let line = &self.buffer.lines[y];
+            // selection overlap on this line, in byte offsets
+            let sel = self.buffer.selection_on_line(y).map(|(a, b)| {
+                (char_index_to_byte(line, a), char_index_to_byte(line, b))
+            });
             let mut spans = vec![num];
-            spans.extend(clip_ops(
-                &self.buffer.lines[y],
-                &ops,
-                self.buffer.scroll.0,
-                text_w,
-            ));
+            spans.extend(clip_ops(line, &ops, self.buffer.scroll.0, text_w, sel));
             rows.push(Line::from(spans));
         }
         if rows.is_empty() {
@@ -416,7 +675,7 @@ impl App {
         // right: position + help
         let (x, y) = self.buffer.cursor;
         let right = format!(
-            "{}:{}   Ctrl+O switch · Ctrl+S save · Ctrl+Q quit",
+            "{}:{}   Ctrl+O switch · Ctrl+S save · Ctrl+C/X/V copy/cut/paste · Ctrl+Q quit",
             y + 1,
             x + 1
         );
@@ -534,6 +793,19 @@ fn char_index_to_byte(s: &str, idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
+/// Char index at (or just past) terminal column `col`, accounting for wide
+/// characters: the cursor lands between chars at the clicked cell boundary.
+fn char_at_col(s: &str, col: usize) -> usize {
+    let mut width = 0;
+    for (i, c) in s.chars().enumerate() {
+        if width >= col {
+            return i;
+        }
+        width += c.width().unwrap_or(0);
+    }
+    s.chars().count()
+}
+
 /// Snap a byte offset up to the next char boundary.
 fn snap_char_up(s: &str, mut b: usize) -> usize {
     while b < s.len() && !s.is_char_boundary(b) {
@@ -552,12 +824,14 @@ fn snap_char_down(s: &str, mut b: usize) -> usize {
 
 /// Clip styled byte-ranges from the highlighter to the visible char slice
 /// `[start_char, start_char + width)`, producing the `Span`s to render.
-/// `None` styles render as plain text (terminal default colors).
+/// `None` styles render as plain text (terminal default colors); spans
+/// overlapping `sel` (byte range on this line) are shown reversed.
 fn clip_ops<'a>(
     line: &'a str,
     ops: &[(Option<Style>, Range<usize>)],
     start_char: usize,
     width: usize,
+    sel: Option<(usize, usize)>,
 ) -> Vec<Span<'a>> {
     let start_byte = char_index_to_byte(line, start_char);
     let end_byte = char_index_to_byte(line, start_char + width);
@@ -574,9 +848,17 @@ fn clip_ops<'a>(
         if a >= b {
             continue;
         }
-        match style {
-            Some(style) => out.push(Span::styled(&line[a..b], *style)),
-            None => out.push(Span::raw(&line[a..b])),
+        let selected = sel.is_some_and(|(sa, sb)| a < sb && b > sa);
+        let text = &line[a..b];
+        match (style, selected) {
+            (Some(style), false) => out.push(Span::styled(text, *style)),
+            (Some(style), true) => {
+                out.push(Span::styled(text, style.add_modifier(Modifier::REVERSED)))
+            }
+            (None, false) => out.push(Span::raw(text)),
+            (None, true) => {
+                out.push(Span::styled(text, Style::default().add_modifier(Modifier::REVERSED)))
+            }
         }
     }
     out
@@ -585,7 +867,27 @@ fn clip_ops<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
+
+    #[derive(Default)]
+    struct FakeClipboard {
+        text: String,
+    }
+
+    impl Clipboard for FakeClipboard {
+        fn get_text(&mut self) -> Option<String> {
+            Some(self.text.clone())
+        }
+
+        fn set_text(&mut self, text: &str) {
+            self.text = text.to_string();
+        }
+    }
+
+    fn with_fake_clipboard(mut app: App) -> App {
+        app.clipboard = Box::new(FakeClipboard::default());
+        app
+    }
     use std::fs;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -594,6 +896,23 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn cmd(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::SUPER)
+    }
+
+    fn shift_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     fn char_key(c: char) -> KeyEvent {
@@ -951,5 +1270,247 @@ mod tests {
         let rows = render(&mut app);
         assert!(row_contains(&rows, "line 199"));
         assert!(!row_contains(&rows, "line 000"));
+    }
+
+    // ---- mouse -------------------------------------------------------------
+
+    #[test]
+    fn mouse_click_positions_cursor_and_focuses_editor() {
+        let dir = scratch("mclick");
+        let file = dir.join("code.rs");
+        fs::write(&file, "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        render_buffer(&mut app); // sets widget areas
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 2));
+        assert_eq!(app.focus, Focus::Editor);
+        // terminal col 35 = text col 4 on line 2 (index 1)
+        assert_eq!(app.buffer.cursor, (4, 1));
+
+        // clicking in the gutter lands at column 0
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 29, 3));
+        assert_eq!(app.buffer.cursor, (0, 2));
+    }
+
+    #[test]
+    fn mouse_drag_selects_text() {
+        let dir = scratch("mdrag");
+        let file = dir.join("code.rs");
+        fs::write(&file, "fn main() {\n}\n").unwrap();
+        let mut app = with_fake_clipboard(App::new(dir, Some(file)).unwrap());
+        render_buffer(&mut app);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 31, 1));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 33, 1));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 33, 1));
+        assert_eq!(app.buffer.selected_text().as_deref(), Some("fn"));
+
+        // Ctrl+C copies the selection to the clipboard
+        app.handle_key(ctrl('c'));
+        assert_eq!(app.clipboard.get_text().as_deref(), Some("fn"));
+    }
+
+    #[test]
+    fn shift_click_extends_selection() {
+        let dir = scratch("mshift");
+        let file = dir.join("code.rs");
+        fs::write(&file, "fn main() {\n}\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 33, 1));
+        let shift_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 36,
+            row: 1,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        app.handle_mouse(shift_click);
+        assert_eq!(app.buffer.selection_range(), Some(((2, 0), (5, 0))));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_editor_and_sidebar() {
+        let dir = scratch("mwheel");
+        let file = dir.join("long.txt");
+        let content: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        fs::write(&file, content).unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+
+        assert_eq!(app.buffer.cursor, (0, 0));
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 60, 10));
+        assert_eq!(app.buffer.cursor, (0, 3));
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 60, 10));
+        assert_eq!(app.buffer.cursor, (0, 0));
+
+        // wheel over the sidebar moves the selection
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 5));
+        assert_eq!(app.sidebar.selected, 1);
+    }
+
+    #[test]
+    fn sidebar_single_click_selects_double_click_opens() {
+        let dir = scratch("mdblclick");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let mut app = App::new(dir, None).unwrap();
+        render_buffer(&mut app);
+
+        // single click on the file row (row 1: ".." is row 0)
+        let click = |kind| mouse(kind, 5, 2);
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        assert_eq!(app.sidebar.selected, 1);
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert!(app.buffer.path.is_none()); // not opened yet
+
+        // second click within the double-click window opens the file
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.buffer.lines, vec!["alpha"]);
+    }
+
+    #[test]
+    fn sidebar_double_click_on_directory_descends() {
+        let dir = scratch("mdblclickdir");
+        fs::create_dir(dir.join("sub")).unwrap();
+        let mut app = App::new(dir.clone(), None).unwrap();
+        render_buffer(&mut app);
+
+        let click = |kind| mouse(kind, 5, 1); // row 0: ".."
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
+        // opened the parent of the scratch dir
+        assert_ne!(app.sidebar.dir, dir);
+    }
+
+    // ---- clipboard ---------------------------------------------------------
+
+    #[test]
+    fn copy_cut_paste_roundtrip() {
+        let dir = scratch("clip1");
+        let mut app = with_fake_clipboard(App::new(dir, None).unwrap());
+        app.handle_key(ctrl('o'));
+        for c in "hello world".chars() {
+            app.handle_key(char_key(c));
+        }
+        // select "world" with shift+arrows
+        app.handle_key(key(KeyCode::Home));
+        for _ in 0..6 {
+            app.handle_key(key(KeyCode::Right));
+        }
+        for _ in 0..5 {
+            app.handle_key(shift_key(KeyCode::Right));
+        }
+        app.handle_key(ctrl('x')); // cut
+        assert_eq!(app.buffer.lines, vec!["hello "]);
+        assert_eq!(app.clipboard.get_text().as_deref(), Some("world"));
+
+        app.handle_key(key(KeyCode::End));
+        app.handle_key(ctrl('v')); // paste
+        assert_eq!(app.buffer.lines, vec!["hello world"]);
+    }
+
+    #[test]
+    fn select_all_copy_and_paste_replaces() {
+        let dir = scratch("clip2");
+        let mut app = with_fake_clipboard(App::new(dir, None).unwrap());
+        app.handle_key(ctrl('o'));
+        for c in "abc".chars() {
+            app.handle_key(char_key(c));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        for c in "def".chars() {
+            app.handle_key(char_key(c));
+        }
+        app.handle_key(ctrl('a'));
+        app.handle_key(ctrl('c'));
+        assert_eq!(app.clipboard.get_text().as_deref(), Some("abc\ndef"));
+
+        // pasting over the selection replaces it (no duplication)
+        app.handle_key(ctrl('v'));
+        assert_eq!(app.buffer.lines, vec!["abc", "def"]);
+        assert!(!app.buffer.has_selection());
+    }
+
+    #[test]
+    fn cmd_shortcuts_work_like_ctrl() {
+        let dir = scratch("clip3");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha").unwrap();
+        let mut app = with_fake_clipboard(App::new(dir.clone(), Some(file)).unwrap());
+        app.handle_key(char_key('X'));
+        assert!(app.buffer.dirty);
+        app.handle_key(cmd('s')); // Cmd+S saves
+        assert!(!app.buffer.dirty);
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "Xalpha");
+
+        app.handle_key(cmd('o')); // Cmd+O switches focus
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.handle_key(cmd('o'));
+        assert_eq!(app.focus, Focus::Editor);
+        app.handle_key(cmd('q')); // Cmd+Q quits
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn bracketed_paste_inserts_multiline() {
+        let dir = scratch("clip4");
+        let mut app = App::new(dir, None).unwrap();
+        app.handle_key(ctrl('o'));
+        app.handle_key(char_key('a'));
+        app.paste_text("b\nc".to_string());
+        assert_eq!(app.buffer.lines, vec!["ab", "c"]);
+        assert!(app.buffer.dirty);
+    }
+
+    #[test]
+    fn paste_with_selection_replaces_it() {
+        let dir = scratch("clip5");
+        let mut app = with_fake_clipboard(App::new(dir, None).unwrap());
+        app.handle_key(ctrl('o'));
+        for c in "abcdef".chars() {
+            app.handle_key(char_key(c));
+        }
+        app.handle_key(key(KeyCode::Home));
+        for _ in 0..3 {
+            app.handle_key(shift_key(KeyCode::Right));
+        }
+        app.clipboard.set_text("XYZ");
+        app.handle_key(ctrl('v'));
+        assert_eq!(app.buffer.lines, vec!["XYZdef"]);
+    }
+
+    #[test]
+    fn selection_renders_reversed() {
+        let dir = scratch("mselrender");
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello world\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        app.buffer.home();
+        app.buffer.begin_selection();
+        app.buffer.end();
+        let buf = render_buffer(&mut app);
+        // cells inside the selection are reversed
+        for x in 31..42 {
+            assert!(
+                buf.cell((x, 1))
+                    .unwrap()
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::REVERSED),
+                "col {x}"
+            );
+        }
+        // cells outside are not
+        assert!(!buf
+            .cell((43, 1))
+            .unwrap()
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED));
     }
 }

@@ -5,6 +5,7 @@
 
 mod app;
 mod buffer;
+mod clipboard;
 mod highlight;
 mod sidebar;
 
@@ -14,7 +15,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
+use crossterm::execute;
 use ratatui::DefaultTerminal;
 
 use app::App;
@@ -41,9 +47,38 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
     };
+    if let Err(e) = enable_terminal_capabilities() {
+        eprintln!("warning: cannot enable mouse/paste support: {e}");
+    }
     let result = run(&mut app, &mut terminal);
+    let _ = disable_terminal_capabilities();
     ratatui::restore();
     result
+}
+
+/// Mouse capture, bracketed paste, and the kitty keyboard protocol (so
+/// macOS Cmd+key arrives as `KeyModifiers::SUPER` on supporting terminals;
+/// unsupported terminals simply ignore the request).
+fn enable_terminal_capabilities() -> io::Result<()> {
+    execute!(
+        io::stdout(),
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        )
+    )
+}
+
+fn disable_terminal_capabilities() -> io::Result<()> {
+    execute!(
+        io::stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
+        DisableMouseCapture
+    )
 }
 
 /// Figure out what directory the sidebar should show and which file (if any)
@@ -85,7 +120,14 @@ fn run(app: &mut App, terminal: &mut DefaultTerminal) -> io::Result<()> {
         terminal.draw(|frame| app.draw(frame))?;
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                // with the kitty protocol, held keys arrive as Repeat events
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+                {
+                    app.handle_key(key)
+                }
+                Event::Mouse(event) => app.handle_mouse(event),
+                Event::Paste(text) => app.paste_text(text),
                 Event::Resize(..) => {}
                 _ => {}
             }
@@ -103,11 +145,15 @@ fn print_usage() {
          Opens `path` if it is a file, or browses it if it is a directory.\n\
          With no argument, the current directory is shown in the sidebar.\n\
          \n\
-         keys:\n\
+         keys (Cmd works like Ctrl on macOS-capable terminals):\n\
          \x20 Ctrl+O   switch between sidebar and editor\n\
          \x20 Ctrl+S   save the current file (asks for a name if untitled)\n\
+         \x20 Ctrl+C/X/V  copy / cut / paste\n\
+         \x20 Ctrl+A   select all\n\
          \x20 Ctrl+Q   quit\n\
-         \x20 sidebar: arrows/Enter open, Backspace goes up, Enter on a file opens it\n\
-         \x20 editor:  type, arrows, Home/End, PgUp/PgDn, Backspace, Delete, Tab"
+         \x20 mouse:    click editor to move the cursor, drag to select, scroll to move,\n\
+         \x20            single-click sidebar to select, double-click to open, scroll to browse\n\
+         \x20 sidebar:  arrows/Enter open, Backspace goes up\n\
+         \x20 editor:   type, arrows (+Shift to select), Home/End, PgUp/PgDn, Backspace, Delete, Tab"
     );
 }

@@ -36,6 +36,12 @@ pub struct Buffer {
     /// invalidate the syntax-highlight cache). Cleared by the app after
     /// use.
     pub last_edit_line: Option<usize>,
+    /// Selection anchor `(line, char)`; `None` when nothing is selected.
+    /// The selection spans `[anchor, cursor]` (normalized).
+    pub selection_anchor: Option<(usize, usize)>,
+    /// True while the user is extending the selection (mouse drag or
+    /// shift+arrow).
+    pub selecting: bool,
 }
 
 impl Buffer {
@@ -48,6 +54,8 @@ impl Buffer {
             path: None,
             dirty: false,
             last_edit_line: None,
+            selection_anchor: None,
+            selecting: false,
         }
     }
 
@@ -86,16 +94,23 @@ impl Buffer {
         }
     }
 
+    /// Record that line `y` was changed; keeps the earliest changed line of
+    /// the current operation (multi-line edits like paste touch several).
+    fn mark_edited(&mut self, y: usize) {
+        self.last_edit_line = Some(self.last_edit_line.map_or(y, |l| l.min(y)));
+    }
+
     // ---- editing -----------------------------------------------------------
 
     pub fn insert_char(&mut self, c: char) {
+        self.delete_selection();
         let (x, y) = self.cursor;
         let line = &mut self.lines[y];
         let byte = char_index_to_byte(line, x);
         line.insert(byte, c);
         self.cursor.0 += 1;
         self.dirty = true;
-        self.last_edit_line = Some(y);
+        self.mark_edited(y);
     }
 
     pub fn insert_text(&mut self, text: &str) {
@@ -104,7 +119,21 @@ impl Buffer {
         }
     }
 
+    /// Insert possibly multi-line text (paste) at the cursor. A leading
+    /// selection is replaced.
+    pub fn insert_multiline(&mut self, text: &str) {
+        let mut parts = text.split('\n');
+        if let Some(first) = parts.next() {
+            self.insert_text(first);
+            for rest in parts {
+                self.newline();
+                self.insert_text(rest);
+            }
+        }
+    }
+
     pub fn newline(&mut self) {
+        self.delete_selection();
         let (x, y) = self.cursor;
         let line = self.lines[y].clone();
         let byte = char_index_to_byte(&line, x);
@@ -113,10 +142,13 @@ impl Buffer {
         self.lines.insert(y + 1, right.to_string());
         self.cursor = (0, y + 1);
         self.dirty = true;
-        self.last_edit_line = Some(y);
+        self.mark_edited(y);
     }
 
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let (x, y) = self.cursor;
         if x > 0 {
             let line = &mut self.lines[y];
@@ -132,10 +164,13 @@ impl Buffer {
             return;
         }
         self.dirty = true;
-        self.last_edit_line = Some(self.cursor.1);
+        self.mark_edited(self.cursor.1);
     }
 
     pub fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let (x, y) = self.cursor;
         if x < self.line_len(y) {
             let line = &mut self.lines[y];
@@ -148,7 +183,120 @@ impl Buffer {
             return;
         }
         self.dirty = true;
-        self.last_edit_line = Some(self.cursor.1);
+        self.mark_edited(self.cursor.1);
+    }
+
+    // ---- selection ---------------------------------------------------------
+
+    /// `(start, end)` of the selection, normalized so `start <= end`;
+    /// `None` when nothing is selected (or the selection is empty).
+    /// Positions are `(char, line)` tuples, but ordering is by line first.
+    pub fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.selection_anchor?;
+        if anchor == self.cursor {
+            return None;
+        }
+        let before = (anchor.1, anchor.0) <= (self.cursor.1, self.cursor.0);
+        Some(if before {
+            (anchor, self.cursor)
+        } else {
+            (self.cursor, anchor)
+        })
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection_range().is_some()
+    }
+
+    /// Start extending the selection from the current cursor position.
+    pub fn begin_selection(&mut self) {
+        self.selection_anchor = Some(self.cursor);
+        self.selecting = true;
+    }
+
+    /// Stop extending the selection (mouse button released), keeping it.
+    pub fn end_selection(&mut self) {
+        self.selecting = false;
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.selecting = false;
+    }
+
+    /// Select the whole buffer.
+    pub fn select_all(&mut self) {
+        let last = self.lines.len() - 1;
+        self.selection_anchor = Some((0, 0));
+        self.cursor = (self.line_len(last), last);
+        self.selecting = false;
+    }
+
+    /// The selected text, if any. Positions are `(char, line)` tuples.
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection_range()?;
+        let (start_char, start_line) = start;
+        let (end_char, end_line) = end;
+        if start_line == end_line {
+            let line = &self.lines[start_line];
+            let a = char_index_to_byte(line, start_char);
+            let b = char_index_to_byte(line, end_char);
+            return Some(line[a..b].to_string());
+        }
+        let mut out = String::new();
+        let first = &self.lines[start_line];
+        out.push_str(&first[char_index_to_byte(first, start_char)..]);
+        for y in start_line + 1..end_line {
+            out.push('\n');
+            out.push_str(&self.lines[y]);
+        }
+        out.push('\n');
+        let last = &self.lines[end_line];
+        out.push_str(&last[..char_index_to_byte(last, end_char)]);
+        Some(out)
+    }
+
+    /// The selected char range on line `y`, if the selection crosses it.
+    pub fn selection_on_line(&self, y: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.selection_range()?;
+        let (start_char, start_line) = start;
+        let (end_char, end_line) = end;
+        if y < start_line || y > end_line {
+            return None;
+        }
+        let from = if y == start_line { start_char } else { 0 };
+        let to = if y == end_line { end_char } else { self.line_len(y) };
+        Some((from, to))
+    }
+
+    /// Delete the selected text, leaving the cursor at the selection start.
+    /// Returns `false` when there was nothing to delete.
+    pub fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection_range() else {
+            return false;
+        };
+        let (start_char, start_line) = start;
+        let (end_char, end_line) = end;
+        if start_line == end_line {
+            let line = &mut self.lines[start_line];
+            let a = char_index_to_byte(line, start_char);
+            let b = char_index_to_byte(line, end_char);
+            line.replace_range(a..b, "");
+        } else {
+            // keep the start-line prefix and the end-line suffix, drop the
+            // lines in between
+            let first = self.lines[start_line].clone();
+            let last = self.lines[end_line].clone();
+            let prefix = &first[..char_index_to_byte(&first, start_char)];
+            let suffix = &last[char_index_to_byte(&last, end_char)..];
+            let joined = format!("{prefix}{suffix}");
+            self.lines.splice(start_line..=end_line, [joined]);
+        }
+        self.cursor = start;
+        self.clear_selection();
+        self.dirty = true;
+        self.mark_edited(start_line);
+        true
     }
 
     // ---- cursor movement ---------------------------------------------------
@@ -479,6 +627,207 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let loaded = Buffer::from_path(path).unwrap();
         assert_eq!(loaded.lines, vec![""]);
+    }
+
+    // ---- selection ---------------------------------------------------------
+
+    fn typed(b: &mut Buffer, text: &str) {
+        b.insert_text(text);
+    }
+
+    #[test]
+    fn selection_requires_anchor_different_from_cursor() {
+        let mut b = empty();
+        typed(&mut b, "ab");
+        b.home();
+        assert!(!b.has_selection());
+        b.begin_selection();
+        assert!(!b.has_selection()); // anchor == cursor
+        b.move_right();
+        assert!(b.has_selection());
+        assert_eq!(b.selection_range(), Some(((0, 0), (1, 0))));
+        // moving backwards normalizes the range
+        b.begin_selection();
+        b.home();
+        assert_eq!(b.selection_range(), Some(((0, 0), (1, 0))));
+    }
+
+    #[test]
+    fn selected_text_same_line_and_multi_line() {
+        let mut b = empty();
+        typed(&mut b, "one two");
+        b.home();
+        b.begin_selection();
+        b.move_right();
+        b.move_right();
+        b.move_right();
+        assert_eq!(b.selected_text().as_deref(), Some("one"));
+
+        // multi-line selection: (0,4) .. (2,5)
+        let mut b = empty();
+        typed(&mut b, "one two");
+        b.newline();
+        typed(&mut b, "second");
+        b.newline();
+        typed(&mut b, "third");
+        b.home();
+        b.move_up();
+        b.move_up();
+        b.move_right();
+        b.move_right();
+        b.move_right();
+        b.move_right();
+        b.begin_selection();
+        b.end();
+        b.move_down();
+        b.move_down();
+        b.move_right();
+        b.move_right();
+        b.move_right();
+        assert_eq!(
+            b.selected_text().as_deref(),
+            Some("two\nsecond\nthird")
+        );
+    }
+
+    #[test]
+    fn selection_on_line_ranges() {
+        let mut b = empty();
+        typed(&mut b, "abc");
+        b.newline();
+        typed(&mut b, "def");
+        b.newline();
+        typed(&mut b, "ghi");
+        b.home();
+        b.move_up();
+        b.move_up();
+        b.move_down();
+        b.move_right();
+        b.begin_selection(); // anchor (1,1)
+        b.move_down();
+        b.move_right();
+        b.move_right();
+        assert_eq!(b.selection_on_line(0), None);
+        assert_eq!(b.selection_on_line(1), Some((1, 3)));
+        assert_eq!(b.selection_on_line(2), Some((0, 3)));
+    }
+
+    #[test]
+    fn delete_selection_same_line() {
+        let mut b = empty();
+        typed(&mut b, "hello world");
+        b.home();
+        b.move_right();
+        b.move_right();
+        b.begin_selection();
+        b.move_right();
+        b.move_right();
+        b.move_right();
+        b.move_right();
+        b.move_right();
+        b.delete_selection();
+        assert_eq!(b.lines, vec!["heorld"]); // "llo w" was removed
+        assert_eq!(b.cursor, (2, 0));
+        assert!(!b.has_selection());
+    }
+
+    #[test]
+    fn delete_selection_multi_line() {
+        let mut b = empty();
+        typed(&mut b, "abc");
+        b.newline();
+        typed(&mut b, "def");
+        b.newline();
+        typed(&mut b, "ghi");
+        // select from (1,0) to (3,2): "bc" + "def" + "ghi"
+        b.home();
+        b.move_up();
+        b.move_up();
+        b.move_right();
+        b.begin_selection();
+        b.move_down();
+        b.move_down();
+        b.move_right();
+        b.move_right();
+        b.delete_selection();
+        assert_eq!(b.lines, vec!["a"]);
+        assert_eq!(b.cursor, (1, 0));
+    }
+
+    #[test]
+    fn typing_replaces_selection() {
+        let mut b = empty();
+        typed(&mut b, "hello");
+        b.home();
+        b.move_right();
+        b.begin_selection();
+        b.move_right();
+        b.move_right();
+        b.insert_char('X');
+        assert_eq!(b.lines, vec!["hXlo"]); // "el" was replaced
+        assert!(!b.has_selection());
+    }
+
+    #[test]
+    fn backspace_and_delete_replace_selection() {
+        let mut b = empty();
+        typed(&mut b, "hello");
+        b.home();
+        b.begin_selection();
+        b.end();
+        b.backspace();
+        assert_eq!(b.lines, vec![""]);
+
+        typed(&mut b, "hello");
+        b.home();
+        b.begin_selection();
+        b.end();
+        b.delete();
+        assert_eq!(b.lines, vec![""]);
+    }
+
+    #[test]
+    fn select_all_and_selected_text() {
+        let mut b = empty();
+        typed(&mut b, "one");
+        b.newline();
+        typed(&mut b, "two");
+        b.select_all();
+        assert_eq!(b.selected_text().as_deref(), Some("one\ntwo"));
+        // select all + type replaces everything
+        b.insert_char('z');
+        assert_eq!(b.lines, vec!["z"]);
+    }
+
+    #[test]
+    fn insert_multiline_with_newlines() {
+        let mut b = empty();
+        typed(&mut b, "ab");
+        b.newline();
+        typed(&mut b, "cd");
+        b.home();
+        b.move_down();
+        b.insert_multiline("X\nY\nZ");
+        assert_eq!(b.lines, vec!["ab", "X", "Y", "Zcd"]);
+        // select from line 2 through the end of line 3 and replace with "Q"
+        b.home();
+        b.move_up();
+        b.begin_selection();
+        b.move_down();
+        b.end();
+        b.insert_multiline("Q");
+        assert_eq!(b.lines, vec!["ab", "X", "Q"]);
+    }
+
+    #[test]
+    fn multi_line_edit_tracks_first_changed_line() {
+        let mut b = empty();
+        typed(&mut b, "abc");
+        b.newline();
+        typed(&mut b, "def");
+        b.home();
+        b.insert_multiline("1\n2\n3");
+        assert_eq!(b.last_edit_line, Some(0));
     }
 
     #[test]
