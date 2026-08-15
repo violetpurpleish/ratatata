@@ -166,6 +166,21 @@ impl App {
                     }
                     return;
                 }
+                // Ctrl+Z undoes, Ctrl+Shift+Z redoes (CapsLock typos land
+                // on redo, a harmless no-op without history). The shifted
+                // letter may arrive as 'Z' or as 'z'+Shift depending on
+                // the terminal, so accept both.
+                KeyCode::Char('z') | KeyCode::Char('Z') => {
+                    if self.save_as_input.is_none() {
+                        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                        if key.code == KeyCode::Char('z') && !shift {
+                            self.undo();
+                        } else {
+                            self.redo();
+                        }
+                    }
+                    return;
+                }
                 _ => return,
             }
         }
@@ -262,6 +277,31 @@ impl App {
             self.highlighter.invalidate_from(line);
         }
         self.buffer.ensure_visible(h as usize, w as usize);
+    }
+
+    // ---- undo / redo ------------------------------------------------------
+
+    fn undo(&mut self) {
+        if self.buffer.undo() {
+            self.after_undo_redo();
+        }
+    }
+
+    fn redo(&mut self) {
+        if self.buffer.redo() {
+            self.after_undo_redo();
+        }
+    }
+
+    /// Re-highlight the changed lines, keep the restored cursor visible,
+    /// and re-arm the quit guard (the buffer changed again).
+    fn after_undo_redo(&mut self) {
+        if let Some(line) = self.buffer.last_edit_line.take() {
+            self.highlighter.invalidate_from(line);
+        }
+        let (w, h) = self.editor_text;
+        self.buffer.ensure_visible(h as usize, w as usize);
+        self.quit_armed = false;
     }
 
     // ---- clipboard ---------------------------------------------------------
@@ -775,7 +815,7 @@ impl App {
         // right: position + help
         let (x, y) = self.buffer.cursor;
         let right = format!(
-            "{}:{}   Ctrl+O switch · Ctrl+S save · Ctrl+C/X/V copy/cut/paste · Ctrl+Q quit",
+            "{}:{}   Ctrl+O switch · Ctrl+S save · Ctrl+Z undo · Ctrl+Shift+Z redo · Ctrl+C/X/V copy/cut/paste · Ctrl+Q quit",
             y + 1,
             x + 1
         );
@@ -1209,14 +1249,14 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn render(app: &mut App) -> Vec<String> {
-        let backend = TestBackend::new(100, 24);
+        let backend = TestBackend::new(140, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         terminal
             .backend()
             .buffer()
             .content()
-            .chunks(100)
+            .chunks(140)
             .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
             .collect()
     }
@@ -1275,7 +1315,7 @@ mod tests {
     }
 
     fn render_buffer(app: &mut App) -> ratatui::buffer::Buffer {
-        let backend = TestBackend::new(100, 24);
+        let backend = TestBackend::new(140, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         terminal.backend().buffer().clone()
@@ -1843,5 +1883,136 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::REVERSED)
         );
+    }
+
+    // ---- undo / redo ------------------------------------------------------
+
+    fn ctrl_shift(c: char) -> KeyEvent {
+        KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )
+    }
+
+    fn cmd_shift(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::SUPER | KeyModifiers::SHIFT)
+    }
+
+    #[test]
+    fn ctrl_z_undoes_and_ctrl_shift_z_redoes() {
+        let dir = scratch("undoredo1");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha").unwrap();
+        let mut app = App::new(dir.clone(), Some(file)).unwrap();
+
+        app.handle_key(char_key('X'));
+        assert_eq!(app.buffer.lines, vec!["Xalpha"]);
+        assert!(app.buffer.dirty);
+
+        app.handle_key(ctrl('z'));
+        assert_eq!(app.buffer.lines, vec!["alpha"]);
+        assert!(!app.buffer.dirty);
+        assert_eq!(app.buffer.cursor, (0, 0));
+
+        app.handle_key(ctrl_shift('z'));
+        assert_eq!(app.buffer.lines, vec!["Xalpha"]);
+        assert!(app.buffer.dirty);
+        assert_eq!(app.buffer.cursor, (1, 0));
+    }
+
+    #[test]
+    fn cmd_z_and_cmd_shift_z_work_like_ctrl() {
+        let dir = scratch("undoredo2");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha").unwrap();
+        let mut app = App::new(dir.clone(), Some(file)).unwrap();
+
+        app.handle_key(char_key('X'));
+        app.handle_key(cmd('z'));
+        assert_eq!(app.buffer.lines, vec!["alpha"]);
+        app.handle_key(cmd_shift('z'));
+        assert_eq!(app.buffer.lines, vec!["Xalpha"]);
+    }
+
+    #[test]
+    fn undo_works_from_sidebar_focus() {
+        let dir = scratch("undoredo4");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha").unwrap();
+        let mut app = App::new(dir.clone(), Some(file)).unwrap();
+
+        app.handle_key(char_key('X'));
+        app.handle_key(ctrl('o')); // switch to the sidebar
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.handle_key(ctrl('z'));
+        assert_eq!(app.buffer.lines, vec!["alpha"]);
+    }
+
+    #[test]
+    fn ctrl_z_in_save_as_prompt_leaves_buffer_alone() {
+        let dir = scratch("undoredo5");
+        let mut app = App::new(dir, None).unwrap();
+        app.handle_key(ctrl('o'));
+        app.handle_key(char_key('x'));
+        app.handle_key(ctrl('s')); // no file name yet: save-as prompt
+        assert!(app.save_as_input.is_some());
+
+        app.handle_key(ctrl('z'));
+        assert!(app.save_as_input.is_some());
+        assert_eq!(app.buffer.lines, vec!["x"]);
+    }
+
+    #[test]
+    fn undo_redo_round_trip_across_save() {
+        let dir = scratch("undoredo6");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha").unwrap();
+        let mut app = App::new(dir.clone(), Some(file)).unwrap();
+
+        app.handle_key(char_key('X'));
+        app.handle_key(ctrl('s')); // save: "Xalpha" on disk
+        assert!(!app.buffer.dirty);
+
+        // undoing past the save restores the pre-edit text; the buffer
+        // now differs from what is on disk, so it is dirty again
+        app.handle_key(ctrl('z'));
+        assert_eq!(app.buffer.lines, vec!["alpha"]);
+        assert!(app.buffer.dirty);
+        // redoing brings back the saved content, which matches the disk
+        app.handle_key(ctrl_shift('z'));
+        assert_eq!(app.buffer.lines, vec!["Xalpha"]);
+        assert!(!app.buffer.dirty);
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "Xalpha");
+    }
+
+    #[test]
+    fn undo_rehighlights_restored_text() {
+        let dir = scratch("undoredo7");
+        let file = dir.join("code.rs");
+        fs::write(&file, "fn main() {\n}\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        let buf = render_buffer(&mut app);
+        assert_ne!(buf.cell((31, 1)).unwrap().style().fg, Some(Color::Reset));
+
+        // typing breaks the keyword, undo restores both text and color
+        app.handle_key(char_key('x'));
+        let buf = render_buffer(&mut app);
+        assert_eq!(buf.cell((31, 1)).unwrap().style().fg, Some(Color::Reset));
+
+        app.handle_key(ctrl('z'));
+        let buf = render_buffer(&mut app);
+        assert_eq!(buf.cell((31, 1)).unwrap().symbol(), "f");
+        assert_eq!(
+            buf.cell((31, 1)).unwrap().style().fg,
+            Some(Color::Rgb(180, 142, 173))
+        );
+    }
+
+    #[test]
+    fn status_bar_lists_undo_shortcut() {
+        let dir = scratch("undoredo8");
+        let mut app = App::new(dir, None).unwrap();
+        let rows = render(&mut app);
+        assert!(row_contains(&rows, "Ctrl+Z undo"));
     }
 }

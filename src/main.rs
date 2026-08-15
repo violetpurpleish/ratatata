@@ -145,6 +145,7 @@ fn print_usage() {
          keys (Cmd works like Ctrl on macOS-capable terminals):\n\
          \x20 Ctrl+O   switch between sidebar and editor\n\
          \x20 Ctrl+S   save the current file (asks for a name if untitled)\n\
+         \x20 Ctrl+Z   undo (Ctrl+Shift+Z redo)\n\
          \x20 Ctrl+C/X/V  copy / cut / paste\n\
          \x20 Ctrl+A   select all\n\
          \x20 Ctrl+Q   quit\n\

@@ -25,6 +25,7 @@ Two panes, one goal: a small, dependency-light editor that stays out of your way
 - **Full mouse support** — click to place the cursor, drag or Shift+click to select, double-click to select a word, triple-click to select a line, scroll wheel to move through text and directories
 - **macOS-friendly keys** — on terminals supporting the kitty keyboard protocol, Cmd+key works like Ctrl (unsupported terminals just ignore the request)
 - **Safe file handling** — a dirty buffer blocks opening another file, and Ctrl+Q asks for confirmation before discarding unsaved changes
+- **Undo / redo** — Ctrl+Z undoes, Ctrl+Shift+Z redoes; continuous typing, backspacing, deleting and pastes each collapse into a single undo step, and undoing restores the cursor, selection and modified state
 - **Unicode-aware editing** — the cursor tracks *characters*, not bytes, so wide characters and non-ASCII text render and edit correctly
 
 ## Usage
@@ -48,6 +49,7 @@ rat [path]
 | `Ctrl+S` | Save (asks for a name if untitled) |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste |
 | `Ctrl+A` | Select all |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | `Ctrl+Q` | Quit (press twice when there are unsaved changes) |
 | `Esc` / `Enter` | Cancel / confirm the save-as prompt |
 
@@ -77,7 +79,7 @@ Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`
 cargo test
 ```
 
-The test suite covers buffer editing, save/save-as flows, dirty-buffer guards, sidebar navigation, mouse interactions, and headless rendering (including syntax-highlight colors) via ratatui's `TestBackend`.
+The test suite covers buffer editing, undo/redo coalescing, save/save-as flows, dirty-buffer guards, sidebar navigation, mouse interactions, and headless rendering (including syntax-highlight colors) via ratatui's `TestBackend`.
 
 ## How it works
 
@@ -88,7 +90,7 @@ src/
 ├── app.rs        application state, key/mouse handling, rendering,
 │                 save-as flow, status bar
 ├── buffer.rs     line-based text buffer with char-indexed cursor,
-│                 selection, scrolling, load/save
+│                 selection, scrolling, undo/redo, load/save
 ├── sidebar.rs    scrollable directory listing (dirs first, ".." entry)
 ├── highlight.rs  incremental syntect highlighting with per-line cached
 │                 parse states and scope stacks

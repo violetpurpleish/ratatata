@@ -22,6 +22,39 @@ fn char_count(s: &str) -> usize {
     s.chars().count()
 }
 
+/// Maximum number of undo steps kept in memory (bounded history).
+const MAX_UNDO: usize = 1000;
+
+/// A saved pre-edit state, restored by undo/redo.
+#[derive(Clone)]
+struct Snapshot {
+    lines: Vec<String>,
+    cursor: (usize, usize),
+    selection_anchor: Option<(usize, usize)>,
+    selecting: bool,
+    dirty: bool,
+}
+
+/// What kind of edit a snapshot belongs to; consecutive edits of the same
+/// kind at a continuous cursor position merge into a single undo step.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditKind {
+    InsertChar,
+    Newline,
+    Backspace,
+    Delete,
+    DeleteSelection,
+}
+
+/// Index of the first line where `a` and `b` differ, or `None` when the
+/// line lists are identical.
+fn first_diff_line(a: &[String], b: &[String]) -> Option<usize> {
+    let n = a.len().min(b.len());
+    (0..n)
+        .find(|&i| a[i] != b[i])
+        .or_else(|| (a.len() != b.len()).then_some(n))
+}
+
 pub struct Buffer {
     pub lines: Vec<String>,
     /// Cursor position: `(x, y)` where `x` is a char index.
@@ -32,6 +65,11 @@ pub struct Buffer {
     pub path: Option<PathBuf>,
     /// Whether the buffer has unsaved changes.
     pub dirty: bool,
+    /// The content the buffer is considered clean against (the pristine
+    /// state for unsaved buffers, the loaded/saved content otherwise).
+    /// Used to recompute `dirty` after undo/redo, which snapshot-based
+    /// dirty flags cannot capture across a save.
+    clean_lines: Vec<String>,
     /// First line changed by the most recent edit operation (used to
     /// invalidate the syntax-highlight cache). Cleared by the app after
     /// use.
@@ -42,6 +80,19 @@ pub struct Buffer {
     /// True while the user is extending the selection (mouse drag or
     /// shift+arrow).
     pub selecting: bool,
+    /// Undo history: the state before each undo step, newest last.
+    undo_stack: Vec<Snapshot>,
+    /// Redo history, newest last; cleared by any new edit.
+    redo_stack: Vec<Snapshot>,
+    /// Kind and cursor position *after* the previous edit, used to merge
+    /// consecutive same-kind edits (continuous typing, backspacing or
+    /// deleting) into a single undo step. `None` after cursor movement,
+    /// selection changes, saves, and undo/redo.
+    last_edit: Option<(EditKind, (usize, usize))>,
+    /// While set, every edit merges into the current undo step (a paste
+    /// must be a single step even though it internally splits into
+    /// several `insert_char`/`newline` calls).
+    force_merge: bool,
 }
 
 impl Buffer {
@@ -53,9 +104,14 @@ impl Buffer {
             scroll: (0, 0),
             path: None,
             dirty: false,
+            clean_lines: vec![String::new()],
             last_edit_line: None,
             selection_anchor: None,
             selecting: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_edit: None,
+            force_merge: false,
         }
     }
 
@@ -66,6 +122,7 @@ impl Buffer {
         let content = fs::read_to_string(&path)?;
         let mut buf = Self::empty();
         buf.lines = content.split('\n').map(str::to_string).collect();
+        buf.clean_lines = buf.lines.clone();
         buf.path = Some(path);
         Ok(buf)
     }
@@ -78,7 +135,10 @@ impl Buffer {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "buffer has no file name"))?;
         let content = self.lines.join("\n");
         fs::write(path, content)?;
+        self.clean_lines = self.lines.clone();
         self.dirty = false;
+        // typing right after a save starts a fresh undo step
+        self.last_edit = None;
         Ok(())
     }
 
@@ -103,12 +163,16 @@ impl Buffer {
     // ---- editing -----------------------------------------------------------
 
     pub fn insert_char(&mut self, c: char) {
-        self.delete_selection();
+        let replaced = self.delete_selection();
+        if !replaced && !self.mergeable(EditKind::InsertChar) {
+            self.push_undo(EditKind::InsertChar);
+        }
         let (x, y) = self.cursor;
         let line = &mut self.lines[y];
         let byte = char_index_to_byte(line, x);
         line.insert(byte, c);
         self.cursor.0 += 1;
+        self.last_edit = Some((EditKind::InsertChar, self.cursor));
         self.dirty = true;
         self.mark_edited(y);
     }
@@ -120,8 +184,19 @@ impl Buffer {
     }
 
     /// Insert possibly multi-line text (paste) at the cursor. A leading
-    /// selection is replaced.
+    /// selection is replaced. The whole paste is a single undo step.
     pub fn insert_multiline(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        // open the paste's undo step explicitly, then fold the internal
+        // insert_char/newline calls into it via force_merge
+        if self.has_selection() {
+            self.push_undo(EditKind::DeleteSelection);
+        } else {
+            self.push_undo(EditKind::InsertChar);
+        }
+        self.force_merge = true;
         let mut parts = text.split('\n');
         if let Some(first) = parts.next() {
             self.insert_text(first);
@@ -130,10 +205,16 @@ impl Buffer {
                 self.insert_text(rest);
             }
         }
+        self.force_merge = false;
+        // whatever follows the paste starts a fresh undo step
+        self.last_edit = None;
     }
 
     pub fn newline(&mut self) {
-        self.delete_selection();
+        let replaced = self.delete_selection();
+        if !replaced && !self.mergeable(EditKind::Newline) {
+            self.push_undo(EditKind::Newline);
+        }
         let (x, y) = self.cursor;
         let line = self.lines[y].clone();
         let byte = char_index_to_byte(&line, x);
@@ -141,6 +222,7 @@ impl Buffer {
         self.lines[y] = left.to_string();
         self.lines.insert(y + 1, right.to_string());
         self.cursor = (0, y + 1);
+        self.last_edit = Some((EditKind::Newline, self.cursor));
         self.dirty = true;
         self.mark_edited(y);
     }
@@ -150,19 +232,24 @@ impl Buffer {
             return;
         }
         let (x, y) = self.cursor;
+        if x == 0 && y == 0 {
+            return; // nothing to delete
+        }
+        if !self.mergeable(EditKind::Backspace) {
+            self.push_undo(EditKind::Backspace);
+        }
         if x > 0 {
             let line = &mut self.lines[y];
             let byte = char_index_to_byte(line, x - 1);
             line.remove(byte);
             self.cursor.0 -= 1;
-        } else if y > 0 {
+        } else {
             let prev_len = self.line_len(y - 1);
             let rest = self.lines.remove(y);
             self.lines[y - 1].push_str(&rest);
             self.cursor = (prev_len, y - 1);
-        } else {
-            return;
         }
+        self.last_edit = Some((EditKind::Backspace, self.cursor));
         self.dirty = true;
         self.mark_edited(self.cursor.1);
     }
@@ -172,18 +259,24 @@ impl Buffer {
             return;
         }
         let (x, y) = self.cursor;
-        if x < self.line_len(y) {
+        let line_len = self.line_len(y);
+        if x >= line_len && y + 1 >= self.lines.len() {
+            return; // nothing to delete
+        }
+        if !self.mergeable(EditKind::Delete) {
+            self.push_undo(EditKind::Delete);
+        }
+        if x < line_len {
             let line = &mut self.lines[y];
             let byte = char_index_to_byte(line, x);
             line.remove(byte);
-        } else if y + 1 < self.lines.len() {
+        } else {
             let rest = self.lines.remove(y + 1);
             self.lines[y].push_str(&rest);
-        } else {
-            return;
         }
+        self.last_edit = Some((EditKind::Delete, self.cursor));
         self.dirty = true;
-        self.mark_edited(self.cursor.1);
+        self.mark_edited(y);
     }
 
     // ---- selection ---------------------------------------------------------
@@ -210,22 +303,26 @@ impl Buffer {
 
     /// Start extending the selection from the current cursor position.
     pub fn begin_selection(&mut self) {
+        self.break_chain();
         self.selection_anchor = Some(self.cursor);
         self.selecting = true;
     }
 
     /// Stop extending the selection (mouse button released), keeping it.
     pub fn end_selection(&mut self) {
+        self.break_chain();
         self.selecting = false;
     }
 
     pub fn clear_selection(&mut self) {
+        self.break_chain();
         self.selection_anchor = None;
         self.selecting = false;
     }
 
     /// Select the whole buffer.
     pub fn select_all(&mut self) {
+        self.break_chain();
         let last = self.lines.len() - 1;
         self.selection_anchor = Some((0, 0));
         self.cursor = (self.line_len(last), last);
@@ -274,6 +371,7 @@ impl Buffer {
     /// adjacent run of punctuation is selected instead (so double-clicking
     /// `->` selects `->`). An empty line selects nothing.
     pub fn select_word_at(&mut self, (x, y): (usize, usize)) {
+        self.break_chain();
         match self.word_range_at((x, y)) {
             Some((start, end)) => {
                 self.selection_anchor = Some((start, y));
@@ -292,6 +390,7 @@ impl Buffer {
     /// or whitespace run at `(x, y)` (used when dragging after a
     /// double-click).
     pub fn extend_selection_word_at(&mut self, (x, y): (usize, usize)) {
+        self.break_chain();
         if self.selection_anchor.is_none() {
             self.begin_selection();
         }
@@ -313,6 +412,7 @@ impl Buffer {
         if y >= self.lines.len() {
             return;
         }
+        self.break_chain();
         if self.selection_anchor.is_none() {
             self.begin_selection();
         }
@@ -326,6 +426,7 @@ impl Buffer {
         if y >= self.lines.len() {
             return;
         }
+        self.break_chain();
         let len = self.line_len(y);
         self.selection_anchor = Some((0, y));
         self.cursor = (len, y);
@@ -379,6 +480,9 @@ impl Buffer {
         let Some((start, end)) = self.selection_range() else {
             return false;
         };
+        if !self.mergeable(EditKind::DeleteSelection) {
+            self.push_undo(EditKind::DeleteSelection);
+        }
         let (start_char, start_line) = start;
         let (end_char, end_line) = end;
         if start_line == end_line {
@@ -398,14 +502,112 @@ impl Buffer {
         }
         self.cursor = start;
         self.clear_selection();
+        self.last_edit = Some((EditKind::DeleteSelection, start));
         self.dirty = true;
         self.mark_edited(start_line);
+        true
+    }
+
+    // ---- undo / redo ------------------------------------------------------
+
+    /// Save the current state as an undo step (dropping the oldest when
+    /// the history is full) and discard any redo history.
+    fn push_undo(&mut self, kind: EditKind) {
+        self.undo_stack.push(self.snapshot());
+        if self.undo_stack.len() > MAX_UNDO {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+        self.last_edit = Some((kind, self.cursor));
+    }
+
+    /// Whether an edit of `kind` starting at the current cursor continues
+    /// the previous edit's undo step. Continuous typing, backspacing and
+    /// deleting merge; anything else (different kind, cursor movement or
+    /// a selection change) starts a new step.
+    fn mergeable(&self, kind: EditKind) -> bool {
+        if self.force_merge {
+            return true;
+        }
+        let Some((last_kind, last_pos)) = self.last_edit else {
+            return false;
+        };
+        match (last_kind, kind) {
+            (EditKind::InsertChar, EditKind::InsertChar)
+            | (EditKind::Backspace, EditKind::Backspace)
+            | (EditKind::Delete, EditKind::Delete)
+            | (EditKind::Newline, EditKind::Newline) => self.cursor == last_pos,
+            _ => false,
+        }
+    }
+
+    /// Break the merge chain: the next edit starts a fresh undo step.
+    /// Called after cursor movement, selection changes and saves.
+    fn break_chain(&mut self) {
+        self.last_edit = None;
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            lines: self.lines.clone(),
+            cursor: self.cursor,
+            selection_anchor: self.selection_anchor,
+            selecting: self.selecting,
+            dirty: self.dirty,
+        }
+    }
+
+    fn restore(&mut self, snap: Snapshot) {
+        self.lines = snap.lines;
+        self.cursor = snap.cursor;
+        self.selection_anchor = snap.selection_anchor;
+        self.selecting = snap.selecting;
+        self.dirty = snap.dirty;
+    }
+
+    /// Undo the last edit. Returns `true` when something was undone and
+    /// sets `last_edit_line` to the first changed line (for
+    /// re-highlighting). The restored state also brings back the cursor,
+    /// selection and dirty flag.
+    pub fn undo(&mut self) -> bool {
+        let Some(snap) = self.undo_stack.pop() else {
+            return false;
+        };
+        let first_diff = first_diff_line(&snap.lines, &self.lines);
+        self.redo_stack.push(self.snapshot());
+        self.restore(snap);
+        // the dirty flag cannot be snapshotted across a save: recompute it
+        // against the content the file was last saved with
+        self.dirty = self.clean_lines != self.lines;
+        self.last_edit = None;
+        self.force_merge = false;
+        self.last_edit_line = first_diff;
+        true
+    }
+
+    /// Redo the last undone edit. Returns `true` when something was
+    /// redone and sets `last_edit_line` to the first changed line.
+    pub fn redo(&mut self) -> bool {
+        let Some(snap) = self.redo_stack.pop() else {
+            return false;
+        };
+        let first_diff = first_diff_line(&snap.lines, &self.lines);
+        self.undo_stack.push(self.snapshot());
+        if self.undo_stack.len() > MAX_UNDO {
+            self.undo_stack.remove(0);
+        }
+        self.restore(snap);
+        self.dirty = self.clean_lines != self.lines;
+        self.last_edit = None;
+        self.force_merge = false;
+        self.last_edit_line = first_diff;
         true
     }
 
     // ---- cursor movement ---------------------------------------------------
 
     pub fn move_left(&mut self) {
+        self.break_chain();
         if self.cursor.0 > 0 {
             self.cursor.0 -= 1;
         } else if self.cursor.1 > 0 {
@@ -415,6 +617,7 @@ impl Buffer {
     }
 
     pub fn move_right(&mut self) {
+        self.break_chain();
         let len = self.line_len(self.cursor.1);
         if self.cursor.0 < len {
             self.cursor.0 += 1;
@@ -425,6 +628,7 @@ impl Buffer {
     }
 
     pub fn move_up(&mut self) {
+        self.break_chain();
         if self.cursor.1 > 0 {
             self.cursor.1 -= 1;
             self.clamp_x();
@@ -432,6 +636,7 @@ impl Buffer {
     }
 
     pub fn move_down(&mut self) {
+        self.break_chain();
         if self.cursor.1 + 1 < self.lines.len() {
             self.cursor.1 += 1;
             self.clamp_x();
@@ -439,14 +644,17 @@ impl Buffer {
     }
 
     pub fn home(&mut self) {
+        self.break_chain();
         self.cursor.0 = 0;
     }
 
     pub fn end(&mut self) {
+        self.break_chain();
         self.cursor.0 = self.line_len(self.cursor.1);
     }
 
     pub fn page_up(&mut self, rows: usize) {
+        self.break_chain();
         if rows > 0 {
             self.cursor.1 = self.cursor.1.saturating_sub(rows);
             self.clamp_x();
@@ -454,6 +662,7 @@ impl Buffer {
     }
 
     pub fn page_down(&mut self, rows: usize) {
+        self.break_chain();
         if rows > 0 {
             let last = self.lines.len() - 1;
             self.cursor.1 = (self.cursor.1 + rows).min(last);
@@ -1047,5 +1256,238 @@ mod tests {
     fn save_without_path_errors() {
         let mut b = empty();
         assert!(b.save().is_err());
+    }
+
+    // ---- undo / redo ------------------------------------------------------
+
+    #[test]
+    fn undo_redo_round_trip_restores_text_cursor_and_dirty() {
+        let mut b = empty();
+        b.insert_text("hello");
+        assert!(b.dirty);
+        b.undo();
+        assert_eq!(b.lines, vec![""]);
+        assert_eq!(b.cursor, (0, 0));
+        assert!(!b.dirty); // back to the pristine state
+        b.redo();
+        assert_eq!(b.lines, vec!["hello"]);
+        assert_eq!(b.cursor, (5, 0));
+        assert!(b.dirty);
+        b.undo();
+        assert_eq!(b.lines, vec![""]);
+        assert!(!b.dirty);
+    }
+
+    #[test]
+    fn continuous_typing_is_one_undo_step() {
+        let mut b = empty();
+        b.insert_text("hello");
+        b.undo();
+        assert_eq!(b.lines, vec![""]);
+        b.redo();
+        assert_eq!(b.lines, vec!["hello"]);
+    }
+
+    #[test]
+    fn cursor_movement_splits_typing_runs() {
+        let mut b = empty();
+        b.insert_text("ab");
+        b.move_left();
+        b.insert_char('X');
+        assert_eq!(b.lines, vec!["aXb"]);
+        // three separate undo steps: "a", "b", then "X"
+        b.undo();
+        assert_eq!(b.lines, vec!["ab"]);
+        assert_eq!(b.cursor, (1, 0)); // where the undone edit started
+        b.undo();
+        assert_eq!(b.lines, vec![""]);
+        b.redo();
+        b.redo();
+        assert_eq!(b.lines, vec!["aXb"]);
+    }
+
+    #[test]
+    fn backspace_run_is_one_undo_step() {
+        let mut b = empty();
+        b.insert_text("hello");
+        b.backspace();
+        b.backspace();
+        assert_eq!(b.lines, vec!["hel"]);
+        b.undo();
+        assert_eq!(b.lines, vec!["hello"]);
+        assert_eq!(b.cursor, (5, 0));
+        b.undo();
+        assert_eq!(b.lines, vec![""]);
+    }
+
+    #[test]
+    fn delete_run_is_one_undo_step() {
+        let mut b = empty();
+        b.insert_text("abc");
+        b.home();
+        b.delete();
+        b.delete();
+        assert_eq!(b.lines, vec!["c"]);
+        b.undo();
+        assert_eq!(b.lines, vec!["abc"]);
+        assert_eq!(b.cursor, (0, 0));
+    }
+
+    #[test]
+    fn consecutive_newlines_merge_but_typing_after_enter_does_not() {
+        let mut b = empty();
+        b.insert_text("ab");
+        b.newline();
+        b.insert_text("cd");
+        // entries: [before "ab"], [before the newline], [before "cd"]
+        b.undo();
+        assert_eq!(b.lines, vec!["ab", ""]);
+        b.undo();
+        assert_eq!(b.lines, vec!["ab"]);
+        b.undo();
+        assert_eq!(b.lines, vec![""]);
+        b.redo();
+        b.redo();
+        b.redo();
+        assert_eq!(b.lines, vec!["ab", "cd"]);
+
+        // but consecutive enters are a single step
+        let mut b = empty();
+        b.newline();
+        b.newline();
+        b.undo();
+        assert_eq!(b.lines, vec![""]);
+    }
+
+    #[test]
+    fn paste_is_single_undo_step() {
+        let mut b = empty();
+        b.insert_text("ab");
+        b.newline();
+        b.insert_text("cd");
+        b.home();
+        b.move_down();
+        b.insert_multiline("X\nY\nZ");
+        assert_eq!(b.lines, vec!["ab", "X", "Y", "Zcd"]);
+        b.undo();
+        assert_eq!(b.lines, vec!["ab", "cd"]);
+        assert_eq!(b.cursor, (0, 1));
+    }
+
+    #[test]
+    fn typing_over_selection_is_single_undo_step() {
+        let mut b = empty();
+        b.insert_text("hello");
+        b.home();
+        b.begin_selection();
+        b.move_right();
+        b.move_right();
+        b.insert_char('X');
+        assert_eq!(b.lines, vec!["Xllo"]);
+        b.undo();
+        assert_eq!(b.lines, vec!["hello"]);
+        // the replaced selection comes back along with the text
+        assert_eq!(b.selection_anchor, Some((0, 0)));
+        assert_eq!(b.cursor, (2, 0));
+    }
+
+    #[test]
+    fn paste_over_selection_is_single_undo_step() {
+        let mut b = empty();
+        b.insert_text("abc");
+        b.home();
+        b.begin_selection();
+        b.move_right();
+        b.insert_multiline("XY\nZ");
+        assert_eq!(b.lines, vec!["XY", "Zbc"]);
+        b.undo();
+        assert_eq!(b.lines, vec!["abc"]);
+        assert_eq!(b.selection_anchor, Some((0, 0)));
+        assert_eq!(b.cursor, (1, 0));
+    }
+
+    #[test]
+    fn cut_undo_restores_selection() {
+        let mut b = empty();
+        b.insert_text("hello");
+        b.home();
+        b.begin_selection();
+        b.end();
+        b.delete_selection();
+        assert_eq!(b.lines, vec![""]);
+        assert!(!b.has_selection());
+        b.undo();
+        assert_eq!(b.lines, vec!["hello"]);
+        assert_eq!(b.selection_anchor, Some((0, 0)));
+        assert_eq!(b.cursor, (5, 0));
+    }
+
+    #[test]
+    fn new_edit_after_undo_clears_redo() {
+        let mut b = empty();
+        b.insert_text("a");
+        b.undo();
+        b.insert_text("b");
+        assert!(!b.redo());
+        assert_eq!(b.lines, vec!["b"]);
+        b.undo();
+        assert_eq!(b.lines, vec![""]);
+    }
+
+    #[test]
+    fn undo_and_redo_are_noops_on_empty_history() {
+        let mut b = empty();
+        assert!(!b.undo());
+        assert!(!b.redo());
+        b.insert_text("x");
+        b.undo();
+        assert!(!b.undo()); // already at the beginning
+        b.redo();
+        assert!(!b.redo()); // already at the end
+    }
+
+    #[test]
+    fn undo_history_is_capped() {
+        let mut b = empty();
+        for _ in 0..MAX_UNDO + 50 {
+            b.move_right(); // break the typing chain each time
+            b.insert_char('x');
+        }
+        assert_eq!(b.undo_stack.len(), MAX_UNDO);
+        // undoing everything stops at the oldest kept snapshot: the
+        // dropped entries' edits stay applied
+        while b.undo() {}
+        assert_eq!(b.lines, vec!["x".repeat(50)]);
+    }
+
+    #[test]
+    fn save_breaks_the_typing_chain() {
+        let path = tmp_path("undo-save.txt");
+        let mut b = empty();
+        b.path = Some(path.clone());
+        b.insert_text("ab");
+        b.save().unwrap();
+        b.insert_text("c");
+        // undoing the post-save typing stops at the saved text
+        b.undo();
+        assert_eq!(b.lines, vec!["ab"]);
+        assert!(!b.dirty);
+        b.undo();
+        assert_eq!(b.lines, vec![""]);
+    }
+
+    #[test]
+    fn undo_sets_last_edit_line_for_rehighlighting() {
+        let mut b = empty();
+        b.insert_text("abc");
+        b.newline();
+        b.insert_text("def");
+        b.home();
+        b.move_down();
+        b.insert_char('X'); // line 1 changed
+        b.undo();
+        assert_eq!(b.last_edit_line, Some(1));
+        b.redo();
+        assert_eq!(b.last_edit_line, Some(1));
     }
 }
