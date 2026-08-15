@@ -34,6 +34,7 @@ use crate::highlight::Highlighter;
 use crate::image_view::{self, ImagePreview};
 use crate::search::Search;
 use crate::sidebar::{Kind, Sidebar};
+use ratatui_image::FontSize;
 use ratatui_image::picker::Picker;
 
 /// How long transient status messages stay visible.
@@ -76,9 +77,11 @@ pub struct App {
     pub should_quit: bool,
     highlighter: Highlighter,
     pub clipboard: Box<dyn Clipboard>,
-    /// Terminal graphics picker (protocol + font size), used to build
-    /// image previews.
+    /// Terminal graphics picker (protocol + backing-pixel cell size), used
+    /// to build image previews.
     picker: Picker,
+    /// Logical cell size used for the preview's no-upscaling decision.
+    logical_cell_size: FontSize,
     /// Active image preview replacing the text buffer, `None` while editing
     /// text.
     image: Option<ImagePreview>,
@@ -104,7 +107,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(dir: PathBuf, file: Option<PathBuf>, picker: Picker) -> io::Result<Self> {
+    pub fn new_with_cell_size(
+        dir: PathBuf,
+        file: Option<PathBuf>,
+        picker: Picker,
+        logical_cell_size: FontSize,
+    ) -> io::Result<Self> {
         let mut highlighter = Highlighter::new();
         highlighter.set_path(file.as_deref());
         // An image file starts an image preview instead of a text buffer;
@@ -112,7 +120,11 @@ impl App {
         let (buffer, image) = match &file {
             Some(path) if image_view::is_image_path(path) => (
                 Buffer::empty(),
-                Some(ImagePreview::open(path.clone(), &picker)?),
+                Some(ImagePreview::open_with_cell_size(
+                    path.clone(),
+                    &picker,
+                    logical_cell_size,
+                )?),
             ),
             Some(path) => (Buffer::from_path(path.clone())?, None),
             None => (Buffer::empty(), None),
@@ -134,6 +146,7 @@ impl App {
             highlighter,
             clipboard: Box::new(SystemClipboard::new()),
             picker,
+            logical_cell_size,
             image,
             message: None,
             save_as_input: None,
@@ -150,6 +163,22 @@ impl App {
 
     fn set_message(&mut self, msg: impl Into<String>) {
         self.message = Some((msg.into(), Instant::now() + MESSAGE_TTL));
+    }
+
+    /// Re-read terminal metrics after a resize without re-querying graphics
+    /// protocol support. The image data remains decoded; only its cached
+    /// protocol is invalidated so it is rebuilt on the next draw.
+    pub(crate) fn refresh_terminal_metrics(&mut self) {
+        let (picker, logical_cell_size) = crate::refresh_image_picker(&self.picker);
+        self.update_image_metrics(picker, logical_cell_size);
+    }
+
+    fn update_image_metrics(&mut self, picker: Picker, logical_cell_size: FontSize) {
+        self.picker = picker.clone();
+        self.logical_cell_size = logical_cell_size;
+        if let Some(preview) = &mut self.image {
+            preview.update_metrics(picker, logical_cell_size);
+        }
     }
 
     // ---- key handling ------------------------------------------------------
@@ -234,11 +263,14 @@ impl App {
             }
         }
 
-        // An image preview replaces the buffer entirely: the only key that
-        // does anything is Esc, which closes the preview.
+        // An image preview keeps the editor read-only, but it must not make
+        // the sidebar modal: Ctrl+O can move focus here and ordinary sidebar
+        // navigation (including opening another entry) must continue to work.
         if self.image.is_some() {
             if key.code == KeyCode::Esc {
                 self.close_image_preview();
+            } else if self.focus == Focus::Sidebar {
+                self.handle_sidebar_key(key);
             }
             return;
         }
@@ -807,7 +839,11 @@ impl App {
             return;
         }
         if image_view::is_image_path(&path) {
-            match ImagePreview::open(path.clone(), &self.picker) {
+            match ImagePreview::open_with_cell_size(
+                path.clone(),
+                &self.picker,
+                self.logical_cell_size,
+            ) {
                 Ok(preview) => {
                     self.buffer = Buffer::empty();
                     self.image = Some(preview);
@@ -915,10 +951,11 @@ impl App {
 
     fn draw_editor(&mut self, frame: &mut Frame, area: Rect) {
         let title = self
-            .buffer
-            .path
+            .image
             .as_ref()
-            .map_or_else(|| "untitled".to_string(), |p| p.display().to_string());
+            .map(|preview| preview.path.display().to_string())
+            .or_else(|| self.buffer.path.as_ref().map(|p| p.display().to_string()))
+            .unwrap_or_else(|| "untitled".to_string());
         let title = truncate(&title, area.width as usize);
 
         let block = Block::bordered()
@@ -1387,7 +1424,8 @@ mod tests {
 
     /// App with the deterministic half-blocks picker (no terminal query).
     fn new_app(dir: PathBuf, file: Option<PathBuf>) -> std::io::Result<App> {
-        App::new(dir, file, Picker::halfblocks())
+        let picker = Picker::halfblocks();
+        App::new_with_cell_size(dir, file, picker, image_view::fallback_logical_cell_size())
     }
     use std::fs;
 
@@ -2766,6 +2804,41 @@ mod tests {
     }
 
     #[test]
+    fn image_preview_title_uses_image_path() {
+        let dir = scratch("imgtitle");
+        let file = dir.join("pic.png");
+        write_test_png(&file);
+        let mut app = new_app(dir, Some(file)).unwrap();
+        let rows = render(&mut app);
+        assert!(row_contains(&rows, "pic.png"));
+        assert!(!row_contains(&rows, "untitled"));
+    }
+
+    #[test]
+    fn updating_image_metrics_invalidates_protocol_without_redecoding() {
+        let dir = scratch("imgmetrics");
+        let file = dir.join("pic.png");
+        write_test_png(&file);
+        let mut app = new_app(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+
+        let (pixels, protocol_was_built) = {
+            let preview = app.image.as_ref().unwrap();
+            (preview.pixels, preview.has_cached_protocol())
+        };
+        assert!(protocol_was_built);
+
+        app.update_image_metrics(Picker::halfblocks(), FontSize::new(4, 8));
+        let preview = app.image.as_ref().unwrap();
+        assert_eq!(preview.pixels, pixels);
+        assert!(!preview.has_cached_protocol());
+
+        // The next draw rebuilds the protocol from the existing decoded image.
+        render_buffer(&mut app);
+        assert!(app.image.as_ref().unwrap().has_cached_protocol());
+    }
+
+    #[test]
     fn preview_renders_halfblock_pixels() {
         let dir = scratch("imgdraw");
         let file = dir.join("pic.png");
@@ -2883,6 +2956,41 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_navigation_continues_while_preview_is_active() {
+        let dir = scratch("imgnavigate");
+        write_test_png(&dir.join("pic.png"));
+        write_test_png(&dir.join("other.png"));
+        fs::write(dir.join("notes.txt"), "text\n").unwrap();
+        fs::create_dir(dir.join("nested")).unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("pic.png"))).unwrap();
+
+        app.handle_key(ctrl('o'));
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.sidebar.select_name("notes.txt");
+        let start = app.sidebar.selected;
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.sidebar.selected, start);
+
+        // Directory navigation remains available even though the editor is
+        // displaying an image.
+        app.sidebar.select_name("nested");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.image.is_some());
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(app.sidebar.dir, dir.join("nested"));
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.sidebar.dir, dir);
+
+        // Enter can open another image directly from the active preview.
+        app.sidebar.select_name("other.png");
+        app.handle_key(key(KeyCode::Enter));
+        let preview = app.image.as_ref().expect("image preview");
+        assert_eq!(preview.path, dir.join("other.png"));
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
     fn sidebar_opens_images_and_dirty_buffers_block_them() {
         let dir = scratch("imgside");
         fs::write(dir.join("a.txt"), "text\n").unwrap();
@@ -2915,7 +3023,13 @@ mod tests {
         let dir = scratch("imgcorrupt");
         let file = dir.join("bad.png");
         fs::write(&file, "definitely not an image").unwrap();
-        let err = match App::new(dir, Some(file), Picker::halfblocks()) {
+        let picker = Picker::halfblocks();
+        let err = match App::new_with_cell_size(
+            dir,
+            Some(file),
+            picker,
+            image_view::fallback_logical_cell_size(),
+        ) {
             Ok(_) => panic!("expected an error for a corrupt image"),
             Err(e) => e,
         };

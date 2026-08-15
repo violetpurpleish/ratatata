@@ -58,8 +58,8 @@ fn main() -> io::Result<()> {
     // possible. Terminals without any support fall back to unicode
     // half-blocks. Must run after entering the alternate screen but before
     // the event loop reads input (it briefly reads stdin itself).
-    let picker = detect_image_picker();
-    let mut app = match App::new(dir, file, picker) {
+    let (picker, logical_cell_size) = detect_image_picker();
+    let mut app = match App::new_with_cell_size(dir, file, picker, logical_cell_size) {
         Ok(app) => app,
         Err(e) => {
             let _ = disable_terminal_capabilities();
@@ -114,34 +114,95 @@ fn disable_terminal_capabilities() -> io::Result<()> {
     )
 }
 
-/// Detect graphics support and correct the cell pixel dimensions using the
-/// terminal's window-size report when it is available. This matters on
-/// HiDPI/Retina terminals: a picker can otherwise receive logical cell
-/// dimensions while Kitty image placement uses physical pixels, making an
-/// image appear smaller than the actual editor viewport.
+/// Detect graphics support and retain the picker cell dimensions used by the
+/// graphics protocol. On macOS, an AppKit backing-scale query supplies the
+/// separate logical cell dimensions used only by the resize decision.
 #[allow(deprecated)]
-fn detect_image_picker() -> Picker {
+fn detect_image_picker() -> (Picker, FontSize) {
     let detected = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-    let protocol = detected.protocol_type();
-    let Ok(window) = crossterm::terminal::window_size() else {
-        return detected;
+    image_view::log_picker_observation("query", &detected);
+    refresh_image_picker(&detected)
+}
+
+/// Refresh the terminal cell metrics without querying graphics capabilities
+/// again. The existing protocol type is copied to any newly constructed
+/// picker, which is important during a font-size-only terminal resize.
+#[allow(deprecated)]
+pub(crate) fn refresh_image_picker(current: &Picker) -> (Picker, FontSize) {
+    let protocol = current.protocol_type();
+    let picker = match crossterm::terminal::window_size() {
+        Ok(window)
+            if window.columns != 0
+                && window.rows != 0
+                && window.width != 0
+                && window.height != 0 =>
+        {
+            let font_size =
+                FontSize::new(window.width / window.columns, window.height / window.rows);
+            let current_font = current.font_size();
+            if font_size.width != 0
+                && font_size.height != 0
+                && (font_size.width != current_font.width
+                    || font_size.height != current_font.height)
+            {
+                let mut refreshed = Picker::from_fontsize(font_size);
+                refreshed.set_protocol_type(protocol);
+                refreshed
+            } else {
+                current.clone()
+            }
+        }
+        _ => current.clone(),
     };
-    if window.columns == 0 || window.rows == 0 || window.width == 0 || window.height == 0 {
-        return detected;
+
+    image_view::log_picker_observation("render", &picker);
+    let physical_cell_size = picker.font_size();
+    let backing_scale = macos_backing_scale_factor();
+    let logical_cell_size = logical_cell_size_from_scale(physical_cell_size, backing_scale)
+        .unwrap_or_else(image_view::fallback_logical_cell_size);
+    image_view::log_scale_observation(physical_cell_size, backing_scale, logical_cell_size);
+    (picker, logical_cell_size)
+}
+
+/// Convert backing-pixel cell dimensions into logical dimensions. Rounding is
+/// necessary because ratatui-image represents cell dimensions as integers.
+fn logical_cell_size_from_scale(
+    backing_cell_size: FontSize,
+    backing_scale: Option<f64>,
+) -> Option<FontSize> {
+    let scale = backing_scale?;
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
     }
 
-    let font_size = FontSize::new(window.width / window.columns, window.height / window.rows);
-    let detected_font = detected.font_size();
-    if font_size.width == 0
-        || font_size.height == 0
-        || (font_size.width == detected_font.width && font_size.height == detected_font.height)
-    {
-        return detected;
+    fn divide(value: u16, scale: f64) -> Option<u16> {
+        let logical = f64::from(value) / scale;
+        if !logical.is_finite() || logical < 1.0 || logical > f64::from(u16::MAX) {
+            return None;
+        }
+        Some(logical.round() as u16)
     }
 
-    let mut corrected = Picker::from_fontsize(font_size);
-    corrected.set_protocol_type(protocol);
-    corrected
+    Some(FontSize::new(
+        divide(backing_cell_size.width, scale)?,
+        divide(backing_cell_size.height, scale)?,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_backing_scale_factor() -> Option<f64> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSScreen;
+
+    let marker = MainThreadMarker::new()?;
+    let screen = NSScreen::mainScreen(marker)?;
+    let scale = screen.backingScaleFactor();
+    (scale.is_finite() && scale > 0.0).then_some(scale)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_backing_scale_factor() -> Option<f64> {
+    None
 }
 
 /// Figure out what directory the sidebar should show and which file (if any)
@@ -188,7 +249,7 @@ fn run(app: &mut App, terminal: &mut DefaultTerminal) -> io::Result<()> {
                 }
                 Event::Mouse(event) => app.handle_mouse(event),
                 Event::Paste(text) => app.paste_text(text),
-                Event::Resize(..) => {}
+                Event::Resize(..) => app.refresh_terminal_metrics(),
                 _ => {}
             }
         }
@@ -220,4 +281,43 @@ fn print_usage() {
          \x20 editor:   type, arrows (+Shift to select), Home/End, PgUp/PgDn, Backspace, Delete, Tab\n\n         images:  opening an image file (png/jpg/gif/webp/…) previews it in the\n         \x20            editor pane via the terminal's graphics protocol (kitty, sixel,
          \x20            iTerm2, or unicode half-blocks as a last resort); Esc closes"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_cell_size_scale_one_is_unchanged() {
+        assert_eq!(
+            logical_cell_size_from_scale(FontSize::new(16, 34), Some(1.0))
+                .map(|size| (size.width, size.height)),
+            Some((16, 34))
+        );
+    }
+
+    #[test]
+    fn logical_cell_size_scale_two_matches_retina_dimensions() {
+        assert_eq!(
+            logical_cell_size_from_scale(FontSize::new(16, 34), Some(2.0))
+                .map(|size| (size.width, size.height)),
+            Some((8, 17))
+        );
+    }
+
+    #[test]
+    fn invalid_or_unavailable_scale_uses_the_known_good_fallback() {
+        let fallback = image_view::fallback_logical_cell_size();
+        for scale in [
+            None,
+            Some(0.0),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
+            let logical =
+                logical_cell_size_from_scale(FontSize::new(16, 34), scale).unwrap_or(fallback);
+            assert_eq!((logical.width, logical.height), (8, 16));
+        }
+    }
 }
