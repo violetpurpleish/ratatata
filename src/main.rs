@@ -1,4 +1,4 @@
-//! ratata — a tiny terminal text editor built with ratatui.
+//! ratatata — a tiny terminal text editor built with ratatui.
 //!
 //! Run with no arguments to browse the current directory, or pass a file or
 //! directory to open.
@@ -93,10 +93,7 @@ fn resolve_start(arg: Option<PathBuf>) -> io::Result<(PathBuf, Option<PathBuf>)>
     }
     if arg.exists() {
         let canon = fs::canonicalize(arg)?;
-        let dir = canon
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
+        let dir = canon.parent().unwrap_or(Path::new(".")).to_path_buf();
         return Ok((dir, Some(canon)));
     }
 
@@ -138,9 +135,9 @@ fn run(app: &mut App, terminal: &mut DefaultTerminal) -> io::Result<()> {
 
 fn print_usage() {
     eprintln!(
-        "ratata — a tiny terminal text editor\n\
+        "rat — a tiny terminal text editor\n\
          \n\
-         usage: ratata [path]\n\
+         usage: rat [path]\n\
          \n\
          Opens `path` if it is a file, or browses it if it is a directory.\n\
          With no argument, the current directory is shown in the sidebar.\n\

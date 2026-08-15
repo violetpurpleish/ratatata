@@ -50,11 +50,7 @@ impl Sidebar {
     /// then files, each group alphabetically (case-insensitive).
     pub fn reload(&mut self) -> io::Result<()> {
         let mut entries: Vec<Entry> = Vec::new();
-        if self
-            .dir
-            .parent()
-            .is_some_and(|p| !p.as_os_str().is_empty())
-        {
+        if self.dir.parent().is_some_and(|p| !p.as_os_str().is_empty()) {
             entries.push(Entry {
                 name: "..".into(),
                 kind: Kind::Parent,
@@ -77,8 +73,14 @@ impl Sidebar {
         let cmp = |a: &String, b: &String| a.to_lowercase().cmp(&b.to_lowercase());
         dirs.sort_by(cmp);
         files.sort_by(cmp);
-        entries.extend(dirs.into_iter().map(|name| Entry { name, kind: Kind::Dir }));
-        entries.extend(files.into_iter().map(|name| Entry { name, kind: Kind::File }));
+        entries.extend(dirs.into_iter().map(|name| Entry {
+            name,
+            kind: Kind::Dir,
+        }));
+        entries.extend(files.into_iter().map(|name| Entry {
+            name,
+            kind: Kind::File,
+        }));
 
         self.entries = entries;
         self.clamp_selection();
@@ -108,9 +110,7 @@ impl Sidebar {
     }
 
     pub fn selected_is_dir(&self) -> bool {
-        self.entries
-            .get(self.selected)
-            .is_some_and(|e| e.is_dir())
+        self.entries.get(self.selected).is_some_and(|e| e.is_dir())
     }
 
     /// Enter the selected directory (if it is one).
@@ -187,7 +187,7 @@ mod tests {
         // unique root per test so parallel tests don't clash
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/test-tmp")
-            .join(format!("ratata-sidebar-{name}"));
+            .join(format!("ratatata-sidebar-{name}"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

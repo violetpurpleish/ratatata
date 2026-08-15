@@ -15,8 +15,8 @@ use std::sync::OnceLock;
 
 use ratatui::style::{Color, Modifier, Style as TuiStyle};
 use syntect::highlighting::{
-    FontStyle, HighlightState, Highlighter as SyntectHighlighter, RangedHighlightIterator,
-    Style, Theme, ThemeSet,
+    FontStyle, HighlightState, Highlighter as SyntectHighlighter, RangedHighlightIterator, Style,
+    Theme, ThemeSet,
 };
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
@@ -125,7 +125,8 @@ impl Highlighter {
             .parse_line(line, self.syntax_set)
             .unwrap_or_default();
         let mut highlight_state = HighlightState::new(&self.highlighter, initial_stack);
-        let iter = RangedHighlightIterator::new(&mut highlight_state, &ops, line, &self.highlighter);
+        let iter =
+            RangedHighlightIterator::new(&mut highlight_state, &ops, line, &self.highlighter);
         let mut out: Vec<(Option<TuiStyle>, Range<usize>)> = iter
             .map(|(style, _text, range)| (self.map_style(style), range))
             .collect();
@@ -183,7 +184,7 @@ mod tests {
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/test-tmp")
-            .join(format!("ratata-hl-{name}"));
+            .join(format!("ratatata-hl-{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

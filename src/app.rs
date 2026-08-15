@@ -6,11 +6,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
-use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::buffer::Buffer;
@@ -71,11 +71,7 @@ impl App {
             Focus::Sidebar
         };
         let mut sidebar = Sidebar::new(dir)?;
-        if let Some(name) = buffer
-            .path
-            .as_ref()
-            .and_then(|p| p.file_name())
-        {
+        if let Some(name) = buffer.path.as_ref().and_then(|p| p.file_name()) {
             sidebar.select_name(&name.to_string_lossy());
         }
         Ok(Self {
@@ -398,11 +394,13 @@ impl App {
     }
 
     fn in_sidebar(&self, pos: (usize, usize)) -> bool {
-        self.sidebar_area.contains(Position::new(pos.0 as u16, pos.1 as u16))
+        self.sidebar_area
+            .contains(Position::new(pos.0 as u16, pos.1 as u16))
     }
 
     fn in_editor(&self, pos: (usize, usize)) -> bool {
-        self.editor_area.contains(Position::new(pos.0 as u16, pos.1 as u16))
+        self.editor_area
+            .contains(Position::new(pos.0 as u16, pos.1 as u16))
     }
 
     /// Row within the sidebar's visible entries for a mouse position.
@@ -487,7 +485,10 @@ impl App {
                 self.quit_armed = false;
                 // refresh the sidebar so the new file shows up
                 if let Err(e) = self.sidebar.reload() {
-                    self.set_message(format!("saved {}, but sidebar refresh failed: {e}", path.display()));
+                    self.set_message(format!(
+                        "saved {}, but sidebar refresh failed: {e}",
+                        path.display()
+                    ));
                     return;
                 }
                 self.set_message(format!("saved {}", path.display()));
@@ -529,11 +530,8 @@ impl App {
         let [main, status_area] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)])
                 .areas(frame.area());
-        let [side_area, edit_area] = Layout::horizontal([
-            Constraint::Length(SIDEBAR_WIDTH),
-            Constraint::Min(0),
-        ])
-        .areas(main);
+        let [side_area, edit_area] =
+            Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)]).areas(main);
         self.sidebar_area = side_area;
         self.editor_area = edit_area;
 
@@ -632,9 +630,10 @@ impl App {
             let ops = self.highlighter.highlight_line(&self.buffer.lines, y);
             let line = &self.buffer.lines[y];
             // selection overlap on this line, in byte offsets
-            let sel = self.buffer.selection_on_line(y).map(|(a, b)| {
-                (char_index_to_byte(line, a), char_index_to_byte(line, b))
-            });
+            let sel = self
+                .buffer
+                .selection_on_line(y)
+                .map(|(a, b)| (char_index_to_byte(line, a), char_index_to_byte(line, b)));
             let mut spans = vec![num];
             spans.extend(clip_ops(line, &ops, self.buffer.scroll.0, text_w, sel));
             rows.push(Line::from(spans));
@@ -663,7 +662,12 @@ impl App {
             let prompt_w = prompt.width() as u16;
             let input_w = input.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() as u16;
             let paragraph = Paragraph::new(Line::from(vec![
-                Span::styled(prompt, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    prompt,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(input.clone(), Style::default().fg(Color::White)),
             ]))
             .style(Style::default().bg(Color::Rgb(30, 30, 30)));
@@ -681,44 +685,44 @@ impl App {
         );
         let right_width = right.width() as u16;
 
-        let [left_area, right_area] = Layout::horizontal([
-            Constraint::Min(0),
-            Constraint::Length(right_width),
-        ])
-        .areas(area);
+        let [left_area, right_area] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).areas(area);
         let base = Style::default().bg(Color::Rgb(30, 30, 30)).fg(Color::Gray);
 
         // left: focus + file + modified state, or a transient message
-        let (left_spans, left_style): (Vec<Span>, Style) = if let Some((msg, expiry)) = &self.message {
-            if *expiry > Instant::now() {
-                // keep the modified indicator visible even while a message
-                // is showing
-                let mut spans = vec![Span::styled(
-                    msg.clone(),
-                    Style::default().fg(Color::Yellow),
-                )];
-                if self.buffer.dirty {
-                    spans.push(Span::styled(
-                        " ● modified",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ));
+        let (left_spans, left_style): (Vec<Span>, Style) =
+            if let Some((msg, expiry)) = &self.message {
+                if *expiry > Instant::now() {
+                    // keep the modified indicator visible even while a message
+                    // is showing
+                    let mut spans = vec![Span::styled(
+                        msg.clone(),
+                        Style::default().fg(Color::Yellow),
+                    )];
+                    if self.buffer.dirty {
+                        spans.push(Span::styled(
+                            " ● modified",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    (spans, Style::default())
+                } else {
+                    self.message = None;
+                    self.status_left(left_area.width)
                 }
-                (spans, Style::default())
             } else {
-                self.message = None;
                 self.status_left(left_area.width)
-            }
-        } else {
-            self.status_left(left_area.width)
-        };
+            };
         frame.render_widget(
             Paragraph::new(Line::from(left_spans)).style(base.patch(left_style)),
             left_area,
         );
         frame.render_widget(
-            Paragraph::new(Line::from(right)).style(base).alignment(ratatui::layout::Alignment::Right),
+            Paragraph::new(Line::from(right))
+                .style(base)
+                .alignment(ratatui::layout::Alignment::Right),
             right_area,
         );
     }
@@ -745,13 +749,15 @@ impl App {
         } else {
             String::new()
         };
-        let path_max = width.saturating_sub(
-            tag.width() as u16 + dirty.width() as u16 + syntax.width() as u16 + 2,
-        );
+        let path_max = width
+            .saturating_sub(tag.width() as u16 + dirty.width() as u16 + syntax.width() as u16 + 2);
         let path = truncate(&path, path_max as usize);
         (
             vec![
-                Span::styled(tag, Style::default().fg(tag_color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    tag,
+                    Style::default().fg(tag_color).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(format!(" {path} ")),
                 Span::styled(syntax, Style::default().fg(Color::DarkGray)),
                 Span::styled(
@@ -856,9 +862,10 @@ fn clip_ops<'a>(
                 out.push(Span::styled(text, style.add_modifier(Modifier::REVERSED)))
             }
             (None, false) => out.push(Span::raw(text)),
-            (None, true) => {
-                out.push(Span::styled(text, Style::default().add_modifier(Modifier::REVERSED)))
-            }
+            (None, true) => out.push(Span::styled(
+                text,
+                Style::default().add_modifier(Modifier::REVERSED),
+            )),
         }
     }
     out
@@ -922,7 +929,7 @@ mod tests {
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/test-tmp")
-            .join(format!("ratata-app-{name}"));
+            .join(format!("ratatata-app-{name}"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -964,7 +971,8 @@ mod tests {
         let mut app = App::new(dir.clone(), None).unwrap();
 
         app.handle_key(ctrl('o')); // focus editor
-        for c in "hello".chars() {            app.handle_key(char_key(c));
+        for c in "hello".chars() {
+            app.handle_key(char_key(c));
         }
         assert!(app.buffer.dirty);
 
@@ -977,7 +985,10 @@ mod tests {
         for c in save_path.display().to_string().chars() {
             app.handle_key(char_key(c));
         }
-        assert_eq!(app.save_as_input.as_deref(), Some(save_path.to_str().unwrap()));
+        assert_eq!(
+            app.save_as_input.as_deref(),
+            Some(save_path.to_str().unwrap())
+        );
         assert_eq!(app.buffer.lines, vec!["hello"]);
 
         app.handle_key(key(KeyCode::Enter));
@@ -985,12 +996,7 @@ mod tests {
         assert!(!app.buffer.dirty);
         assert_eq!(fs::read_to_string(&save_path).unwrap(), "hello");
         // the sidebar was refreshed and now lists the new file
-        assert!(
-            app.sidebar
-                .entries
-                .iter()
-                .any(|e| e.name == "out.txt")
-        );
+        assert!(app.sidebar.entries.iter().any(|e| e.name == "out.txt"));
     }
 
     #[test]
@@ -1089,8 +1095,8 @@ mod tests {
 
     // ---- headless rendering via ratatui's TestBackend --------------------
 
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn render(app: &mut App) -> Vec<String> {
         let backend = TestBackend::new(100, 24);
@@ -1202,7 +1208,8 @@ mod tests {
         fs::write(&file, "just some words\n").unwrap();
         let mut app = App::new(dir, Some(file)).unwrap();
         let buf = render_buffer(&mut app);
-        for x in 31..99 { // exclude the yellow focus border at x=99
+        for x in 31..99 {
+            // exclude the yellow focus border at x=99
             let cell = buf.cell((x, 1)).unwrap();
             if cell.symbol().is_empty() || cell.symbol() == " " {
                 continue;
@@ -1506,11 +1513,12 @@ mod tests {
             );
         }
         // cells outside are not
-        assert!(!buf
-            .cell((43, 1))
-            .unwrap()
-            .style()
-            .add_modifier
-            .contains(Modifier::REVERSED));
+        assert!(
+            !buf.cell((43, 1))
+                .unwrap()
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 }

@@ -1,7 +1,11 @@
 [package]
-name = "ratata"
+name = "ratatata"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "rat"
+path = "src/main.rs"
 
 [dependencies]
 arboard = "3.6.1"
