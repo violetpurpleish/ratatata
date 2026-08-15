@@ -22,6 +22,41 @@ fn char_count(s: &str) -> usize {
     s.chars().count()
 }
 
+/// One level of indentation (Tab inserts this many spaces).
+const INDENT_UNIT: &str = "    ";
+
+/// The leading run of spaces/tabs of `s` (the line's indentation).
+fn leading_whitespace(s: &str) -> &str {
+    let end = s
+        .char_indices()
+        .find_map(|(i, c)| (!(c == ' ' || c == '\t')).then_some(i))
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+/// Chars one indent unit at the start of `line` takes: a leading tab, or
+/// up to `INDENT_UNIT.len()` leading spaces (partial indents are
+/// partially removed, e.g. two spaces on an oddly-indented line).
+fn count_indent_unit(line: &str) -> usize {
+    if line.starts_with('\t') {
+        return 1;
+    }
+    line.chars()
+        .take_while(|&c| c == ' ')
+        .count()
+        .min(INDENT_UNIT.len())
+}
+
+/// Remove one indent unit from the start of `line`; returns how many
+/// chars were removed.
+fn remove_indent_unit(line: &mut String) -> usize {
+    let n = count_indent_unit(line);
+    if n > 0 {
+        line.drain(..n);
+    }
+    n
+}
+
 /// Maximum number of undo steps kept in memory (bounded history).
 const MAX_UNDO: usize = 1000;
 
@@ -44,6 +79,8 @@ enum EditKind {
     Backspace,
     Delete,
     DeleteSelection,
+    Indent,
+    Dedent,
 }
 
 /// Index of the first line where `a` and `b` differ, or `None` when the
@@ -201,7 +238,7 @@ impl Buffer {
         if let Some(first) = parts.next() {
             self.insert_text(first);
             for rest in parts {
-                self.newline();
+                self.newline_inner(false);
                 self.insert_text(rest);
             }
         }
@@ -210,7 +247,17 @@ impl Buffer {
         self.last_edit = None;
     }
 
+    /// Insert a line break at the cursor. The new line inherits the
+    /// leading whitespace of the line being split, so pressing Enter in an
+    /// indented block continues the indentation.
     pub fn newline(&mut self) {
+        self.newline_inner(true);
+    }
+
+    /// Insert a line break; `auto_indent` controls whether the new line
+    /// inherits the current line's leading whitespace. Pastes pass `false`
+    /// so clipboard content stays verbatim.
+    fn newline_inner(&mut self, auto_indent: bool) {
         let replaced = self.delete_selection();
         if !replaced && !self.mergeable(EditKind::Newline) {
             self.push_undo(EditKind::Newline);
@@ -220,8 +267,15 @@ impl Buffer {
         let byte = char_index_to_byte(&line, x);
         let (left, right) = line.split_at(byte);
         self.lines[y] = left.to_string();
-        self.lines.insert(y + 1, right.to_string());
-        self.cursor = (0, y + 1);
+        let indent = if auto_indent {
+            leading_whitespace(&line).to_string()
+        } else {
+            String::new()
+        };
+        let mut rest = indent.clone();
+        rest.push_str(right);
+        self.lines.insert(y + 1, rest);
+        self.cursor = (indent.chars().count(), y + 1);
         self.last_edit = Some((EditKind::Newline, self.cursor));
         self.dirty = true;
         self.mark_edited(y);
@@ -277,6 +331,96 @@ impl Buffer {
         self.last_edit = Some((EditKind::Delete, self.cursor));
         self.dirty = true;
         self.mark_edited(y);
+    }
+
+    /// Indent (Tab): with a selection, indent every line it touches and
+    /// keep the selection; otherwise insert an indent unit at the cursor.
+    pub fn indent(&mut self) {
+        if self.indent_selection() {
+            return;
+        }
+        self.insert_text(INDENT_UNIT);
+    }
+
+    /// Dedent (Shift+Tab): with a selection, remove one indent unit from
+    /// every line it touches; otherwise remove one indent unit from the
+    /// current line. Does nothing when there is no indentation to remove.
+    pub fn dedent(&mut self) {
+        if self.dedent_selection() {
+            return;
+        }
+        let (x, y) = self.cursor;
+        let n = count_indent_unit(&self.lines[y]);
+        if n == 0 {
+            return;
+        }
+        if !self.mergeable(EditKind::Dedent) {
+            self.push_undo(EditKind::Dedent);
+        }
+        remove_indent_unit(&mut self.lines[y]);
+        self.cursor.0 = x.saturating_sub(n);
+        self.last_edit = Some((EditKind::Dedent, self.cursor));
+        self.dirty = true;
+        self.mark_edited(y);
+    }
+
+    /// Indent every line the selection touches, keeping the selection.
+    /// Returns false when there is no selection.
+    fn indent_selection(&mut self) -> bool {
+        let Some(((_, ay), (_, by))) = self.selection_range() else {
+            return false;
+        };
+        if !self.mergeable(EditKind::Indent) {
+            self.push_undo(EditKind::Indent);
+        }
+        for y in ay..=by {
+            self.lines[y].insert_str(0, INDENT_UNIT);
+        }
+        // positions at the very start of a line stay pinned to the start;
+        // every other position shifts right with its line
+        let shift = |pos: &mut (usize, usize)| {
+            if pos.1 >= ay && pos.1 <= by && pos.0 > 0 {
+                pos.0 += INDENT_UNIT.len();
+            }
+        };
+        shift(&mut self.cursor);
+        shift(self.selection_anchor.as_mut().expect("selection"));
+        self.last_edit = Some((EditKind::Indent, self.cursor));
+        self.dirty = true;
+        self.mark_edited(ay);
+        true
+    }
+
+    /// Dedent every line the selection touches, keeping the selection.
+    /// Returns false when there is no selection (or nothing to dedent).
+    fn dedent_selection(&mut self) -> bool {
+        let Some(((_, ay), (_, by))) = self.selection_range() else {
+            return false;
+        };
+        // count first: if no line is indented, leave everything untouched
+        let removed: Vec<usize> = (ay..=by)
+            .map(|y| count_indent_unit(&self.lines[y]))
+            .collect();
+        if removed.iter().all(|&n| n == 0) {
+            return false;
+        }
+        if !self.mergeable(EditKind::Dedent) {
+            self.push_undo(EditKind::Dedent);
+        }
+        for y in ay..=by {
+            remove_indent_unit(&mut self.lines[y]);
+        }
+        let unshift = |pos: &mut (usize, usize)| {
+            if pos.1 >= ay && pos.1 <= by {
+                pos.0 = pos.0.saturating_sub(removed[pos.1 - ay]);
+            }
+        };
+        unshift(&mut self.cursor);
+        unshift(self.selection_anchor.as_mut().expect("selection"));
+        self.last_edit = Some((EditKind::Dedent, self.cursor));
+        self.dirty = true;
+        self.mark_edited(ay);
+        true
     }
 
     // ---- selection ---------------------------------------------------------
@@ -536,7 +680,9 @@ impl Buffer {
             (EditKind::InsertChar, EditKind::InsertChar)
             | (EditKind::Backspace, EditKind::Backspace)
             | (EditKind::Delete, EditKind::Delete)
-            | (EditKind::Newline, EditKind::Newline) => self.cursor == last_pos,
+            | (EditKind::Newline, EditKind::Newline)
+            | (EditKind::Indent, EditKind::Indent)
+            | (EditKind::Dedent, EditKind::Dedent) => self.cursor == last_pos,
             _ => false,
         }
     }
@@ -760,6 +906,140 @@ mod tests {
         b.newline();
         assert_eq!(b.lines, vec!["ab", ""]);
         assert_eq!(b.cursor, (0, 1));
+    }
+
+    #[test]
+    fn newline_inherits_indentation() {
+        let mut b = empty();
+        b.insert_text("    fn foo() {");
+        b.newline();
+        assert_eq!(b.lines, vec!["    fn foo() {", "    "]);
+        assert_eq!(b.cursor, (4, 1));
+    }
+
+    #[test]
+    fn newline_mid_indentation_keeps_full_indent() {
+        let mut b = empty();
+        typed(&mut b, "    foo");
+        b.home();
+        b.move_right();
+        b.move_right(); // inside the leading spaces
+        b.newline();
+        assert_eq!(b.lines, vec!["  ", "      foo"]);
+        assert_eq!(b.cursor, (4, 1));
+    }
+
+    #[test]
+    fn newline_on_blank_indented_line_keeps_indent() {
+        let mut b = empty();
+        typed(&mut b, "    ");
+        b.newline();
+        assert_eq!(b.lines, vec!["    ", "    "]);
+        assert_eq!(b.cursor, (4, 1));
+    }
+
+    #[test]
+    fn paste_does_not_auto_indent() {
+        let mut b = empty();
+        typed(&mut b, "    ab");
+        b.newline(); // auto-indents: "    "
+        b.insert_multiline("x\n  y");
+        // the pasted lines stay verbatim; no indent is injected
+        assert_eq!(b.lines, vec!["    ab", "    x", "  y"]);
+        assert_eq!(b.cursor, (3, 2));
+    }
+
+    #[test]
+    fn tab_indents_selected_lines() {
+        let mut b = empty();
+        b.insert_multiline("a\nb\nc");
+        b.home();
+        b.move_up();
+        b.move_up(); // top-left
+        b.begin_selection();
+        b.move_down();
+        b.end();
+        b.indent();
+        assert_eq!(b.lines, vec!["    a", "    b", "c"]);
+        assert_eq!(b.selection_anchor, Some((0, 0)));
+        assert_eq!(b.cursor, (5, 1));
+    }
+
+    #[test]
+    fn shift_tab_dedents_selected_lines() {
+        let mut b = empty();
+        b.insert_multiline("    a\n    b\n    c");
+        b.home();
+        b.move_up();
+        b.move_up(); // top-left
+        b.begin_selection();
+        b.move_down();
+        b.move_down();
+        b.end();
+        b.dedent();
+        assert_eq!(b.lines, vec!["a", "b", "c"]);
+        assert_eq!(b.selection_anchor, Some((0, 0)));
+        assert_eq!(b.cursor, (1, 2));
+    }
+
+    #[test]
+    fn shift_tab_dedents_current_line() {
+        let mut b = empty();
+        typed(&mut b, "    foo");
+        b.dedent();
+        assert_eq!(b.lines, vec!["foo"]);
+        assert_eq!(b.cursor, (3, 0));
+    }
+
+    #[test]
+    fn dedent_removes_partial_indent() {
+        let mut b = empty();
+        typed(&mut b, "  foo");
+        b.dedent();
+        assert_eq!(b.lines, vec!["foo"]);
+        assert_eq!(b.cursor, (3, 0));
+    }
+
+    #[test]
+    fn dedent_without_indent_does_nothing() {
+        let mut b = empty();
+        b.dedent();
+        assert_eq!(b.lines, vec![""]);
+        assert!(!b.dirty);
+        assert!(!b.undo()); // no undo step was pushed
+    }
+
+    #[test]
+    fn tab_and_shift_tab_selection_undo_redo() {
+        let mut b = empty();
+        b.insert_multiline("a\nb");
+        b.home();
+        b.move_up(); // top-left
+        b.begin_selection();
+        b.move_down();
+        b.indent();
+        assert_eq!(b.lines, vec!["    a", "    b"]);
+        b.undo();
+        assert_eq!(b.lines, vec!["a", "b"]);
+        assert_eq!(b.selection_anchor, Some((0, 0))); // selection restored
+        b.redo();
+        assert_eq!(b.lines, vec!["    a", "    b"]);
+        b.dedent();
+        assert_eq!(b.lines, vec!["a", "b"]);
+        b.undo();
+        assert_eq!(b.lines, vec!["    a", "    b"]);
+    }
+
+    #[test]
+    fn consecutive_dedents_merge_into_one_undo_step() {
+        let mut b = empty();
+        typed(&mut b, "        foo");
+        b.dedent();
+        b.dedent();
+        assert_eq!(b.lines, vec!["foo"]);
+        b.undo();
+        assert_eq!(b.lines, vec!["        foo"]);
+        assert_eq!(b.cursor, (11, 0));
     }
 
     #[test]

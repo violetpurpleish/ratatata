@@ -258,7 +258,9 @@ impl App {
                 }
             }
             KeyCode::Enter => self.buffer.newline(),
-            KeyCode::Tab => self.buffer.insert_text("    "),
+            KeyCode::Tab if shift => self.buffer.dedent(),
+            KeyCode::Tab => self.buffer.indent(),
+            KeyCode::BackTab => self.buffer.dedent(),
             KeyCode::Backspace => self.buffer.backspace(),
             KeyCode::Delete => self.buffer.delete(),
             KeyCode::Left => self.buffer.move_left(),
@@ -1229,6 +1231,42 @@ mod tests {
         let mut app = App::new(dir, None).unwrap();
         app.handle_key(ctrl('q'));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn enter_auto_indents() {
+        let dir = scratch("autoindent");
+        fs::write(dir.join("a.txt"), "").unwrap();
+        let mut app = App::new(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        for c in "    fn f() {}".chars() {
+            app.handle_key(char_key(c));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.buffer.lines, vec!["    fn f() {}", "    "]);
+        assert_eq!(app.buffer.cursor, (4, 1));
+    }
+
+    #[test]
+    fn tab_indents_selection_and_shift_tab_dedents() {
+        let dir = scratch("tabindent");
+        fs::write(dir.join("a.txt"), "").unwrap();
+        let mut app = App::new(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        app.buffer.insert_multiline("    a\n    b");
+        app.buffer.home();
+        app.buffer.move_up(); // top-left
+        app.buffer.begin_selection();
+        app.buffer.move_down();
+        app.buffer.end();
+
+        // Tab with a selection block-indents instead of replacing it
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.buffer.lines, vec!["        a", "        b"]);
+
+        // Shift+Tab (both the BackTab and the Tab+SHIFT encodings) dedents
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.buffer.lines, vec!["    a", "    b"]);
+        app.handle_key(shift_key(KeyCode::Tab));
+        assert_eq!(app.buffer.lines, vec!["a", "b"]);
     }
 
     #[test]

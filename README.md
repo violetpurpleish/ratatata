@@ -55,7 +55,7 @@ rat [path]
 
 **Sidebar:** `↑`/`↓` select, `Enter` open (directory = enter, file = open), `Backspace` go up, `Home`/`End`, `PgUp`/`PgDn` page.
 
-**Editor:** type to insert, `←`/`→`/`↑`/`↓` move (hold `Shift` to extend the selection), `Home`/`End`, `PgUp`/`PgDn`, `Backspace`, `Delete`, `Tab` inserts four spaces.
+**Editor:** type to insert, `←`/`→`/`↑`/`↓` move (hold `Shift` to extend the selection), `Home`/`End`, `PgUp`/`PgDn`, `Backspace`, `Delete`, `Enter` auto-indents (the new line keeps the current indentation), `Tab` indents (four spaces, or every selected line), `Shift+Tab` dedents.
 
 **Mouse:** click the editor to move the cursor, drag or Shift+click to select, double-click selects the word under the cursor, triple-click selects the whole line, scroll to move; single-click the sidebar to select, double-click to open, scroll to browse.
 
