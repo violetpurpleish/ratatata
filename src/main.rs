@@ -56,9 +56,24 @@ fn main() -> io::Result<()> {
     result
 }
 
-/// Mouse capture, bracketed paste, and the kitty keyboard protocol (so
-/// macOS Cmd+key arrives as `KeyModifiers::SUPER` on supporting terminals;
-/// unsupported terminals simply ignore the request).
+/// Mouse capture, bracketed paste, and the kitty keyboard protocol.
+///
+/// We request DISAMBIGUATE_ESCAPE_CODES + REPORT_EVENT_TYPES so that on
+/// supporting terminals (kitty, Ghostty, …) macOS Cmd+key arrives as
+/// `KeyModifiers::SUPER` and held keys as Repeat events; unsupported
+/// terminals simply ignore the request.
+///
+/// We deliberately do NOT request REPORT_ALL_KEYS_AS_ESCAPE_CODES. With it,
+/// kitty-protocol terminals report printable keys as their *unshifted* base
+/// key plus modifiers — e.g. Shift+8 as `8`+SHIFT and Option+5 as `5`+ALT
+/// on a German layout — because the shifted character is layout-dependent.
+/// crossterm cannot recover it from the event, so typing would insert the
+/// base digit instead of the intended character (`(` / `[` …). Without the
+/// flag, terminals send the resulting character as plain text while still
+/// encoding modifier-only combinations (Ctrl/Cmd+key) as CSI u events,
+/// which is what the shortcuts need. REPORT_ALTERNATE_KEYS is kept so
+/// terminals that do encode Shift+key as CSI u can attach the shifted
+/// character, which crossterm then resolves.
 fn enable_terminal_capabilities() -> io::Result<()> {
     execute!(
         io::stdout(),
@@ -67,7 +82,7 @@ fn enable_terminal_capabilities() -> io::Result<()> {
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         )
     )
 }

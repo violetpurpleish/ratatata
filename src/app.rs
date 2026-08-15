@@ -1,5 +1,20 @@
 //! Application state, key handling and rendering.
 
+/// Fold a reported character into what the user actually typed.
+///
+/// Kitty-protocol terminals that encode Shift+letter as a CSI u event
+/// report the *unshifted* base key plus a SHIFT modifier (e.g. `a`+SHIFT
+/// for `A`), because the shifted character is layout-dependent. ASCII
+/// letters can be folded deterministically; symbols cannot (Shift+8 is
+/// `(` on a German layout but `*` on a US one), so they are left alone.
+fn printable_char(c: char, modifiers: KeyModifiers) -> char {
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        c.to_ascii_uppercase()
+    } else {
+        c
+    }
+}
+
 use std::io;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -192,7 +207,11 @@ impl App {
                 KeyCode::Backspace => {
                     input.pop();
                 }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::ALT) => input.push(c),
+                // Ctrl/Super combinations already returned above, so any
+                // remaining Char is printable input — including Shift- and
+                // Alt/Option-modified characters, which international layouts
+                // need (e.g. `[` is Option+5 on a German macOS keyboard).
+                KeyCode::Char(c) => input.push(printable_char(c, key.modifiers)),
                 _ => {}
             }
             return;
@@ -250,11 +269,21 @@ impl App {
             }
         }
         match key.code {
+            // Printable characters insert even when Shift or Alt/Option are
+            // held (e.g. `[` and `]` are Option+5 / Option+6 on a German
+            // macOS keyboard). Some terminals report Shift+letter as the base
+            // key plus a SHIFT modifier instead of the shifted character, so
+            // fold ASCII letters to uppercase. Ctrl/Super combinations are
+            // reserved for shortcuts and already returned in handle_key
+            // before reaching this point.
             KeyCode::Char(c)
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
             {
                 if !c.is_control() {
-                    self.buffer.insert_char(c);
+                    self.buffer
+                        .insert_char(printable_char(c, key.modifiers));
                 }
             }
             KeyCode::Enter => self.buffer.newline(),
@@ -1061,6 +1090,10 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::SUPER)
     }
 
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
     fn shift_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::SHIFT)
     }
@@ -1161,6 +1194,106 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         assert!(app.save_as_input.is_none());
         assert!(app.buffer.path.is_none());
+    }
+
+    // ---- modified printable characters ------------------------------------
+
+    #[test]
+    fn shift_modified_char_inserts_into_buffer() {
+        let dir = scratch("shiftchar");
+        let file = dir.join("a.txt");
+        fs::write(&file, "").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+
+        // Some terminals report Shift+letter as the base key plus a SHIFT
+        // modifier; the ASCII letter is folded to uppercase.
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        app.handle_key(shift_key(KeyCode::Char('a')));
+        assert_eq!(app.buffer.lines, vec!["AA"]);
+    }
+
+    #[test]
+    fn alt_modified_char_inserts_into_buffer() {
+        // German macOS layout: `[`/`]` are Option+5 / Option+6 and
+        // `{`/`}` are Option+8 / Option+9.
+        let dir = scratch("altchar");
+        let file = dir.join("a.txt");
+        fs::write(&file, "").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+
+        app.handle_key(alt('['));
+        app.handle_key(alt(']'));
+        app.handle_key(alt('{'));
+        app.handle_key(alt('}'));
+        assert_eq!(app.buffer.lines, vec!["[]{}"]);
+    }
+
+    #[test]
+    fn alt_shift_modified_char_inserts_into_buffer() {
+        // e.g. Option+Shift+7 on a German macOS layout produces `|`.
+        let dir = scratch("altshiftchar");
+        let file = dir.join("a.txt");
+        fs::write(&file, "").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('|'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(app.buffer.lines, vec!["|"]);
+    }
+
+    #[test]
+    fn plain_text_chars_insert_as_reported() {
+        // What a kitty-protocol terminal (e.g. Ghostty on macOS) sends for
+        // ordinary printable keys once REPORT_ALL_KEYS_AS_ESCAPE_CODES is
+        // not requested: the resulting character as plain text, with no
+        // modifiers. German layout: Shift+8 is `(`, Option+5 is `[`,
+        // Option+8 is `{`, Option+9 is `}`, Option+L is `@`.
+        let dir = scratch("plainchars");
+        let file = dir.join("a.txt");
+        fs::write(&file, "").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+
+        for c in ['a', 'A', '(', '[', '{', '}', '@', ']', ')'] {
+            app.handle_key(char_key(c));
+        }
+        assert_eq!(app.buffer.lines, vec!["aA([{}@])"]);
+    }
+
+    #[test]
+    fn ctrl_and_super_chars_do_not_insert() {
+        let dir = scratch("ctrlchar");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+
+        // unbound Ctrl/Super letters are swallowed, not typed
+        app.handle_key(ctrl('k'));
+        app.handle_key(cmd('k'));
+        assert_eq!(app.buffer.lines, vec!["alpha"]);
+
+        // bound shortcuts don't type their letter either
+        app.handle_key(ctrl('c'));
+        assert_eq!(app.buffer.lines, vec!["alpha"]);
+        assert_eq!(app.buffer.cursor, (0, 0));
+    }
+
+    #[test]
+    fn save_as_prompt_accepts_alt_and_shift_chars() {
+        let dir = scratch("saveasmod");
+        let mut app = App::new(dir, None).unwrap();
+        app.handle_key(ctrl('o'));
+        app.handle_key(ctrl('s'));
+        assert!(app.save_as_input.is_some());
+
+        // `[` needs Option on German layouts; `:` and `a` need Shift on many
+        // layouts (the `a` is folded to uppercase)
+        app.handle_key(alt('['));
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT));
+        assert_eq!(app.save_as_input.as_deref(), Some("[:A"));
+        assert_eq!(app.buffer.lines, vec![""]);
     }
 
     #[test]
