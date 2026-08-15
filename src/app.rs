@@ -650,9 +650,12 @@ impl App {
             .scroll((self.sidebar.scroll as u16, 0));
         frame.render_widget(paragraph, area);
 
-        // put the terminal cursor on the selected row
-        let row = (self.sidebar.selected - self.sidebar.scroll) as u16;
-        frame.set_cursor_position(Position::new(area.x + 1, area.y + 1 + row));
+        // Put the terminal cursor on the selected row while the sidebar has
+        // focus. The editor draws its own colored caret.
+        if self.focus == Focus::Sidebar {
+            let row = (self.sidebar.selected - self.sidebar.scroll) as u16;
+            frame.set_cursor_position(Position::new(area.x + 1, area.y + 1 + row));
+        }
     }
 
     fn draw_editor(&mut self, frame: &mut Frame, area: Rect) {
@@ -682,6 +685,7 @@ impl App {
         let start = self.buffer.scroll.1;
         let end = (start + text_h).min(self.buffer.lines.len());
         let mut rows: Vec<Line> = Vec::with_capacity(end.saturating_sub(start));
+        let mut caret_style = None;
         for y in start..end {
             let num = Span::styled(
                 format!("{:>width$} ", y + 1, width = gutter_w - 1),
@@ -689,6 +693,20 @@ impl App {
             );
             let ops = self.highlighter.highlight_line(&self.buffer.lines, y);
             let line = &self.buffer.lines[y];
+            if self.focus == Focus::Editor
+                && self.save_as_input.is_none()
+                && self.buffer.cursor.1 == y
+                && self.buffer.cursor.0 >= self.buffer.scroll.0
+                && self.buffer.cursor.0 < self.buffer.scroll.0 + text_w
+            {
+                let cursor_byte = char_index_to_byte(line, self.buffer.cursor.0);
+                caret_style = Some(
+                    ops.iter()
+                        .find(|(_, range)| range.contains(&cursor_byte))
+                        .and_then(|(style, _)| *style)
+                        .unwrap_or_default(),
+                );
+            }
             // selection overlap on this line, in byte offsets
             let sel = self
                 .buffer
@@ -709,9 +727,27 @@ impl App {
         frame.render_widget(paragraph, area);
 
         if self.focus == Focus::Editor && self.save_as_input.is_none() {
-            let cx = 1 + gutter_w as u16 + self.buffer.cursor_col() as u16;
-            let cy = 1 + (self.buffer.cursor.1 - self.buffer.scroll.1) as u16;
-            frame.set_cursor_position(Position::new(area.x + cx, area.y + cy));
+            // Ratatui can position the terminal cursor, but cannot give it a
+            // color. Render a block caret ourselves so it remains distinct
+            // from the reversed selection style (and leave the native cursor
+            // hidden).
+            let cx = area.x + 1 + gutter_w as u16 + self.buffer.cursor_col() as u16;
+            let cy = area.y + 1 + (self.buffer.cursor.1 - self.buffer.scroll.1) as u16;
+            let inner_right = area.x + area.width.saturating_sub(1);
+            let inner_bottom = area.y + area.height.saturating_sub(1);
+            if cx < inner_right && cy < inner_bottom {
+                let symbol = self
+                    .buffer
+                    .lines
+                    .get(self.buffer.cursor.1)
+                    .and_then(|line| line.chars().nth(self.buffer.cursor.0))
+                    .map_or_else(|| " ".to_string(), |c| c.to_string());
+                let caret = Paragraph::new(Span::styled(
+                    symbol,
+                    caret_style.unwrap_or_default().bg(Color::Yellow),
+                ));
+                frame.render_widget(caret, Rect::new(cx, cy, 1, 1));
+            }
         }
     }
 
@@ -914,18 +950,32 @@ fn clip_ops<'a>(
         if a >= b {
             continue;
         }
-        let selected = sel.is_some_and(|(sa, sb)| a < sb && b > sa);
-        let text = &line[a..b];
-        match (style, selected) {
-            (Some(style), false) => out.push(Span::styled(text, *style)),
-            (Some(style), true) => {
-                out.push(Span::styled(text, style.add_modifier(Modifier::REVERSED)))
+        let mut push_span = |a: usize, b: usize, selected: bool| {
+            if a >= b {
+                return;
             }
-            (None, false) => out.push(Span::raw(text)),
-            (None, true) => out.push(Span::styled(
-                text,
-                Style::default().add_modifier(Modifier::REVERSED),
-            )),
+            let text = &line[a..b];
+            match (style, selected) {
+                (Some(style), false) => out.push(Span::styled(text, *style)),
+                (Some(style), true) => {
+                    out.push(Span::styled(text, style.add_modifier(Modifier::REVERSED)))
+                }
+                (None, false) => out.push(Span::raw(text)),
+                (None, true) => out.push(Span::styled(
+                    text,
+                    Style::default().add_modifier(Modifier::REVERSED),
+                )),
+            }
+        };
+
+        if let Some((sa, sb)) = sel.filter(|(sa, sb)| a < *sb && b > *sa) {
+            let selected_start = a.max(sa);
+            let selected_end = b.min(sb);
+            push_span(a, selected_start, false);
+            push_span(selected_start, selected_end, true);
+            push_span(selected_end, b, false);
+        } else {
+            push_span(a, b, false);
         }
     }
     out
@@ -1262,6 +1312,19 @@ mod tests {
     }
 
     #[test]
+    fn caret_has_distinct_rendered_style() {
+        let dir = scratch("caretstyle");
+        let file = dir.join("notes.txt");
+        fs::write(&file, "test\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        let buf = render_buffer(&mut app);
+        let caret = buf.cell((31, 1)).unwrap();
+        assert_eq!(caret.symbol(), "t");
+        assert_eq!(caret.style().bg, Some(Color::Yellow));
+        assert!(!caret.style().add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
     fn plain_text_files_render_uncolored() {
         let dir = scratch("hlplain");
         let file = dir.join("notes.txt");
@@ -1552,7 +1615,7 @@ mod tests {
     }
 
     #[test]
-    fn double_click_on_whitespace_selects_nothing() {
+    fn double_click_on_whitespace_selects_whitespace() {
         let dir = scratch("mdblspace");
         let file = dir.join("a.txt");
         fs::write(&file, "hello world\n").unwrap();
@@ -1565,8 +1628,8 @@ mod tests {
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
-        assert!(!app.buffer.has_selection());
-        assert_eq!(app.buffer.cursor, (5, 0));
+        assert_eq!(app.buffer.selected_text().as_deref(), Some(" "));
+        assert_eq!(app.buffer.selection_range(), Some(((5, 0), (6, 0))));
     }
 
     #[test]
@@ -1722,6 +1785,33 @@ mod tests {
         app.clipboard.set_text("XYZ");
         app.handle_key(ctrl('v'));
         assert_eq!(app.buffer.lines, vec!["XYZdef"]);
+    }
+
+    #[test]
+    fn partial_selection_splits_highlighted_span() {
+        let line = "fn main";
+        let syntax_style = Style::default().fg(Color::Blue);
+        let spans = clip_ops(
+            line,
+            &[(Some(syntax_style), 0..line.len())],
+            0,
+            line.chars().count(),
+            Some((3, 5)),
+        );
+
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["fn ", "ma", "in"]
+        );
+        assert!(!spans[0].style.add_modifier.contains(Modifier::REVERSED));
+        assert!(spans[1].style.add_modifier.contains(Modifier::REVERSED));
+        assert!(!spans[2].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(spans[0].style.fg, Some(Color::Blue));
+        assert_eq!(spans[1].style.fg, Some(Color::Blue));
+        assert_eq!(spans[2].style.fg, Some(Color::Blue));
     }
 
     #[test]

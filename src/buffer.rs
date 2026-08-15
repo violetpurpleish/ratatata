@@ -233,11 +233,11 @@ impl Buffer {
     }
 
     /// The char range of the "word" at `(x, y)` (`x` is a char index), or
-    /// `None` when the char under the cursor is whitespace or the line is
-    /// empty. A word is a run of alphanumeric/underscore chars; when the
-    /// char under the cursor is punctuation, the adjacent run of punctuation
-    /// is the "word" instead (so `->` is one). Clicks past the end of the
-    /// line look at the last char.
+    /// `None` when the line is empty. A word is a run of
+    /// alphanumeric/underscore chars; whitespace selects its contiguous run;
+    /// when the char under the cursor is punctuation, the adjacent run of
+    /// punctuation is the "word" instead (so `->` is one). Clicks past the
+    /// end of the line look at the last char.
     fn word_range_at(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let line = self.lines.get(y)?;
         let chars: Vec<char> = line.chars().collect();
@@ -247,12 +247,11 @@ impl Buffer {
         }
         let x = x.min(len);
         let i = if x == len { len - 1 } else { x };
-        if chars[i].is_whitespace() {
-            return None;
-        }
         let word_like = chars[i].is_alphanumeric() || chars[i] == '_';
         let matches = |c: char| {
-            if word_like {
+            if chars[i].is_whitespace() {
+                c.is_whitespace()
+            } else if word_like {
                 c.is_alphanumeric() || c == '_'
             } else {
                 !c.is_whitespace() && !c.is_alphanumeric() && c != '_'
@@ -270,10 +269,10 @@ impl Buffer {
     }
 
     /// Select the "word" at `(x, y)` (`x` is a char index). A word is a
-    /// run of alphanumeric/underscore chars; when the char under the cursor
-    /// is punctuation, the adjacent run of punctuation is selected instead
-    /// (so double-clicking `->` selects `->`). Clicking whitespace or an
-    /// empty line selects nothing — the cursor just moves there.
+    /// run of alphanumeric/underscore chars; whitespace selects its
+    /// contiguous run; when the char under the cursor is punctuation, the
+    /// adjacent run of punctuation is selected instead (so double-clicking
+    /// `->` selects `->`). An empty line selects nothing.
     pub fn select_word_at(&mut self, (x, y): (usize, usize)) {
         match self.word_range_at((x, y)) {
             Some((start, end)) => {
@@ -290,8 +289,8 @@ impl Buffer {
     }
 
     /// Extend the selection so its moving end lands at the end of the word
-    /// at `(x, y)` (used when dragging after a double-click). Dragging onto
-    /// whitespace just moves the cursor there.
+    /// or whitespace run at `(x, y)` (used when dragging after a
+    /// double-click).
     pub fn extend_selection_word_at(&mut self, (x, y): (usize, usize)) {
         if self.selection_anchor.is_none() {
             self.begin_selection();
@@ -929,16 +928,16 @@ mod tests {
     }
 
     #[test]
-    fn select_word_at_whitespace_selects_nothing() {
+    fn select_word_at_selects_whitespace() {
         let mut b = empty();
-        typed(&mut b, "hello world");
+        typed(&mut b, "hello   world");
         b.select_word_at((1, 0));
-        assert!(b.has_selection());
-        // clicking the space between words clears the selection
-        b.select_word_at((5, 0));
-        assert!(!b.has_selection());
-        assert_eq!(b.cursor, (5, 0));
-        // an empty line selects nothing either
+        assert_eq!(b.selected_text().as_deref(), Some("hello"));
+        // clicking the whitespace between words selects its whole run
+        b.select_word_at((6, 0));
+        assert_eq!(b.selected_text().as_deref(), Some("   "));
+        assert_eq!(b.selection_range(), Some(((5, 0), (8, 0))));
+        // an empty line selects nothing
         let mut b = empty();
         b.newline();
         b.select_word_at((0, 1));
@@ -982,10 +981,10 @@ mod tests {
         // dragging back into the first word shrinks it again
         b.extend_selection_word_at((2, 0));
         assert_eq!(b.selected_text().as_deref(), Some("one"));
-        // dragging onto whitespace just moves the cursor
+        // dragging onto whitespace extends to the end of its run
         b.extend_selection_word_at((3, 0));
-        assert_eq!(b.selected_text().as_deref(), Some("one"));
-        assert_eq!(b.cursor, (3, 0));
+        assert_eq!(b.selected_text().as_deref(), Some("one "));
+        assert_eq!(b.cursor, (4, 0));
     }
 
     #[test]
