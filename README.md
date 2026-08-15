@@ -24,6 +24,7 @@ Two panes, one goal: a small, dependency-light editor that stays out of your way
 - **Clipboard integration** — copy/cut/paste through the system clipboard ([arboard](https://github.com/1Password/arboard)), with bracketed-paste support for terminals that send it
 - **Full mouse support** — click to place the cursor, drag or Shift+click to select, double-click to select a word, triple-click to select a line, scroll wheel to move through text and directories
 - **macOS-friendly keys** — on terminals supporting the kitty keyboard protocol, Cmd+key works like Ctrl (unsupported terminals just ignore the request)
+- **Incremental search** — Ctrl+F opens a search bar: matches are highlighted as you type, Enter / Shift+Enter step to the next / previous match, Esc closes
 - **Safe file handling** — a dirty buffer blocks opening another file, and Ctrl+Q asks for confirmation before discarding unsaved changes
 - **Undo / redo** — Ctrl+Z undoes, Ctrl+Shift+Z redoes; continuous typing, backspacing, deleting and pastes each collapse into a single undo step, and undoing restores the cursor, selection and modified state
 - **Unicode-aware editing** — the cursor tracks *characters*, not bytes, so wide characters and non-ASCII text render and edit correctly
@@ -49,6 +50,7 @@ rat [path]
 | `Ctrl+S` | Save (asks for a name if untitled) |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste |
 | `Ctrl+A` | Select all |
+| `Ctrl+F` | Search (type to filter, `Enter` / `Shift+Enter` next / previous match, `Esc` closes) |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | `Ctrl+Q` | Quit (press twice when there are unsaved changes) |
 | `Esc` / `Enter` | Cancel / confirm the save-as prompt |
@@ -94,6 +96,7 @@ src/
 ├── sidebar.rs    scrollable directory listing (dirs first, ".." entry)
 ├── highlight.rs  incremental syntect highlighting with per-line cached
 │                 parse states and scope stacks
+├── search.rs     case-insensitive incremental search (matches, navigation)
 └── clipboard.rs  system clipboard behind a small trait (tests use a fake)
 ```
 

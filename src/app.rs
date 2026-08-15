@@ -31,6 +31,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::buffer::Buffer;
 use crate::clipboard::{Clipboard, SystemClipboard};
 use crate::highlight::Highlighter;
+use crate::search::Search;
 use crate::sidebar::{Kind, Sidebar};
 
 /// How long transient status messages stay visible.
@@ -50,6 +51,11 @@ const EDITOR_CLICK_TTL: Duration = Duration::from_millis(250);
 
 const SIDEBAR_WIDTH: u16 = 28;
 const STATUS_HEIGHT: u16 = 1;
+
+/// Background of the current search match (same yellow as the block caret).
+const SEARCH_CURRENT_BG: Color = Color::Yellow;
+/// Background of the other search matches.
+const SEARCH_OTHER_BG: Color = Color::Rgb(100, 88, 26);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
@@ -72,6 +78,8 @@ pub struct App {
     message: Option<(String, Instant)>,
     /// Active "save as" input text, when the buffer has no file name.
     save_as_input: Option<String>,
+    /// Active incremental search (Ctrl+F), `None` while not searching.
+    search: Option<Search>,
     /// Set when Ctrl+Q is pressed with unsaved changes; second press quits.
     quit_armed: bool,
     /// Viewport sizes from the last draw, used for paging and scrolling.
@@ -113,6 +121,7 @@ impl App {
             clipboard: Box::new(SystemClipboard::new()),
             message: None,
             save_as_input: None,
+            search: None,
             quit_armed: false,
             editor_text: (0, 0),
             sidebar_height: 0,
@@ -160,13 +169,13 @@ impl App {
                     return;
                 }
                 KeyCode::Char('c') => {
-                    if self.save_as_input.is_none() {
+                    if self.save_as_input.is_none() && self.search.is_none() {
                         self.copy_selection();
                     }
                     return;
                 }
                 KeyCode::Char('x') => {
-                    if self.save_as_input.is_none() {
+                    if self.save_as_input.is_none() && self.search.is_none() {
                         self.cut_selection();
                     }
                     return;
@@ -176,9 +185,13 @@ impl App {
                     return;
                 }
                 KeyCode::Char('a') => {
-                    if self.save_as_input.is_none() {
+                    if self.save_as_input.is_none() && self.search.is_none() {
                         self.buffer.select_all();
                     }
+                    return;
+                }
+                KeyCode::Char('f') => {
+                    self.open_search();
                     return;
                 }
                 // Ctrl+Z undoes, Ctrl+Shift+Z redoes (CapsLock typos land
@@ -186,7 +199,7 @@ impl App {
                 // letter may arrive as 'Z' or as 'z'+Shift depending on
                 // the terminal, so accept both.
                 KeyCode::Char('z') | KeyCode::Char('Z') => {
-                    if self.save_as_input.is_none() {
+                    if self.save_as_input.is_none() && self.search.is_none() {
                         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
                         if key.code == KeyCode::Char('z') && !shift {
                             self.undo();
@@ -213,6 +226,43 @@ impl App {
                 // need (e.g. `[` is Option+5 on a German macOS keyboard).
                 KeyCode::Char(c) => input.push(printable_char(c, key.modifiers)),
                 _ => {}
+            }
+            return;
+        }
+
+        // The search bar is modal like the save-as prompt: Esc closes it,
+        // Enter/Shift+Enter step through the matches, everything else that
+        // is printable edits the query. Ctrl/Super combinations returned
+        // above, so any remaining Char is printable input.
+        if self.search.is_some() && key.code == KeyCode::Esc {
+            self.search = None;
+            return;
+        }
+        if let Some(search) = self.search.as_mut() {
+            let mut query_changed = false;
+            match key.code {
+                KeyCode::Enter => {
+                    let dir = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        -1
+                    } else {
+                        1
+                    };
+                    search.step(dir);
+                }
+                KeyCode::Backspace => {
+                    search.query.pop();
+                    query_changed = true;
+                }
+                KeyCode::Char(c) if !c.is_control() => {
+                    search.query.push(printable_char(c, key.modifiers));
+                    query_changed = true;
+                }
+                _ => return,
+            }
+            if query_changed {
+                self.recompute_search();
+            } else {
+                self.jump_to_current_match();
             }
             return;
         }
@@ -282,8 +332,7 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
             {
                 if !c.is_control() {
-                    self.buffer
-                        .insert_char(printable_char(c, key.modifiers));
+                    self.buffer.insert_char(printable_char(c, key.modifiers));
                 }
             }
             KeyCode::Enter => self.buffer.newline(),
@@ -370,11 +419,26 @@ impl App {
             input.push_str(&text);
             return;
         }
+        if let Some(search) = self.search.as_mut() {
+            search
+                .query
+                .extend(text.chars().filter(|c| !c.is_control()));
+            self.recompute_search();
+            return;
+        }
         self.paste_text(text);
     }
 
     /// Insert pasted text (from Ctrl+V or bracketed paste) into the buffer.
     pub fn paste_text(&mut self, text: String) {
+        // bracketed paste while searching fills in the query instead
+        if let Some(search) = self.search.as_mut() {
+            search
+                .query
+                .extend(text.chars().filter(|c| !c.is_control()));
+            self.recompute_search();
+            return;
+        }
         self.focus = Focus::Editor;
         self.buffer.insert_multiline(&text);
         if let Some(line) = self.buffer.last_edit_line.take() {
@@ -390,6 +454,8 @@ impl App {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.quit_armed = false;
+                // clicking dismisses the search bar (like most editors)
+                self.search = None;
                 if self.in_sidebar(pos) {
                     self.focus = Focus::Sidebar;
                     if let Some(row) = self.sidebar_row_at(pos) {
@@ -497,6 +563,7 @@ impl App {
                         self.buffer.move_down();
                     }
                     self.ensure_cursor_visible();
+                    self.reanchor_search();
                 }
             }
             MouseEventKind::ScrollUp => {
@@ -507,6 +574,7 @@ impl App {
                         self.buffer.move_up();
                     }
                     self.ensure_cursor_visible();
+                    self.reanchor_search();
                 }
             }
             MouseEventKind::ScrollLeft => {
@@ -626,6 +694,66 @@ impl App {
             }
             Err(e) => self.set_message(format!("save failed: {e}")),
         }
+    }
+
+    // ---- search ------------------------------------------------------------
+
+    /// Open the search bar. Ctrl+F while it is already open jumps to the
+    /// next match (like most editors).
+    fn open_search(&mut self) {
+        if self.save_as_input.is_some() {
+            return;
+        }
+        if self.search.is_some() {
+            self.search_step(1);
+        } else {
+            self.search = Some(Search::new());
+        }
+    }
+
+    /// Move the current match by `dir` (+1 next, −1 previous) and jump the
+    /// cursor to it.
+    fn search_step(&mut self, dir: isize) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        search.step(dir);
+        self.jump_to_current_match();
+    }
+
+    /// Recompute the matches after the query changed and jump the cursor to
+    /// the match at or after its current position.
+    fn recompute_search(&mut self) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        let cursor = self.buffer.cursor;
+        search.refresh(&self.buffer.lines, cursor);
+        self.jump_to_current_match();
+    }
+
+    /// Keep the current match anchored to the cursor without moving it
+    /// (used when scrolling with the mouse while searching).
+    fn reanchor_search(&mut self) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        let cursor = self.buffer.cursor;
+        search.refresh(&self.buffer.lines, cursor);
+    }
+
+    /// Move the cursor onto the current search match and clear any
+    /// selection so the highlight reads cleanly.
+    fn jump_to_current_match(&mut self) {
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        let Some(m) = search.current_match() else {
+            return;
+        };
+        self.buffer.cursor = (m.start, m.line);
+        self.buffer.clear_selection();
+        self.ensure_cursor_visible();
     }
 
     fn open_selected(&mut self) {
@@ -783,8 +911,21 @@ impl App {
                 .buffer
                 .selection_on_line(y)
                 .map(|(a, b)| (char_index_to_byte(line, a), char_index_to_byte(line, b)));
+            // search matches on this line, in char offsets
+            let search_matches: Vec<(usize, usize, bool)> = self
+                .search
+                .as_ref()
+                .map(|s| s.matches_on_line(y).collect())
+                .unwrap_or_default();
             let mut spans = vec![num];
-            spans.extend(clip_ops(line, &ops, self.buffer.scroll.0, text_w, sel));
+            spans.extend(clip_ops(
+                line,
+                &ops,
+                self.buffer.scroll.0,
+                text_w,
+                sel,
+                &search_matches,
+            ));
             rows.push(Line::from(spans));
         }
         if rows.is_empty() {
@@ -843,14 +984,63 @@ impl App {
             return;
         }
 
+        // the search prompt replaces the status bar content while active
+        if let Some(search) = &self.search {
+            let prompt = "search: ";
+            let prompt_w = prompt.width() as u16;
+            let input_w = search
+                .query
+                .chars()
+                .map(|c| c.width().unwrap_or(0))
+                .sum::<usize>() as u16;
+            let base = Style::default().bg(Color::Rgb(30, 30, 30));
+            let counter: Vec<Span> = if search.query.is_empty() {
+                Vec::new()
+            } else if search.match_count() == 0 {
+                vec![Span::styled(
+                    "no matches",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )]
+            } else {
+                vec![Span::styled(
+                    format!("{}/{}", search.current_index() + 1, search.match_count()),
+                    Style::default().fg(Color::Cyan),
+                )]
+            };
+            let counter_w = counter.iter().map(|s| s.content.width() as u16).sum();
+            let [left_area, right_area] =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(counter_w)]).areas(area);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        prompt,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(search.query.clone(), Style::default().fg(Color::White)),
+                ]))
+                .style(base),
+                left_area,
+            );
+            frame.render_widget(Paragraph::new(Line::from(counter)).style(base), right_area);
+            let cursor_x = (area.x + prompt_w + input_w).min(left_area.x + left_area.width);
+            frame.set_cursor_position(Position::new(cursor_x, area.y));
+            return;
+        }
+
         // right: position + help
         let (x, y) = self.buffer.cursor;
         let right = format!(
-            "{}:{}   Ctrl+O switch · Ctrl+S save · Ctrl+Z undo · Ctrl+Shift+Z redo · Ctrl+C/X/V copy/cut/paste · Ctrl+Q quit",
+            "{}:{}   Ctrl+O switch · Ctrl+S save · Ctrl+Z undo · Ctrl+Shift+Z redo · Ctrl+C/X/V clipboard · Ctrl+F search · Ctrl+Q quit",
             y + 1,
             x + 1
         );
-        let right_width = right.width() as u16;
+        // cap the help so the left side (focus, file, modified state) always
+        // stays visible, even on narrow terminals
+        let right_width = (right.width() as u16).min(area.width.saturating_sub(24));
 
         let [left_area, right_area] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).areas(area);
@@ -998,16 +1188,30 @@ fn snap_char_down(s: &str, mut b: usize) -> usize {
 /// Clip styled byte-ranges from the highlighter to the visible char slice
 /// `[start_char, start_char + width)`, producing the `Span`s to render.
 /// `None` styles render as plain text (terminal default colors); spans
-/// overlapping `sel` (byte range on this line) are shown reversed.
+/// overlapping `sel` (byte range on this line) are shown reversed, and
+/// spans inside a search match (`matches`, char ranges with a "current
+/// match" flag) get the match background.
 fn clip_ops<'a>(
     line: &'a str,
     ops: &[(Option<Style>, Range<usize>)],
     start_char: usize,
     width: usize,
     sel: Option<(usize, usize)>,
+    matches: &[(usize, usize, bool)],
 ) -> Vec<Span<'a>> {
     let start_byte = char_index_to_byte(line, start_char);
     let end_byte = char_index_to_byte(line, start_char + width);
+    let sel = sel.map(|(a, b)| (char_index_to_byte(line, a), char_index_to_byte(line, b)));
+    let matches: Vec<(usize, usize, bool)> = matches
+        .iter()
+        .map(|&(a, b, current)| {
+            (
+                char_index_to_byte(line, a),
+                char_index_to_byte(line, b),
+                current,
+            )
+        })
+        .collect();
     let mut out = Vec::new();
     for (style, range) in ops {
         let a = range.start.max(start_byte);
@@ -1021,32 +1225,42 @@ fn clip_ops<'a>(
         if a >= b {
             continue;
         }
-        let mut push_span = |a: usize, b: usize, selected: bool| {
-            if a >= b {
-                return;
+        // split the range at every selection and match boundary so each
+        // piece can carry its own style
+        let mut cuts = vec![a, b];
+        if let Some((sa, sb)) = sel {
+            cuts.extend([sa, sb]);
+        }
+        for &(ma, mb, _) in &matches {
+            cuts.extend([ma, mb]);
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for pair in cuts.windows(2) {
+            let (ca, cb) = (pair[0], pair[1]);
+            if ca < a || cb > b || ca >= cb {
+                continue;
             }
-            let text = &line[a..b];
-            match (style, selected) {
-                (Some(style), false) => out.push(Span::styled(text, *style)),
-                (Some(style), true) => {
-                    out.push(Span::styled(text, style.add_modifier(Modifier::REVERSED)))
-                }
-                (None, false) => out.push(Span::raw(text)),
-                (None, true) => out.push(Span::styled(
-                    text,
-                    Style::default().add_modifier(Modifier::REVERSED),
-                )),
+            let mut style = style.unwrap_or_default();
+            if let Some(&(_, _, current)) =
+                matches.iter().find(|&&(ma, mb, _)| ca >= ma && cb <= mb)
+            {
+                let bg = if current {
+                    SEARCH_CURRENT_BG
+                } else {
+                    SEARCH_OTHER_BG
+                };
+                style = style.bg(bg);
             }
-        };
-
-        if let Some((sa, sb)) = sel.filter(|(sa, sb)| a < *sb && b > *sa) {
-            let selected_start = a.max(sa);
-            let selected_end = b.min(sb);
-            push_span(a, selected_start, false);
-            push_span(selected_start, selected_end, true);
-            push_span(selected_end, b, false);
-        } else {
-            push_span(a, b, false);
+            if sel.is_some_and(|(sa, sb)| ca >= sa && cb <= sb) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            let text = &line[ca..cb];
+            if style == Style::default() {
+                out.push(Span::raw(text));
+            } else {
+                out.push(Span::styled(text, style));
+            }
         }
     }
     out
@@ -1194,6 +1408,208 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         assert!(app.save_as_input.is_none());
         assert!(app.buffer.path.is_none());
+    }
+
+    // ---- search ------------------------------------------------------------
+
+    fn open_search_typed(app: &mut App, query: &str) {
+        app.handle_key(ctrl('f'));
+        for c in query.chars() {
+            app.handle_key(char_key(c));
+        }
+    }
+
+    #[test]
+    fn ctrl_f_opens_search_and_typing_highlights_matches() {
+        let dir = scratch("search1");
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello world\nhello again\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+
+        app.handle_key(ctrl('f'));
+        assert!(app.search.is_some());
+        assert_eq!(app.search.as_ref().unwrap().query, "");
+
+        open_search_typed(&mut app, "hello");
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.query, "hello");
+        assert_eq!(search.match_count(), 2);
+        assert_eq!(search.current_index(), 0);
+        // the cursor jumped to the current match...
+        assert_eq!(app.buffer.cursor, (0, 0));
+        // ...and the buffer itself was not edited
+        assert_eq!(app.buffer.lines, vec!["hello world", "hello again", ""]);
+    }
+
+    #[test]
+    fn search_enter_and_shift_enter_step_through_matches() {
+        let dir = scratch("search2");
+        let file = dir.join("a.txt");
+        fs::write(&file, "aa bb aa\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        open_search_typed(&mut app, "aa");
+
+        app.handle_key(key(KeyCode::Enter));
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.current_index(), 1);
+        assert_eq!(app.buffer.cursor, (6, 0));
+
+        // wraps around past the last match
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.buffer.cursor, (0, 0));
+
+        // Shift+Enter goes back (kitty terminals report it as Enter+SHIFT)
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.buffer.cursor, (6, 0));
+
+        // Ctrl+F again jumps to the next match too
+        app.handle_key(ctrl('f'));
+        assert_eq!(app.buffer.cursor, (0, 0));
+        assert!(app.search.is_some());
+    }
+
+    #[test]
+    fn search_backspace_and_esc() {
+        let dir = scratch("search3");
+        let file = dir.join("a.txt");
+        fs::write(&file, "foo bar\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        open_search_typed(&mut app, "foob");
+        assert_eq!(app.search.as_ref().unwrap().match_count(), 0);
+
+        app.handle_key(key(KeyCode::Backspace)); // "foo" now matches
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.query, "foo");
+        assert_eq!(search.match_count(), 1);
+        assert_eq!(
+            search.current_match(),
+            Some(crate::search::Match {
+                line: 0,
+                start: 0,
+                end: 3
+            })
+        );
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn search_without_matches_keeps_cursor_put() {
+        let dir = scratch("search4");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha beta\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        app.buffer.cursor = (3, 0);
+        open_search_typed(&mut app, "zzz");
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.match_count(), 0);
+        assert_eq!(app.buffer.cursor, (3, 0));
+        // the status bar shows "no matches"
+        let rows = render(&mut app);
+        assert!(row_contains(&rows, "no matches"));
+    }
+
+    #[test]
+    fn search_rendering_highlights_matches_and_counts() {
+        let dir = scratch("search5");
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello world\nhello again\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        render_buffer(&mut app); // set the viewport first
+        open_search_typed(&mut app, "hello");
+
+        let buf = render_buffer(&mut app);
+        // current match (line 0, chars 0..5): yellow background
+        for x in 31..36 {
+            assert_eq!(
+                buf.cell((x, 1)).unwrap().style().bg,
+                Some(Color::Yellow),
+                "col {x}"
+            );
+        }
+        // the other match (line 1, chars 0..5): the dim match color
+        for x in 31..36 {
+            assert_eq!(
+                buf.cell((x, 2)).unwrap().style().bg,
+                Some(Color::Rgb(100, 88, 26)),
+                "col {x}"
+            );
+        }
+        // outside the matches: untouched (Reset, like every plain cell)
+        assert_eq!(buf.cell((36, 1)).unwrap().style().bg, Some(Color::Reset));
+        assert_eq!(buf.cell((31, 3)).unwrap().style().bg, Some(Color::Reset));
+
+        // the status bar shows the prompt, the query and the counter
+        let rows = render(&mut app);
+        assert!(row_contains(&rows, "search:"));
+        assert!(row_contains(&rows, "hello"));
+        assert!(row_contains(&rows, "1/2"));
+    }
+
+    #[test]
+    fn mouse_click_dismisses_search() {
+        let dir = scratch("search6");
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello world\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+        open_search_typed(&mut app, "hello");
+        assert!(app.search.is_some());
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 1));
+        assert!(app.search.is_none());
+        // and the click still moves the cursor (char 4 of line 0)
+        assert_eq!(app.buffer.cursor, (4, 0));
+    }
+
+    #[test]
+    fn ctrl_v_pastes_into_the_search_query() {
+        let dir = scratch("search7");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha\n").unwrap();
+        let mut app = with_fake_clipboard(App::new(dir, Some(file)).unwrap());
+        app.clipboard.set_text("alp");
+        app.handle_key(ctrl('f'));
+        app.handle_key(ctrl('v'));
+        assert_eq!(app.search.as_ref().unwrap().query, "alp");
+        assert_eq!(app.search.as_ref().unwrap().match_count(), 1);
+        assert_eq!(app.buffer.lines, vec!["alpha", ""]); // buffer untouched
+    }
+
+    #[test]
+    fn ctrl_z_while_searching_does_not_undo_the_buffer() {
+        let dir = scratch("search8");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        app.handle_key(char_key('X')); // buffer now "Xalpha"
+        open_search_typed(&mut app, "X");
+        assert_eq!(app.buffer.lines, vec!["Xalpha", ""]);
+
+        app.handle_key(ctrl('z'));
+        assert_eq!(app.buffer.lines, vec!["Xalpha", ""]);
+        assert!(app.search.is_some());
+    }
+
+    #[test]
+    fn clip_ops_styles_search_matches() {
+        let line = "hello world";
+        let style = Style::default().fg(Color::Blue);
+        let spans = clip_ops(
+            line,
+            &[(Some(style), 0..line.len())],
+            0,
+            line.chars().count(),
+            None,
+            &[(0, 5, false)],
+        );
+        let parts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(parts, vec!["hello", " world"]);
+        // match keeps the syntax fg and gains the match background
+        assert_eq!(spans[0].style.bg, Some(Color::Rgb(100, 88, 26)));
+        assert_eq!(spans[0].style.fg, Some(Color::Blue));
+        assert_eq!(spans[1].style.bg, None);
     }
 
     // ---- modified printable characters ------------------------------------
@@ -2008,6 +2424,7 @@ mod tests {
             0,
             line.chars().count(),
             Some((3, 5)),
+            &[],
         );
 
         assert_eq!(
