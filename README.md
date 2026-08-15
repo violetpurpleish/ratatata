@@ -1,21 +1,12 @@
 # ratatata
 
+![Logo](resources/logo.png)
+
 A tiny terminal text editor built with [ratatui](https://github.com/ratatui/ratatui).
 
 Two panes, one goal: a small, dependency-light editor that stays out of your way.
 
-```
-┌──────────────────────────────┬────────────────────────────────┐
-│ ~/proj/                      │ ~/proj/src/main.rs             │
-│                              │   1 fn main() {                │
-│ ▶ src/                       │   2     let msg = "hi";        │
-│   Cargo.toml                 │   3     println!("{msg}");     │
-│   README.md                  │   4 }                          │
-│   main.rs                    │                                │
-│                              │                                │
-└──────────────────────────────┴────────────────────────────────┘
- EDITOR ~/proj/src/main.rs [Rust] ○ saved   1:1  Ctrl+O switch · ...
-```
+![Screenshot](resources/screenshot.png)
 
 ## Features
 
