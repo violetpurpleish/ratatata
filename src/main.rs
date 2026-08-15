@@ -7,6 +7,7 @@ mod app;
 mod buffer;
 mod clipboard;
 mod highlight;
+mod image_view;
 mod search;
 mod sidebar;
 
@@ -23,6 +24,8 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use ratatui::DefaultTerminal;
+use ratatui_image::FontSize;
+use ratatui_image::picker::Picker;
 
 use app::App;
 
@@ -39,7 +42,6 @@ fn main() -> io::Result<()> {
     }
 
     let (dir, file) = resolve_start(args.first().map(PathBuf::from))?;
-    let mut app = App::new(dir, file)?;
 
     let mut terminal = match ratatui::try_init() {
         Ok(t) => t,
@@ -51,6 +53,21 @@ fn main() -> io::Result<()> {
     if let Err(e) = enable_terminal_capabilities() {
         eprintln!("warning: cannot enable mouse/paste support: {e}");
     }
+    // Query the terminal for graphics-protocol support (kitty, sixel,
+    // iTerm2) and its font size so image previews render natively where
+    // possible. Terminals without any support fall back to unicode
+    // half-blocks. Must run after entering the alternate screen but before
+    // the event loop reads input (it briefly reads stdin itself).
+    let picker = detect_image_picker();
+    let mut app = match App::new(dir, file, picker) {
+        Ok(app) => app,
+        Err(e) => {
+            let _ = disable_terminal_capabilities();
+            ratatui::restore();
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
     let result = run(&mut app, &mut terminal);
     let _ = disable_terminal_capabilities();
     ratatui::restore();
@@ -95,6 +112,36 @@ fn disable_terminal_capabilities() -> io::Result<()> {
         DisableBracketedPaste,
         DisableMouseCapture
     )
+}
+
+/// Detect graphics support and correct the cell pixel dimensions using the
+/// terminal's window-size report when it is available. This matters on
+/// HiDPI/Retina terminals: a picker can otherwise receive logical cell
+/// dimensions while Kitty image placement uses physical pixels, making an
+/// image appear smaller than the actual editor viewport.
+#[allow(deprecated)]
+fn detect_image_picker() -> Picker {
+    let detected = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let protocol = detected.protocol_type();
+    let Ok(window) = crossterm::terminal::window_size() else {
+        return detected;
+    };
+    if window.columns == 0 || window.rows == 0 || window.width == 0 || window.height == 0 {
+        return detected;
+    }
+
+    let font_size = FontSize::new(window.width / window.columns, window.height / window.rows);
+    let detected_font = detected.font_size();
+    if font_size.width == 0
+        || font_size.height == 0
+        || (font_size.width == detected_font.width && font_size.height == detected_font.height)
+    {
+        return detected;
+    }
+
+    let mut corrected = Picker::from_fontsize(font_size);
+    corrected.set_protocol_type(protocol);
+    corrected
 }
 
 /// Figure out what directory the sidebar should show and which file (if any)
@@ -170,6 +217,7 @@ fn print_usage() {
          \x20            selects a word, triple-click selects the line, scroll to move,\n\
          \x20            single-click sidebar to select, double-click to open, scroll to browse\n\
          \x20 sidebar:  arrows/Enter open, Backspace goes up\n\
-         \x20 editor:   type, arrows (+Shift to select), Home/End, PgUp/PgDn, Backspace, Delete, Tab"
+         \x20 editor:   type, arrows (+Shift to select), Home/End, PgUp/PgDn, Backspace, Delete, Tab\n\n         images:  opening an image file (png/jpg/gif/webp/…) previews it in the\n         \x20            editor pane via the terminal's graphics protocol (kitty, sixel,
+         \x20            iTerm2, or unicode half-blocks as a last resort); Esc closes"
     );
 }

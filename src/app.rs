@@ -31,8 +31,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::buffer::Buffer;
 use crate::clipboard::{Clipboard, SystemClipboard};
 use crate::highlight::Highlighter;
+use crate::image_view::{self, ImagePreview};
 use crate::search::Search;
 use crate::sidebar::{Kind, Sidebar};
+use ratatui_image::picker::Picker;
 
 /// How long transient status messages stay visible.
 const MESSAGE_TTL: Duration = Duration::from_secs(4);
@@ -74,6 +76,12 @@ pub struct App {
     pub should_quit: bool,
     highlighter: Highlighter,
     pub clipboard: Box<dyn Clipboard>,
+    /// Terminal graphics picker (protocol + font size), used to build
+    /// image previews.
+    picker: Picker,
+    /// Active image preview replacing the text buffer, `None` while editing
+    /// text.
+    image: Option<ImagePreview>,
     /// Transient status message with expiry.
     message: Option<(String, Instant)>,
     /// Active "save as" input text, when the buffer has no file name.
@@ -96,20 +104,26 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(dir: PathBuf, file: Option<PathBuf>) -> io::Result<Self> {
+    pub fn new(dir: PathBuf, file: Option<PathBuf>, picker: Picker) -> io::Result<Self> {
         let mut highlighter = Highlighter::new();
         highlighter.set_path(file.as_deref());
-        let buffer = match &file {
-            Some(path) => Buffer::from_path(path.clone())?,
-            None => Buffer::empty(),
+        // An image file starts an image preview instead of a text buffer;
+        // decoding failures are errors like read failures for text files.
+        let (buffer, image) = match &file {
+            Some(path) if image_view::is_image_path(path) => (
+                Buffer::empty(),
+                Some(ImagePreview::open(path.clone(), &picker)?),
+            ),
+            Some(path) => (Buffer::from_path(path.clone())?, None),
+            None => (Buffer::empty(), None),
         };
-        let focus = if buffer.path.is_some() {
+        let focus = if file.is_some() {
             Focus::Editor
         } else {
             Focus::Sidebar
         };
         let mut sidebar = Sidebar::new(dir)?;
-        if let Some(name) = buffer.path.as_ref().and_then(|p| p.file_name()) {
+        if let Some(name) = file.as_ref().and_then(|p| p.file_name()) {
             sidebar.select_name(&name.to_string_lossy());
         }
         Ok(Self {
@@ -119,6 +133,8 @@ impl App {
             should_quit: false,
             highlighter,
             clipboard: Box::new(SystemClipboard::new()),
+            picker,
+            image,
             message: None,
             save_as_input: None,
             search: None,
@@ -155,10 +171,6 @@ impl App {
                     }
                     return;
                 }
-                KeyCode::Char('s') => {
-                    self.save();
-                    return;
-                }
                 KeyCode::Char('o') => {
                     if self.save_as_input.is_none() {
                         self.focus = match self.focus {
@@ -166,6 +178,15 @@ impl App {
                             Focus::Editor => Focus::Sidebar,
                         };
                     }
+                    return;
+                }
+                // While an image preview is open the other shortcuts do
+                // nothing: there is no text to edit, save or search. This
+                // arm must come after 'q'/'o' (which still work) and before
+                // the rest.
+                _ if self.image.is_some() => return,
+                KeyCode::Char('s') => {
+                    self.save();
                     return;
                 }
                 KeyCode::Char('c') => {
@@ -211,6 +232,15 @@ impl App {
                 }
                 _ => return,
             }
+        }
+
+        // An image preview replaces the buffer entirely: the only key that
+        // does anything is Esc, which closes the preview.
+        if self.image.is_some() {
+            if key.code == KeyCode::Esc {
+                self.close_image_preview();
+            }
+            return;
         }
 
         if let Some(input) = self.save_as_input.as_mut() {
@@ -431,6 +461,11 @@ impl App {
 
     /// Insert pasted text (from Ctrl+V or bracketed paste) into the buffer.
     pub fn paste_text(&mut self, text: String) {
+        // pasting while an image preview is open would edit an invisible
+        // buffer, so ignore it
+        if self.image.is_some() {
+            return;
+        }
         // bracketed paste while searching fills in the query instead
         if let Some(search) = self.search.as_mut() {
             search
@@ -771,6 +806,19 @@ impl App {
             self.set_message("unsaved changes — press Ctrl+S to save first");
             return;
         }
+        if image_view::is_image_path(&path) {
+            match ImagePreview::open(path.clone(), &self.picker) {
+                Ok(preview) => {
+                    self.buffer = Buffer::empty();
+                    self.image = Some(preview);
+                    self.quit_armed = false;
+                    self.focus = Focus::Editor;
+                    self.set_message(format!("previewing {}", path.display()));
+                }
+                Err(e) => self.set_message(format!("cannot open {}: {e}", path.display())),
+            }
+            return;
+        }
         match Buffer::from_path(path.clone()) {
             Ok(buffer) => {
                 self.buffer = buffer;
@@ -781,6 +829,14 @@ impl App {
             }
             Err(e) => self.set_message(format!("cannot open {}: {e}", path.display())),
         }
+    }
+
+    /// Close the image preview and drop back to an empty buffer. The
+    /// terminal's copy of the transmitted image is freed when the app exits.
+    fn close_image_preview(&mut self) {
+        self.image = None;
+        self.buffer = Buffer::empty();
+        self.focus = Focus::Editor;
     }
 
     // ---- drawing -----------------------------------------------------------
@@ -873,6 +929,17 @@ impl App {
             } else {
                 Style::default().fg(Color::DarkGray)
             });
+
+        // An image preview replaces the text: render the block and the image
+        // fitted into the inner area (the image keeps its aspect ratio and
+        // is never upscaled).
+        if let Some(preview) = &mut self.image {
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            preview.draw(frame, inner);
+            return;
+        }
+
         let inner = block.inner(area);
 
         let gutter_w = self.buffer.lines.len().to_string().len() + 1;
@@ -1033,11 +1100,15 @@ impl App {
 
         // right: position + help
         let (x, y) = self.buffer.cursor;
-        let right = format!(
-            "{}:{}   Ctrl+O switch · Ctrl+S save · Ctrl+Z undo · Ctrl+Shift+Z redo · Ctrl+C/X/V clipboard · Ctrl+F search · Ctrl+Q quit",
-            y + 1,
-            x + 1
-        );
+        let right = if self.image.is_some() {
+            "Esc close preview · Ctrl+O switch · Ctrl+Q quit".to_string()
+        } else {
+            format!(
+                "{}:{}   Ctrl+O switch · Ctrl+S save · Ctrl+Z undo · Ctrl+Shift+Z redo · Ctrl+C/X/V clipboard · Ctrl+F search · Ctrl+Q quit",
+                y + 1,
+                x + 1
+            )
+        };
         // cap the help so the left side (focus, file, modified state) always
         // stays visible, even on narrow terminals
         let right_width = (right.width() as u16).min(area.width.saturating_sub(24));
@@ -1087,6 +1158,29 @@ impl App {
     /// The normal (non-message) left side of the status bar. Truncates the
     /// path so the focus tag and the modified indicator always stay visible.
     fn status_left(&self, width: u16) -> (Vec<Span<'static>>, Style) {
+        if let Some(preview) = &self.image {
+            let tag = "IMAGE";
+            let path = preview.path.display().to_string();
+            let dims = format!("[{}x{}]", preview.pixels.0, preview.pixels.1);
+            let view = "○ view";
+            let path_max = width
+                .saturating_sub(tag.width() as u16 + dims.width() as u16 + view.width() as u16 + 2);
+            let path = truncate(&path, path_max as usize);
+            return (
+                vec![
+                    Span::styled(
+                        tag,
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!(" {path} ")),
+                    Span::styled(dims, Style::default().fg(Color::DarkGray)),
+                    Span::styled(view, Style::default().fg(Color::Cyan)),
+                ],
+                Style::default(),
+            );
+        }
         let (tag, tag_color) = match self.focus {
             Focus::Sidebar => ("SIDEBAR", Color::Cyan),
             Focus::Editor => ("EDITOR", Color::Green),
@@ -1290,6 +1384,11 @@ mod tests {
         app.clipboard = Box::new(FakeClipboard::default());
         app
     }
+
+    /// App with the deterministic half-blocks picker (no terminal query).
+    fn new_app(dir: PathBuf, file: Option<PathBuf>) -> std::io::Result<App> {
+        App::new(dir, file, Picker::halfblocks())
+    }
     use std::fs;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1339,7 +1438,7 @@ mod tests {
         let dir = scratch("filearg");
         let file = dir.join("a.txt");
         fs::write(&file, "hello\nworld\n").unwrap();
-        let app = App::new(dir, Some(file)).unwrap();
+        let app = new_app(dir, Some(file)).unwrap();
         assert_eq!(app.focus, Focus::Editor);
         assert_eq!(app.buffer.lines, vec!["hello", "world", ""]);
         assert!(!app.buffer.dirty);
@@ -1348,7 +1447,7 @@ mod tests {
     #[test]
     fn directory_arg_focuses_sidebar() {
         let dir = scratch("dira");
-        let app = App::new(dir, None).unwrap();
+        let app = new_app(dir, None).unwrap();
         assert_eq!(app.focus, Focus::Sidebar);
         assert!(app.buffer.path.is_none());
     }
@@ -1356,7 +1455,7 @@ mod tests {
     #[test]
     fn ctrl_o_toggles_focus() {
         let dir = scratch("toggle");
-        let mut app = App::new(dir, None).unwrap();
+        let mut app = new_app(dir, None).unwrap();
         assert_eq!(app.focus, Focus::Sidebar);
         app.handle_key(ctrl('o'));
         assert_eq!(app.focus, Focus::Editor);
@@ -1367,7 +1466,7 @@ mod tests {
     #[test]
     fn save_as_flow_creates_file_and_updates_sidebar() {
         let dir = scratch("saveas");
-        let mut app = App::new(dir.clone(), None).unwrap();
+        let mut app = new_app(dir.clone(), None).unwrap();
 
         app.handle_key(ctrl('o')); // focus editor
         for c in "hello".chars() {
@@ -1401,7 +1500,7 @@ mod tests {
     #[test]
     fn escape_cancels_save_as() {
         let dir = scratch("cancel");
-        let mut app = App::new(dir, None).unwrap();
+        let mut app = new_app(dir, None).unwrap();
         app.handle_key(ctrl('o'));
         app.handle_key(ctrl('s'));
         app.handle_key(char_key('x'));
@@ -1424,7 +1523,7 @@ mod tests {
         let dir = scratch("search1");
         let file = dir.join("a.txt");
         fs::write(&file, "hello world\nhello again\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
 
         app.handle_key(ctrl('f'));
         assert!(app.search.is_some());
@@ -1446,7 +1545,7 @@ mod tests {
         let dir = scratch("search2");
         let file = dir.join("a.txt");
         fs::write(&file, "aa bb aa\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         open_search_typed(&mut app, "aa");
 
         app.handle_key(key(KeyCode::Enter));
@@ -1473,7 +1572,7 @@ mod tests {
         let dir = scratch("search3");
         let file = dir.join("a.txt");
         fs::write(&file, "foo bar\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         open_search_typed(&mut app, "foob");
         assert_eq!(app.search.as_ref().unwrap().match_count(), 0);
 
@@ -1499,7 +1598,7 @@ mod tests {
         let dir = scratch("search4");
         let file = dir.join("a.txt");
         fs::write(&file, "alpha beta\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         app.buffer.cursor = (3, 0);
         open_search_typed(&mut app, "zzz");
         let search = app.search.as_ref().unwrap();
@@ -1515,7 +1614,7 @@ mod tests {
         let dir = scratch("search5");
         let file = dir.join("a.txt");
         fs::write(&file, "hello world\nhello again\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app); // set the viewport first
         open_search_typed(&mut app, "hello");
 
@@ -1552,7 +1651,7 @@ mod tests {
         let dir = scratch("search6");
         let file = dir.join("a.txt");
         fs::write(&file, "hello world\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
         open_search_typed(&mut app, "hello");
         assert!(app.search.is_some());
@@ -1568,7 +1667,7 @@ mod tests {
         let dir = scratch("search7");
         let file = dir.join("a.txt");
         fs::write(&file, "alpha\n").unwrap();
-        let mut app = with_fake_clipboard(App::new(dir, Some(file)).unwrap());
+        let mut app = with_fake_clipboard(new_app(dir, Some(file)).unwrap());
         app.clipboard.set_text("alp");
         app.handle_key(ctrl('f'));
         app.handle_key(ctrl('v'));
@@ -1582,7 +1681,7 @@ mod tests {
         let dir = scratch("search8");
         let file = dir.join("a.txt");
         fs::write(&file, "alpha\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         app.handle_key(char_key('X')); // buffer now "Xalpha"
         open_search_typed(&mut app, "X");
         assert_eq!(app.buffer.lines, vec!["Xalpha", ""]);
@@ -1619,7 +1718,7 @@ mod tests {
         let dir = scratch("shiftchar");
         let file = dir.join("a.txt");
         fs::write(&file, "").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
 
         // Some terminals report Shift+letter as the base key plus a SHIFT
         // modifier; the ASCII letter is folded to uppercase.
@@ -1635,7 +1734,7 @@ mod tests {
         let dir = scratch("altchar");
         let file = dir.join("a.txt");
         fs::write(&file, "").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
 
         app.handle_key(alt('['));
         app.handle_key(alt(']'));
@@ -1650,7 +1749,7 @@ mod tests {
         let dir = scratch("altshiftchar");
         let file = dir.join("a.txt");
         fs::write(&file, "").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
 
         app.handle_key(KeyEvent::new(
             KeyCode::Char('|'),
@@ -1669,7 +1768,7 @@ mod tests {
         let dir = scratch("plainchars");
         let file = dir.join("a.txt");
         fs::write(&file, "").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
 
         for c in ['a', 'A', '(', '[', '{', '}', '@', ']', ')'] {
             app.handle_key(char_key(c));
@@ -1682,7 +1781,7 @@ mod tests {
         let dir = scratch("ctrlchar");
         let file = dir.join("a.txt");
         fs::write(&file, "alpha").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
 
         // unbound Ctrl/Super letters are swallowed, not typed
         app.handle_key(ctrl('k'));
@@ -1698,7 +1797,7 @@ mod tests {
     #[test]
     fn save_as_prompt_accepts_alt_and_shift_chars() {
         let dir = scratch("saveasmod");
-        let mut app = App::new(dir, None).unwrap();
+        let mut app = new_app(dir, None).unwrap();
         app.handle_key(ctrl('o'));
         app.handle_key(ctrl('s'));
         assert!(app.save_as_input.is_some());
@@ -1716,7 +1815,7 @@ mod tests {
     fn sidebar_enter_opens_file_and_switches_focus() {
         let dir = scratch("open");
         fs::write(dir.join("b.txt"), "beta").unwrap();
-        let mut app = App::new(dir, None).unwrap();
+        let mut app = new_app(dir, None).unwrap();
         app.sidebar.select_name("b.txt");
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.focus, Focus::Editor);
@@ -1732,7 +1831,7 @@ mod tests {
         let dir = scratch("dirtyblock");
         fs::write(dir.join("a.txt"), "alpha").unwrap();
         fs::write(dir.join("b.txt"), "beta").unwrap();
-        let mut app = App::new(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
         app.handle_key(char_key('X')); // make dirty
         assert!(app.buffer.dirty);
 
@@ -1754,7 +1853,7 @@ mod tests {
         let dir = scratch("save");
         let file = dir.join("a.txt");
         fs::write(&file, "alpha").unwrap();
-        let mut app = App::new(dir.clone(), Some(file)).unwrap();
+        let mut app = new_app(dir.clone(), Some(file)).unwrap();
         app.handle_key(char_key('Z'));
         assert!(app.buffer.dirty);
         app.handle_key(ctrl('s'));
@@ -1765,7 +1864,7 @@ mod tests {
     #[test]
     fn ctrl_q_requires_second_press_when_dirty() {
         let dir = scratch("quit");
-        let mut app = App::new(dir, None).unwrap();
+        let mut app = new_app(dir, None).unwrap();
         app.handle_key(ctrl('o'));
         app.handle_key(char_key('x'));
         app.handle_key(ctrl('q'));
@@ -1777,7 +1876,7 @@ mod tests {
     #[test]
     fn ctrl_q_quits_immediately_when_clean() {
         let dir = scratch("quit2");
-        let mut app = App::new(dir, None).unwrap();
+        let mut app = new_app(dir, None).unwrap();
         app.handle_key(ctrl('q'));
         assert!(app.should_quit);
     }
@@ -1786,7 +1885,7 @@ mod tests {
     fn enter_auto_indents() {
         let dir = scratch("autoindent");
         fs::write(dir.join("a.txt"), "").unwrap();
-        let mut app = App::new(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
         for c in "    fn f() {}".chars() {
             app.handle_key(char_key(c));
         }
@@ -1799,7 +1898,7 @@ mod tests {
     fn tab_indents_selection_and_shift_tab_dedents() {
         let dir = scratch("tabindent");
         fs::write(dir.join("a.txt"), "").unwrap();
-        let mut app = App::new(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
         app.buffer.insert_multiline("    a\n    b");
         app.buffer.home();
         app.buffer.move_up(); // top-left
@@ -1822,7 +1921,7 @@ mod tests {
     fn sidebar_backspace_ascends() {
         let dir = scratch("ascend");
         fs::create_dir(dir.join("sub")).unwrap();
-        let mut app = App::new(dir.clone(), None).unwrap();
+        let mut app = new_app(dir.clone(), None).unwrap();
         app.sidebar.select_name("sub");
         app.handle_key(key(KeyCode::Enter)); // descend
         assert_eq!(app.sidebar.dir, dir.join("sub"));
@@ -1857,7 +1956,7 @@ mod tests {
         let dir = scratch("render1");
         fs::create_dir(dir.join("docs")).unwrap();
         fs::write(dir.join("notes.txt"), "hello world").unwrap();
-        let mut app = App::new(dir.clone(), None).unwrap();
+        let mut app = new_app(dir.clone(), None).unwrap();
 
         let rows = render(&mut app);
         // sidebar: dirs and files listed, selected row marked
@@ -1879,7 +1978,7 @@ mod tests {
         let dir = scratch("render2");
         let file = dir.join("notes.txt");
         fs::write(&file, "hello world").unwrap();
-        let mut app = App::new(dir.clone(), Some(file)).unwrap();
+        let mut app = new_app(dir.clone(), Some(file)).unwrap();
 
         // clean state shows the content and the saved marker
         let rows = render(&mut app);
@@ -1913,7 +2012,7 @@ mod tests {
         let dir = scratch("hlrender");
         let file = dir.join("code.rs");
         fs::write(&file, "fn main() {\n    let msg = \"hi\";\n}\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         let buf = render_buffer(&mut app);
         // "fn" keyword: purple; "main" function name: blue-gray
         // (colors probed from the base16-ocean.dark theme)
@@ -1943,7 +2042,7 @@ mod tests {
         let dir = scratch("caretstyle");
         let file = dir.join("notes.txt");
         fs::write(&file, "test\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         let buf = render_buffer(&mut app);
         let caret = buf.cell((31, 1)).unwrap();
         assert_eq!(caret.symbol(), "t");
@@ -1956,7 +2055,7 @@ mod tests {
         let dir = scratch("hlplain");
         let file = dir.join("notes.txt");
         fs::write(&file, "just some words\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         let buf = render_buffer(&mut app);
         for x in 31..99 {
             // exclude the yellow focus border at x=99
@@ -1973,7 +2072,7 @@ mod tests {
         let dir = scratch("hlrehighlight");
         let file = dir.join("code.rs");
         fs::write(&file, "fn main() {\n}\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         let buf = render_buffer(&mut app);
         assert_ne!(buf.cell((31, 1)).unwrap().style().fg, Some(Color::Reset));
         // typing 'x' in front of "fn" must immediately re-highlight:
@@ -1990,14 +2089,14 @@ mod tests {
         let dir = scratch("hlsyntax");
         let file = dir.join("code.rs");
         fs::write(&file, "fn main() {}\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         let rows = render(&mut app);
         assert!(row_contains(&rows, "[Rust]"));
 
         let dir = scratch("hlsyntax2");
         let file = dir.join("notes.txt");
         fs::write(&file, "hello\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         let rows = render(&mut app);
         assert!(!row_contains(&rows, "[Plain Text]"));
     }
@@ -2005,7 +2104,7 @@ mod tests {
     #[test]
     fn renders_save_as_prompt() {
         let dir = scratch("render3");
-        let mut app = App::new(dir, None).unwrap();
+        let mut app = new_app(dir, None).unwrap();
         app.handle_key(ctrl('o'));
         app.handle_key(char_key('x'));
         app.handle_key(ctrl('s'));
@@ -2019,7 +2118,7 @@ mod tests {
         let file = dir.join("long.txt");
         let content: String = (0..200).map(|i| format!("line {i:03}\n")).collect();
         fs::write(&file, content).unwrap();
-        let mut app = App::new(dir.clone(), Some(file)).unwrap();
+        let mut app = new_app(dir.clone(), Some(file)).unwrap();
 
         // cursor at the end of the buffer; drawing must scroll it into view
         // without panicking
@@ -2036,7 +2135,7 @@ mod tests {
         let dir = scratch("mclick");
         let file = dir.join("code.rs");
         fs::write(&file, "fn main() {\n    let x = 1;\n}\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app); // sets widget areas
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 2));
@@ -2054,7 +2153,7 @@ mod tests {
         let dir = scratch("mdrag");
         let file = dir.join("code.rs");
         fs::write(&file, "fn main() {\n}\n").unwrap();
-        let mut app = with_fake_clipboard(App::new(dir, Some(file)).unwrap());
+        let mut app = with_fake_clipboard(new_app(dir, Some(file)).unwrap());
         render_buffer(&mut app);
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 31, 1));
@@ -2072,7 +2171,7 @@ mod tests {
         let dir = scratch("mshift");
         let file = dir.join("code.rs");
         fs::write(&file, "fn main() {\n}\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 33, 1));
@@ -2091,7 +2190,7 @@ mod tests {
         let dir = scratch("mdblword");
         let file = dir.join("a.txt");
         fs::write(&file, "hello brave world\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
         // terminal col 37 = char 6 = 'b' of "brave"
@@ -2115,7 +2214,7 @@ mod tests {
         let dir = scratch("mtriple");
         let file = dir.join("a.txt");
         fs::write(&file, "one two three\nfour five\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
         let click = |kind| mouse(kind, 31, 1); // char 0 of line 0
@@ -2138,7 +2237,7 @@ mod tests {
         let dir = scratch("mdblafterclick");
         let file = dir.join("a.txt");
         fs::write(&file, "hello brave world\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
         let click = |kind| mouse(kind, 37, 1); // char 6 = 'b' of "brave"
@@ -2162,7 +2261,7 @@ mod tests {
         let dir = scratch("mdblworddrag");
         let file = dir.join("a.txt");
         fs::write(&file, "hello brave new world\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
         let click = |kind| mouse(kind, 37, 1); // char 6 = 'b' of "brave"
@@ -2183,7 +2282,7 @@ mod tests {
         let dir = scratch("mdbljitter");
         let file = dir.join("a.txt");
         fs::write(&file, "hello brave world\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
         let click = |kind| mouse(kind, 37, 1); // char 6 = 'b' of "brave"
@@ -2201,7 +2300,7 @@ mod tests {
         let dir = scratch("mtripledrag");
         let file = dir.join("a.txt");
         fs::write(&file, "one two three\nfour five\nsix\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
         let click = |kind| mouse(kind, 31, 1); // char 0 of line 0
@@ -2223,7 +2322,7 @@ mod tests {
         let dir = scratch("mmulticlick");
         let file = dir.join("a.txt");
         fs::write(&file, "hello brave world\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
         // double-click "brave" -> word selected
@@ -2246,7 +2345,7 @@ mod tests {
         let dir = scratch("mdblspace");
         let file = dir.join("a.txt");
         fs::write(&file, "hello world\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
         // terminal col 36 = char 5 = the space between the words
@@ -2265,7 +2364,7 @@ mod tests {
         let file = dir.join("long.txt");
         let content: String = (0..30).map(|i| format!("line {i}\n")).collect();
         fs::write(&file, content).unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
         assert_eq!(app.buffer.cursor, (0, 0));
@@ -2283,7 +2382,7 @@ mod tests {
     fn sidebar_single_click_selects_double_click_opens() {
         let dir = scratch("mdblclick");
         fs::write(dir.join("a.txt"), "alpha").unwrap();
-        let mut app = App::new(dir, None).unwrap();
+        let mut app = new_app(dir, None).unwrap();
         render_buffer(&mut app);
 
         // single click on the file row (row 1: ".." is row 0)
@@ -2305,7 +2404,7 @@ mod tests {
     fn sidebar_double_click_on_directory_descends() {
         let dir = scratch("mdblclickdir");
         fs::create_dir(dir.join("sub")).unwrap();
-        let mut app = App::new(dir.clone(), None).unwrap();
+        let mut app = new_app(dir.clone(), None).unwrap();
         render_buffer(&mut app);
 
         let click = |kind| mouse(kind, 5, 1); // row 0: ".."
@@ -2322,7 +2421,7 @@ mod tests {
     #[test]
     fn copy_cut_paste_roundtrip() {
         let dir = scratch("clip1");
-        let mut app = with_fake_clipboard(App::new(dir, None).unwrap());
+        let mut app = with_fake_clipboard(new_app(dir, None).unwrap());
         app.handle_key(ctrl('o'));
         for c in "hello world".chars() {
             app.handle_key(char_key(c));
@@ -2347,7 +2446,7 @@ mod tests {
     #[test]
     fn select_all_copy_and_paste_replaces() {
         let dir = scratch("clip2");
-        let mut app = with_fake_clipboard(App::new(dir, None).unwrap());
+        let mut app = with_fake_clipboard(new_app(dir, None).unwrap());
         app.handle_key(ctrl('o'));
         for c in "abc".chars() {
             app.handle_key(char_key(c));
@@ -2371,7 +2470,7 @@ mod tests {
         let dir = scratch("clip3");
         let file = dir.join("a.txt");
         fs::write(&file, "alpha").unwrap();
-        let mut app = with_fake_clipboard(App::new(dir.clone(), Some(file)).unwrap());
+        let mut app = with_fake_clipboard(new_app(dir.clone(), Some(file)).unwrap());
         app.handle_key(char_key('X'));
         assert!(app.buffer.dirty);
         app.handle_key(cmd('s')); // Cmd+S saves
@@ -2389,7 +2488,7 @@ mod tests {
     #[test]
     fn bracketed_paste_inserts_multiline() {
         let dir = scratch("clip4");
-        let mut app = App::new(dir, None).unwrap();
+        let mut app = new_app(dir, None).unwrap();
         app.handle_key(ctrl('o'));
         app.handle_key(char_key('a'));
         app.paste_text("b\nc".to_string());
@@ -2400,7 +2499,7 @@ mod tests {
     #[test]
     fn paste_with_selection_replaces_it() {
         let dir = scratch("clip5");
-        let mut app = with_fake_clipboard(App::new(dir, None).unwrap());
+        let mut app = with_fake_clipboard(new_app(dir, None).unwrap());
         app.handle_key(ctrl('o'));
         for c in "abcdef".chars() {
             app.handle_key(char_key(c));
@@ -2447,7 +2546,7 @@ mod tests {
         let dir = scratch("mselrender");
         let file = dir.join("a.txt");
         fs::write(&file, "hello world\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         app.buffer.home();
         app.buffer.begin_selection();
         app.buffer.end();
@@ -2491,7 +2590,7 @@ mod tests {
         let dir = scratch("undoredo1");
         let file = dir.join("a.txt");
         fs::write(&file, "alpha").unwrap();
-        let mut app = App::new(dir.clone(), Some(file)).unwrap();
+        let mut app = new_app(dir.clone(), Some(file)).unwrap();
 
         app.handle_key(char_key('X'));
         assert_eq!(app.buffer.lines, vec!["Xalpha"]);
@@ -2513,7 +2612,7 @@ mod tests {
         let dir = scratch("undoredo2");
         let file = dir.join("a.txt");
         fs::write(&file, "alpha").unwrap();
-        let mut app = App::new(dir.clone(), Some(file)).unwrap();
+        let mut app = new_app(dir.clone(), Some(file)).unwrap();
 
         app.handle_key(char_key('X'));
         app.handle_key(cmd('z'));
@@ -2527,7 +2626,7 @@ mod tests {
         let dir = scratch("undoredo4");
         let file = dir.join("a.txt");
         fs::write(&file, "alpha").unwrap();
-        let mut app = App::new(dir.clone(), Some(file)).unwrap();
+        let mut app = new_app(dir.clone(), Some(file)).unwrap();
 
         app.handle_key(char_key('X'));
         app.handle_key(ctrl('o')); // switch to the sidebar
@@ -2539,7 +2638,7 @@ mod tests {
     #[test]
     fn ctrl_z_in_save_as_prompt_leaves_buffer_alone() {
         let dir = scratch("undoredo5");
-        let mut app = App::new(dir, None).unwrap();
+        let mut app = new_app(dir, None).unwrap();
         app.handle_key(ctrl('o'));
         app.handle_key(char_key('x'));
         app.handle_key(ctrl('s')); // no file name yet: save-as prompt
@@ -2555,7 +2654,7 @@ mod tests {
         let dir = scratch("undoredo6");
         let file = dir.join("a.txt");
         fs::write(&file, "alpha").unwrap();
-        let mut app = App::new(dir.clone(), Some(file)).unwrap();
+        let mut app = new_app(dir.clone(), Some(file)).unwrap();
 
         app.handle_key(char_key('X'));
         app.handle_key(ctrl('s')); // save: "Xalpha" on disk
@@ -2578,7 +2677,7 @@ mod tests {
         let dir = scratch("undoredo7");
         let file = dir.join("code.rs");
         fs::write(&file, "fn main() {\n}\n").unwrap();
-        let mut app = App::new(dir, Some(file)).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
         let buf = render_buffer(&mut app);
         assert_ne!(buf.cell((31, 1)).unwrap().style().fg, Some(Color::Reset));
 
@@ -2599,8 +2698,227 @@ mod tests {
     #[test]
     fn status_bar_lists_undo_shortcut() {
         let dir = scratch("undoredo8");
-        let mut app = App::new(dir, None).unwrap();
+        let mut app = new_app(dir, None).unwrap();
         let rows = render(&mut app);
         assert!(row_contains(&rows, "Ctrl+Z undo"));
+    }
+
+    // ---- image previews ----------------------------------------------------
+
+    /// Write a 4x2 px test image: top row red, bottom row blue.
+    fn write_test_png(path: &std::path::Path) {
+        let mut img = image::RgbImage::new(4, 2);
+        for x in 0..4 {
+            img.put_pixel(x, 0, image::Rgb([255, 0, 0]));
+            img.put_pixel(x, 1, image::Rgb([0, 0, 255]));
+        }
+        img.save(path).unwrap();
+    }
+
+    fn write_large_test_png(path: &std::path::Path) {
+        let mut img = image::RgbImage::new(1200, 600);
+        for y in 0..600 {
+            for x in 0..1200 {
+                img.put_pixel(x, y, image::Rgb([(x / 5) as u8, (y / 3) as u8, 128]));
+            }
+        }
+        img.save(path).unwrap();
+    }
+
+    #[test]
+    fn image_path_detection() {
+        use crate::image_view::is_image_path;
+        for name in [
+            "a.png",
+            "a.PNG",
+            "photo.JpEg",
+            "a.gif",
+            "a.webp",
+            "a.bmp",
+            "a.jpeg",
+            "a.tiff",
+            "a.tif",
+            "a.qoi",
+            "a.Pnm",
+        ] {
+            assert!(is_image_path(std::path::Path::new(&name)), "{name}");
+        }
+        for name in ["a.txt", "a", "a.png.bak", "dir"] {
+            assert!(!is_image_path(std::path::Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn opening_image_arg_starts_a_preview() {
+        let dir = scratch("imgarg");
+        let file = dir.join("pic.png");
+        write_test_png(&file);
+        let mut app = new_app(dir, Some(file)).unwrap();
+        assert!(app.image.is_some());
+        assert_eq!(app.buffer.lines, vec![""]);
+        assert!(app.buffer.path.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+        let rows = render(&mut app);
+        // status bar advertises the preview: tag, dimensions, and hint
+        assert!(row_contains(&rows, "IMAGE"));
+        assert!(row_contains(&rows, "[4x2]"));
+        assert!(row_contains(&rows, "Esc close preview"));
+    }
+
+    #[test]
+    fn preview_renders_halfblock_pixels() {
+        let dir = scratch("imgdraw");
+        let file = dir.join("pic.png");
+        write_test_png(&file);
+        let mut app = new_app(dir, Some(file)).unwrap();
+        let buf = render_buffer(&mut app);
+        // the editor pane starts at column 28 (sidebar width); the 4x2 px
+        // image is one cell at the assumed 10x20 font. The half-blocks
+        // renderer places a colored block character there — the exact
+        // color is image-rs's resize math (aspect-fit + triangle filter),
+        // so assert the structure: a half-block, colored, with a red/blue
+        // blend that contains no green.
+        let cell = buf.cell((29, 1)).unwrap();
+        assert!(matches!(cell.symbol(), "▀" | "▄"), "{:?}", cell.symbol());
+        let fg = cell.style().fg;
+        let Some(Color::Rgb(r, g, b)) = fg else {
+            panic!("expected an RGB foreground, got {fg:?}");
+        };
+        assert!(r > 0 && b > 0 && g == 0, "got rgb({r},{g},{b})");
+    }
+
+    #[test]
+    fn large_preview_is_contained_without_clipping() {
+        let dir = scratch("imglarge");
+        let file = dir.join("large.png");
+        write_large_test_png(&file);
+        let mut app = new_app(dir.clone(), Some(file)).unwrap();
+        let buf = render_buffer(&mut app);
+
+        // The editor's inner area is columns 29..=138. A wide image is
+        // contained by height, so it must not be stretched to the right edge.
+        let rendered_x: Vec<u16> = (29..=138)
+            .filter(|&x| {
+                matches!(
+                    buf.cell((x, 1)).and_then(|c| c.style().fg),
+                    Some(Color::Rgb(..))
+                )
+            })
+            .collect();
+        assert!(!rendered_x.is_empty());
+        assert!(*rendered_x.iter().max().unwrap() < 138);
+
+        // A tall image is contained by height too, and its last visible row
+        // is still part of the image rather than being clipped away.
+        let medium = dir.join("medium.png");
+        let mut medium_img = image::RgbImage::new(1000, 400);
+        for y in 0..400 {
+            for x in 0..1000 {
+                medium_img.put_pixel(x, y, image::Rgb([(x / 4) as u8, (y / 2) as u8, 128]));
+            }
+        }
+        medium_img.save(&medium).unwrap();
+        let mut medium_app = new_app(dir.clone(), Some(medium)).unwrap();
+        let medium_buf = render_buffer(&mut medium_app);
+        assert!(matches!(
+            medium_buf.cell((29, 21)).and_then(|c| c.style().fg),
+            Some(Color::Rgb(..))
+        ));
+
+        let tall = dir.join("tall.png");
+        let mut img = image::RgbImage::new(600, 1200);
+        for y in 0..1200 {
+            for x in 0..600 {
+                img.put_pixel(x, y, image::Rgb([(x / 3) as u8, (y / 5) as u8, 128]));
+            }
+        }
+        img.save(&tall).unwrap();
+        let mut tall_app = new_app(dir, Some(tall)).unwrap();
+        let tall_buf = render_buffer(&mut tall_app);
+        assert!(matches!(
+            tall_buf.cell((29, 21)).and_then(|c| c.style().fg),
+            Some(Color::Rgb(..))
+        ));
+    }
+
+    #[test]
+    fn esc_closes_preview_and_other_keys_are_ignored() {
+        let dir = scratch("imgclose");
+        let file = dir.join("pic.png");
+        write_test_png(&file);
+        let mut app = new_app(dir, Some(file)).unwrap();
+
+        // typing, saving, and searching do nothing while previewing
+        app.handle_key(char_key('a'));
+        assert!(app.image.is_some());
+        assert_eq!(app.buffer.lines, vec![""]);
+        app.handle_key(ctrl('s'));
+        assert!(app.save_as_input.is_none());
+        app.handle_key(ctrl('f'));
+        assert!(app.search.is_none());
+        // bracketed paste is ignored too
+        app.paste_text("pasted".to_string());
+        assert_eq!(app.buffer.lines, vec![""]);
+
+        // Esc closes the preview, then editing works again
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.image.is_none());
+        app.handle_key(char_key('a'));
+        assert_eq!(app.buffer.lines, vec!["a"]);
+    }
+
+    #[test]
+    fn ctrl_o_and_ctrl_q_still_work_while_previewing() {
+        let dir = scratch("imghotkeys");
+        let file = dir.join("pic.png");
+        write_test_png(&file);
+        let mut app = new_app(dir, Some(file)).unwrap();
+        app.handle_key(ctrl('o'));
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.handle_key(ctrl('o'));
+        assert_eq!(app.focus, Focus::Editor);
+        // clean buffer: Ctrl+Q quits immediately
+        app.handle_key(ctrl('q'));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn sidebar_opens_images_and_dirty_buffers_block_them() {
+        let dir = scratch("imgside");
+        fs::write(dir.join("a.txt"), "text\n").unwrap();
+        write_test_png(&dir.join("pic.png"));
+        let mut app = new_app(dir, None).unwrap();
+        // ".." = 0, a.txt = 1, pic.png = 2
+        app.sidebar.selected = 2;
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.image.is_some());
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.buffer.lines, vec![""]);
+
+        // a dirty buffer blocks opening an image, like any other file
+        let dir = scratch("imgside2");
+        fs::write(dir.join("a.txt"), "text\n").unwrap();
+        write_test_png(&dir.join("pic.png"));
+        let mut app = new_app(dir, None).unwrap();
+        app.sidebar.selected = 1;
+        app.handle_key(key(KeyCode::Enter)); // open a.txt
+        app.handle_key(char_key('x')); // dirty it
+        app.handle_key(ctrl('o')); // back to the sidebar
+        app.sidebar.selected = 2;
+        app.handle_key(key(KeyCode::Enter)); // try to open pic.png
+        assert!(app.image.is_none());
+        assert!(app.buffer.dirty);
+    }
+
+    #[test]
+    fn corrupt_image_is_an_open_error() {
+        let dir = scratch("imgcorrupt");
+        let file = dir.join("bad.png");
+        fs::write(&file, "definitely not an image").unwrap();
+        let err = match App::new(dir, Some(file), Picker::halfblocks()) {
+            Ok(_) => panic!("expected an error for a corrupt image"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("not a valid image"), "{err}");
     }
 }
