@@ -5,6 +5,7 @@
 
 mod app;
 mod buffer;
+mod highlight;
 mod sidebar;
 
 use std::env;

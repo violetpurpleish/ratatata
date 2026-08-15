@@ -32,6 +32,10 @@ pub struct Buffer {
     pub path: Option<PathBuf>,
     /// Whether the buffer has unsaved changes.
     pub dirty: bool,
+    /// First line changed by the most recent edit operation (used to
+    /// invalidate the syntax-highlight cache). Cleared by the app after
+    /// use.
+    pub last_edit_line: Option<usize>,
 }
 
 impl Buffer {
@@ -43,6 +47,7 @@ impl Buffer {
             scroll: (0, 0),
             path: None,
             dirty: false,
+            last_edit_line: None,
         }
     }
 
@@ -90,6 +95,7 @@ impl Buffer {
         line.insert(byte, c);
         self.cursor.0 += 1;
         self.dirty = true;
+        self.last_edit_line = Some(y);
     }
 
     pub fn insert_text(&mut self, text: &str) {
@@ -107,6 +113,7 @@ impl Buffer {
         self.lines.insert(y + 1, right.to_string());
         self.cursor = (0, y + 1);
         self.dirty = true;
+        self.last_edit_line = Some(y);
     }
 
     pub fn backspace(&mut self) {
@@ -125,6 +132,7 @@ impl Buffer {
             return;
         }
         self.dirty = true;
+        self.last_edit_line = Some(self.cursor.1);
     }
 
     pub fn delete(&mut self) {
@@ -140,6 +148,7 @@ impl Buffer {
             return;
         }
         self.dirty = true;
+        self.last_edit_line = Some(self.cursor.1);
     }
 
     // ---- cursor movement ---------------------------------------------------
@@ -223,11 +232,6 @@ impl Buffer {
         if self.cursor.0 >= self.scroll.0 + view_w {
             self.scroll.0 = self.cursor.0.saturating_add(1).saturating_sub(view_w);
         }
-    }
-
-    /// The text of line `y` restricted to the visible slice, as a `String`.
-    pub fn visible_line(&self, y: usize, width: usize) -> String {
-        self.lines[y].chars().skip(self.scroll.0).take(width).collect()
     }
 
     /// Terminal column of the cursor relative to the visible slice,

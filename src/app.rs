@@ -1,6 +1,7 @@
 //! Application state, key handling and rendering.
 
 use std::io;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::buffer::Buffer;
+use crate::highlight::Highlighter;
 use crate::sidebar::{Kind, Sidebar};
 
 /// How long transient status messages stay visible.
@@ -32,6 +34,7 @@ pub struct App {
     pub sidebar: Sidebar,
     pub focus: Focus,
     pub should_quit: bool,
+    highlighter: Highlighter,
     /// Transient status message with expiry.
     message: Option<(String, Instant)>,
     /// Active "save as" input text, when the buffer has no file name.
@@ -45,8 +48,10 @@ pub struct App {
 
 impl App {
     pub fn new(dir: PathBuf, file: Option<PathBuf>) -> io::Result<Self> {
-        let buffer = match file {
-            Some(path) => Buffer::from_path(path)?,
+        let mut highlighter = Highlighter::new();
+        highlighter.set_path(file.as_deref());
+        let buffer = match &file {
+            Some(path) => Buffer::from_path(path.clone())?,
             None => Buffer::empty(),
         };
         let focus = if buffer.path.is_some() {
@@ -67,6 +72,7 @@ impl App {
             sidebar,
             focus,
             should_quit: false,
+            highlighter,
             message: None,
             save_as_input: None,
             quit_armed: false,
@@ -176,6 +182,10 @@ impl App {
             _ => {}
         }
         self.quit_armed = false;
+        // invalidate the highlight cache at the first changed line
+        if let Some(line) = self.buffer.last_edit_line.take() {
+            self.highlighter.invalidate_from(line);
+        }
         self.buffer.ensure_visible(h as usize, w as usize);
     }
 
@@ -214,6 +224,7 @@ impl App {
             return;
         }
         self.buffer.path = Some(path.clone());
+        self.highlighter.set_path(Some(&path));
         match self.buffer.save() {
             Ok(()) => {
                 self.quit_armed = false;
@@ -246,6 +257,7 @@ impl App {
         match Buffer::from_path(path.clone()) {
             Ok(buffer) => {
                 self.buffer = buffer;
+                self.highlighter.set_path(Some(&path));
                 self.quit_armed = false;
                 self.focus = Focus::Editor;
                 self.set_message(format!("opened {}", path.display()));
@@ -352,14 +364,21 @@ impl App {
 
         let start = self.buffer.scroll.1;
         let end = (start + text_h).min(self.buffer.lines.len());
-        let mut rows = Vec::with_capacity(end - start);
+        let mut rows: Vec<Line> = Vec::with_capacity(end.saturating_sub(start));
         for y in start..end {
             let num = Span::styled(
                 format!("{:>width$} ", y + 1, width = gutter_w - 1),
                 Style::default().fg(Color::DarkGray),
             );
-            let text = Span::raw(self.buffer.visible_line(y, text_w));
-            rows.push(Line::from(vec![num, text]));
+            let ops = self.highlighter.highlight_line(&self.buffer.lines, y);
+            let mut spans = vec![num];
+            spans.extend(clip_ops(
+                &self.buffer.lines[y],
+                &ops,
+                self.buffer.scroll.0,
+                text_w,
+            ));
+            rows.push(Line::from(spans));
         }
         if rows.is_empty() {
             rows.push(Line::from(Span::styled(
@@ -462,12 +481,20 @@ impl App {
         } else {
             "○ saved"
         };
-        let path_max = width.saturating_sub(tag.width() as u16 + dirty.width() as u16 + 2);
+        let syntax = if self.highlighter.syntax_name() != "Plain Text" {
+            format!("[{}]", self.highlighter.syntax_name())
+        } else {
+            String::new()
+        };
+        let path_max = width.saturating_sub(
+            tag.width() as u16 + dirty.width() as u16 + syntax.width() as u16 + 2,
+        );
         let path = truncate(&path, path_max as usize);
         (
             vec![
                 Span::styled(tag, Style::default().fg(tag_color).add_modifier(Modifier::BOLD)),
                 Span::raw(format!(" {path} ")),
+                Span::styled(syntax, Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     dirty,
                     if self.buffer.dirty {
@@ -496,6 +523,62 @@ fn truncate(s: &str, max: usize) -> String {
     let keep = max - 1;
     let mut out: String = s.chars().skip(count - keep).collect();
     out.insert(0, '…');
+    out
+}
+
+/// Byte index of the `idx`-th char in `s` (or `s.len()` if past the end).
+fn char_index_to_byte(s: &str, idx: usize) -> usize {
+    s.char_indices()
+        .nth(idx)
+        .map(|(byte, _)| byte)
+        .unwrap_or(s.len())
+}
+
+/// Snap a byte offset up to the next char boundary.
+fn snap_char_up(s: &str, mut b: usize) -> usize {
+    while b < s.len() && !s.is_char_boundary(b) {
+        b += 1;
+    }
+    b
+}
+
+/// Snap a byte offset down to the previous char boundary.
+fn snap_char_down(s: &str, mut b: usize) -> usize {
+    while b > 0 && !s.is_char_boundary(b) {
+        b -= 1;
+    }
+    b
+}
+
+/// Clip styled byte-ranges from the highlighter to the visible char slice
+/// `[start_char, start_char + width)`, producing the `Span`s to render.
+/// `None` styles render as plain text (terminal default colors).
+fn clip_ops<'a>(
+    line: &'a str,
+    ops: &[(Option<Style>, Range<usize>)],
+    start_char: usize,
+    width: usize,
+) -> Vec<Span<'a>> {
+    let start_byte = char_index_to_byte(line, start_char);
+    let end_byte = char_index_to_byte(line, start_char + width);
+    let mut out = Vec::new();
+    for (style, range) in ops {
+        let a = range.start.max(start_byte);
+        let b = range.end.min(end_byte);
+        if a >= b {
+            continue;
+        }
+        // syntect ranges are char-aligned, but be safe
+        let a = snap_char_up(line, a);
+        let b = snap_char_down(line, b);
+        if a >= b {
+            continue;
+        }
+        match style {
+            Some(style) => out.push(Span::styled(&line[a..b], *style)),
+            None => out.push(Span::raw(&line[a..b])),
+        }
+    }
     out
 }
 
@@ -754,6 +837,93 @@ mod tests {
         app.message = None; // simulate the message expiring
         let rows = render(&mut app);
         assert!(row_contains(&rows, "○ saved"));
+    }
+
+    fn render_buffer(app: &mut App) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn renders_syntax_highlighted_code() {
+        let dir = scratch("hlrender");
+        let file = dir.join("code.rs");
+        fs::write(&file, "fn main() {\n    let msg = \"hi\";\n}\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        let buf = render_buffer(&mut app);
+        // "fn" keyword: purple; "main" function name: blue-gray
+        // (colors probed from the base16-ocean.dark theme)
+        assert_eq!(buf.cell((31, 1)).unwrap().symbol(), "f");
+        assert_eq!(
+            buf.cell((31, 1)).unwrap().style().fg,
+            Some(Color::Rgb(180, 142, 173))
+        );
+        assert_eq!(buf.cell((34, 1)).unwrap().symbol(), "m");
+        assert_eq!(
+            buf.cell((34, 1)).unwrap().style().fg,
+            Some(Color::Rgb(143, 161, 179))
+        );
+        // string content "hi": green
+        assert_eq!(buf.cell((46, 2)).unwrap().symbol(), "h");
+        assert_eq!(
+            buf.cell((46, 2)).unwrap().style().fg,
+            Some(Color::Rgb(163, 190, 140))
+        );
+        // punctuation stays uncolored
+        assert_eq!(buf.cell((31, 3)).unwrap().symbol(), "}");
+        assert_eq!(buf.cell((31, 3)).unwrap().style().fg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn plain_text_files_render_uncolored() {
+        let dir = scratch("hlplain");
+        let file = dir.join("notes.txt");
+        fs::write(&file, "just some words\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        let buf = render_buffer(&mut app);
+        for x in 31..99 { // exclude the yellow focus border at x=99
+            let cell = buf.cell((x, 1)).unwrap();
+            if cell.symbol().is_empty() || cell.symbol() == " " {
+                continue;
+            }
+            assert_eq!(cell.style().fg, Some(Color::Reset), "col {x}");
+        }
+    }
+
+    #[test]
+    fn editing_rehighlights_immediately() {
+        let dir = scratch("hlrehighlight");
+        let file = dir.join("code.rs");
+        fs::write(&file, "fn main() {\n}\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        let buf = render_buffer(&mut app);
+        assert_ne!(buf.cell((31, 1)).unwrap().style().fg, Some(Color::Reset));
+        // typing 'x' in front of "fn" must immediately re-highlight:
+        // "xfn" is no longer a keyword
+        app.handle_key(char_key('x'));
+        let buf = render_buffer(&mut app);
+        assert_eq!(buf.cell((31, 1)).unwrap().symbol(), "x");
+        assert_eq!(buf.cell((31, 1)).unwrap().style().fg, Some(Color::Reset));
+        assert_eq!(buf.cell((32, 1)).unwrap().symbol(), "f");
+    }
+
+    #[test]
+    fn status_bar_shows_detected_syntax() {
+        let dir = scratch("hlsyntax");
+        let file = dir.join("code.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        let rows = render(&mut app);
+        assert!(row_contains(&rows, "[Rust]"));
+
+        let dir = scratch("hlsyntax2");
+        let file = dir.join("notes.txt");
+        fs::write(&file, "hello\n").unwrap();
+        let mut app = App::new(dir, Some(file)).unwrap();
+        let rows = render(&mut app);
+        assert!(!row_contains(&rows, "[Plain Text]"));
     }
 
     #[test]
