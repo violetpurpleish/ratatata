@@ -163,10 +163,17 @@ fn resize_mode_for(pixels: (u32, u32), area: Rect, cell_size: FontSize) -> Resiz
 const DIAGNOSTICS_FILE: &str = "ratatata-image-sizing.log";
 static DIAGNOSTICS_INITIALIZED: OnceLock<()> = OnceLock::new();
 
+fn diagnostics_enabled() -> bool {
+    matches!(std::env::var("RAT_DEBUG_IMAGE").as_deref(), Ok("1"))
+}
+
 /// Record a picker before/after terminal-size correction. This deliberately
 /// does not classify either value as logical or physical; that is what the
 /// runtime comparison is meant to establish.
 pub(crate) fn log_picker_observation(label: &str, picker: &Picker) {
+    if !diagnostics_enabled() {
+        return;
+    }
     let font = picker.font_size();
     append_diagnostics(&format!(
         "picker_observation={label} font_size=({}, {}) protocol={:?} capabilities={:?}",
@@ -182,6 +189,9 @@ pub(crate) fn log_scale_observation(
     backing_scale: Option<f64>,
     logical_cell_size: FontSize,
 ) {
+    if !diagnostics_enabled() {
+        return;
+    }
     append_diagnostics(&format!(
         "backing_scale={backing_scale:?} physical_cell_size=({}, {}) derived_logical_cell_size=({}, {})",
         physical_cell_size.width,
@@ -205,6 +215,9 @@ fn diagnostics_path() -> PathBuf {
 }
 
 fn append_diagnostics(record: &str) {
+    if !diagnostics_enabled() {
+        return;
+    }
     DIAGNOSTICS_INITIALIZED.get_or_init(|| {
         let _ = OpenOptions::new()
             .create(true)
@@ -233,6 +246,9 @@ fn log_sizing_diagnostics(
     resize: Resize,
     requested_size: Size,
 ) {
+    if !diagnostics_enabled() {
+        return;
+    }
     let picker_font = picker.font_size();
     let natural_size = Resize::natural_size(image, picker_font);
     let resized_size = resize.size_for(image, picker_font, requested_size);
@@ -275,6 +291,9 @@ fn log_sizing_diagnostics(
 }
 
 fn log_protocol_diagnostics(protocol: &Protocol) {
+    if !diagnostics_enabled() {
+        return;
+    }
     let size = protocol.size();
     append_diagnostics(&format!(
         "protocol_result_size=({}, {})",

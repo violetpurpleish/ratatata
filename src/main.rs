@@ -158,10 +158,38 @@ pub(crate) fn refresh_image_picker(current: &Picker) -> (Picker, FontSize) {
     image_view::log_picker_observation("render", &picker);
     let physical_cell_size = picker.font_size();
     let backing_scale = macos_backing_scale_factor();
-    let logical_cell_size = logical_cell_size_from_scale(physical_cell_size, backing_scale)
-        .unwrap_or_else(image_view::fallback_logical_cell_size);
+    let logical_cell_size = logical_cell_size_for_platform(physical_cell_size, backing_scale);
     image_view::log_scale_observation(physical_cell_size, backing_scale, logical_cell_size);
     (picker, logical_cell_size)
+}
+
+/// Convert backing-pixel cell dimensions into logical dimensions. Rounding is
+/// necessary because ratatui-image represents cell dimensions as integers.
+fn logical_cell_size_for_platform(
+    physical_cell_size: FontSize,
+    backing_scale: Option<f64>,
+) -> FontSize {
+    #[cfg(target_os = "macos")]
+    {
+        macos_logical_cell_size_or_fallback(physical_cell_size, backing_scale)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        non_macos_logical_cell_size(physical_cell_size)
+    }
+}
+
+fn macos_logical_cell_size_or_fallback(
+    physical_cell_size: FontSize,
+    backing_scale: Option<f64>,
+) -> FontSize {
+    logical_cell_size_from_scale(physical_cell_size, backing_scale)
+        .unwrap_or_else(image_view::fallback_logical_cell_size)
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn non_macos_logical_cell_size(physical_cell_size: FontSize) -> FontSize {
+    physical_cell_size
 }
 
 /// Convert backing-pixel cell dimensions into logical dimensions. Rounding is
@@ -305,9 +333,9 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn invalid_or_unavailable_scale_uses_the_known_good_fallback() {
-        let fallback = image_view::fallback_logical_cell_size();
+    fn invalid_or_unavailable_macos_scale_uses_the_known_good_fallback() {
         for scale in [
             None,
             Some(0.0),
@@ -315,9 +343,14 @@ mod tests {
             Some(f64::NAN),
             Some(f64::INFINITY),
         ] {
-            let logical =
-                logical_cell_size_from_scale(FontSize::new(16, 34), scale).unwrap_or(fallback);
+            let logical = macos_logical_cell_size_or_fallback(FontSize::new(16, 34), scale);
             assert_eq!((logical.width, logical.height), (8, 16));
         }
+    }
+
+    #[test]
+    fn non_macos_logical_cell_size_uses_reported_dimensions_unchanged() {
+        let logical = non_macos_logical_cell_size(FontSize::new(16, 34));
+        assert_eq!((logical.width, logical.height), (16, 34));
     }
 }
