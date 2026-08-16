@@ -62,15 +62,13 @@ fn main() -> io::Result<()> {
     let mut app = match App::new_with_cell_size(dir, file, picker, logical_cell_size) {
         Ok(app) => app,
         Err(e) => {
-            let _ = disable_terminal_capabilities();
-            ratatui::restore();
+            restore_terminal();
             eprintln!("error: {e}");
             std::process::exit(1);
         }
     };
     let result = run(&mut app, &mut terminal);
-    let _ = disable_terminal_capabilities();
-    ratatui::restore();
+    restore_terminal();
     result
 }
 
@@ -112,6 +110,28 @@ fn disable_terminal_capabilities() -> io::Result<()> {
         DisableBracketedPaste,
         DisableMouseCapture
     )
+}
+
+/// Return the terminal to the shell without leaving input generated while
+/// mouse capture was enabled in its input queue. If those reports are left
+/// unread, the shell interprets their SGR escape sequences as user input and
+/// prints fragments such as `34;88;2M` at the prompt.
+fn restore_terminal() {
+    let _ = disable_terminal_capabilities();
+    drain_pending_events();
+    ratatui::restore();
+}
+
+/// Mouse reports can already be buffered when the quit event is handled. Stop
+/// tracking first, then let crossterm consume everything that was queued while
+/// the application still owned the terminal. This must happen before raw mode
+/// is disabled by [`ratatui::restore`].
+fn drain_pending_events() {
+    while let Ok(true) = event::poll(Duration::ZERO) {
+        if event::read().is_err() {
+            break;
+        }
+    }
 }
 
 /// Detect graphics support and retain the picker cell dimensions used by the
