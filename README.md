@@ -6,11 +6,11 @@ A tiny terminal text editor built with [ratatui](https://github.com/ratatui/rata
 
 Two panes, one goal: a small, dependency-light editor that stays out of your way.
 
-![Screenshot](https://i.imgur.com/Wq1AbnC.png)
+![Screenshot](https://i.imgur.com/5WJN5q4.png)
 
 ## Installation
 
-```
+```sh
 cargo install ratatata
 ```
 
