@@ -60,14 +60,21 @@ fn remove_indent_unit(line: &mut String) -> usize {
 // ---- soft wrapping --------------------------------------------------------
 //
 // With wrapping enabled every logical line is split into *visual rows* of
-// at most `width` terminal columns, never splitting a wide (CJK etc.)
-// character across rows. A visual row is a char range `[start, end)` of
-// its logical line; `scroll.y` then counts visual rows instead of lines.
+// at most `width` terminal columns. Rows break at word boundaries: the
+// row ends after the last whitespace that fits, so words stay whole (a
+// single word longer than the width is hard-broken, and wide CJK chars
+// are never split). Whitespace that does not fit at a wrap point is
+// *elided*: it stays in the logical line but is rendered on no row, and
+// continuation rows start at the first visible char. A visual row is a
+// char range `[start, end)` of its logical line; `scroll.y` counts
+// visual rows instead of lines.
 
-/// Char index where the visual row starting at char `start` of `line`
-/// ends (exclusive): the largest index whose display width fits in
-/// `width` columns. A single character wider than `width` is kept whole
-/// on its own row (it overflows, but is never split).
+/// Char index where the row starting at char `start` of `line` would
+/// end by pure column width (exclusive): the largest index whose
+/// display width fits in `width` columns. This is the hard-break
+/// fallback used when no whitespace boundary is available; a single
+/// character wider than `width` is kept whole (it overflows, but is
+/// never split).
 fn chunk_end(line: &str, start: usize, width: usize) -> usize {
     let width = width.max(1);
     let mut w = 0;
@@ -83,8 +90,24 @@ fn chunk_end(line: &str, start: usize, width: usize) -> usize {
     line.chars().count()
 }
 
+/// Whether `c` counts as word-boundary whitespace for wrapping.
+fn is_ws(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
+/// Index of the last whitespace char in `line[start..end)`, if any.
+fn last_ws(line: &str, start: usize, end: usize) -> Option<usize> {
+    line.chars()
+        .enumerate()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .fold(None, |last, (i, c)| if is_ws(c) { Some(i) } else { last })
+}
+
 /// Iterator over the visual rows of `line` at `width` columns, yielding
-/// `(start_char, end_char)` ranges. An empty line is a single empty row.
+/// `(start_char, end_char)` ranges. An empty line is a single empty row;
+/// ranges may be non-contiguous where elided whitespace sits between
+/// them.
 pub(crate) struct VisualChunks<'a> {
     line: &'a str,
     width: usize,
@@ -101,11 +124,37 @@ impl Iterator for VisualChunks<'_> {
         }
         let len = self.line.chars().count();
         let start = self.start;
-        if start == len {
+        if start >= len {
+            // an empty line, or a trailing run of whitespace elided
+            // past the last row: one empty row, then nothing
             self.done = true;
             return Some((start, start));
         }
-        let end = chunk_end(self.line, start, self.width);
+        // continuation rows skip the whitespace the previous row could
+        // not fit (it is elided, not shown at the start of the row)
+        let start = if start > 0 {
+            let mut s = start;
+            while s < len && is_ws(self.line.chars().nth(s).expect("s < len")) {
+                s += 1;
+            }
+            if s >= len {
+                self.start = len;
+                self.done = true;
+                return Some((s, s));
+            }
+            s
+        } else {
+            start
+        };
+        let max_end = chunk_end(self.line, start, self.width);
+        // word wrap: end the row after the last whitespace that fits, so
+        // the next row starts with a whole word; without a boundary the
+        // row hard-breaks at the column width
+        let end = if max_end < len {
+            last_ws(self.line, start, max_end).map_or(max_end, |ws| ws + 1)
+        } else {
+            max_end
+        };
         self.start = end;
         if end >= len {
             self.done = true;
@@ -139,7 +188,8 @@ pub(crate) fn visual_chunk(line: &str, k: usize, width: usize) -> (usize, usize)
 }
 
 /// Index of the visual row of `line` that contains char `x` (the last
-/// row when `x` is past the end of the line).
+/// row when `x` is past the end of the line). A position in an elided
+/// gap maps to the row that follows it.
 pub(crate) fn visual_row_of(line: &str, x: usize, width: usize) -> usize {
     let mut row = 0;
     for (_, end) in visual_chunks(line, width) {
@@ -149,6 +199,29 @@ pub(crate) fn visual_row_of(line: &str, x: usize, width: usize) -> usize {
         row += 1;
     }
     row.saturating_sub(1)
+}
+
+/// Snap a position inside an elided gap (whitespace hidden by word
+/// wrap) to the previous visible char; other positions pass through.
+/// Used when moving up/left so the caret never rests on hidden text.
+fn snap_visible_back(line: &str, x: usize, width: usize) -> usize {
+    let row = visual_row_of(line, x, width);
+    let (start, _) = visual_chunk(line, row, width);
+    if x < start {
+        let (_, prev_end) = visual_chunk(line, row.saturating_sub(1), width);
+        prev_end.saturating_sub(1)
+    } else {
+        x
+    }
+}
+
+/// Snap a position inside an elided gap to the next visible char (the
+/// start of the row that follows); other positions pass through. Used
+/// when moving right.
+fn snap_visible_fwd(line: &str, x: usize, width: usize) -> usize {
+    let row = visual_row_of(line, x, width);
+    let (start, _) = visual_chunk(line, row, width);
+    if x < start { start } else { x }
 }
 
 /// Maximum number of undo steps kept in memory (bounded history).
@@ -868,7 +941,8 @@ impl Buffer {
             let row = visual_row_of(&self.lines[y], x, width);
             if row > 0 {
                 let (start, end) = visual_chunk(&self.lines[y], row - 1, width);
-                self.cursor = (x.clamp(start, end), y);
+                let nx = snap_visible_back(&self.lines[y], x.clamp(start, end), width);
+                self.cursor = (nx, y);
             } else if y > 0 {
                 self.cursor.1 -= 1;
                 self.clamp_x();
@@ -893,7 +967,8 @@ impl Buffer {
             let row = visual_row_of(&self.lines[y], x, width);
             if row + 1 < visual_len(&self.lines[y], width) {
                 let (start, end) = visual_chunk(&self.lines[y], row + 1, width);
-                self.cursor = (x.clamp(start, end), y);
+                let nx = snap_visible_back(&self.lines[y], x.clamp(start, end), width);
+                self.cursor = (nx, y);
             } else if y + 1 < self.lines.len() {
                 self.cursor.1 += 1;
                 self.clamp_x();
@@ -910,12 +985,17 @@ impl Buffer {
         self.break_chain();
         // Character movement is already visual-row-correct: the caret sits
         // on a char, and the char before the first char of a wrapped row is
-        // the last char of the previous row.
+        // the last char of the previous row. With word wrap, positions that
+        // land inside elided whitespace snap to the previous visible char.
         if self.cursor.0 > 0 {
             self.cursor.0 -= 1;
         } else if self.cursor.1 > 0 {
             self.cursor.1 -= 1;
             self.cursor.0 = self.line_len(self.cursor.1);
+        }
+        if self.wrap {
+            let width = self.wrap_width.max(1);
+            self.cursor.0 = snap_visible_back(&self.lines[self.cursor.1], self.cursor.0, width);
         }
     }
 
@@ -927,6 +1007,10 @@ impl Buffer {
         } else if self.cursor.1 + 1 < self.lines.len() {
             self.cursor.1 += 1;
             self.cursor.0 = 0;
+        }
+        if self.wrap {
+            let width = self.wrap_width.max(1);
+            self.cursor.0 = snap_visible_fwd(&self.lines[self.cursor.1], self.cursor.0, width);
         }
     }
 
@@ -950,7 +1034,8 @@ impl Buffer {
             let (x, y) = self.cursor;
             let row = visual_row_of(&self.lines[y], x, width);
             let (_, end) = visual_chunk(&self.lines[y], row, width);
-            self.cursor.0 = end;
+            // never rest on whitespace elided at the wrap point
+            self.cursor.0 = snap_visible_back(&self.lines[y], end, width);
             return;
         }
         self.cursor.0 = self.line_len(self.cursor.1);
@@ -966,7 +1051,8 @@ impl Buffer {
             let vrow = self.cursor_vrow().saturating_sub(rows);
             if let Some((y, k)) = self.vrow_position(vrow) {
                 let (start, end) = visual_chunk(&self.lines[y], k, width);
-                self.cursor = (self.cursor.0.clamp(start, end), y);
+                let nx = snap_visible_back(&self.lines[y], self.cursor.0.clamp(start, end), width);
+                self.cursor = (nx, y);
             }
             return;
         }
@@ -984,7 +1070,8 @@ impl Buffer {
             let vrow = (self.cursor_vrow() + rows).min(self.total_visual_rows().saturating_sub(1));
             if let Some((y, k)) = self.vrow_position(vrow) {
                 let (start, end) = visual_chunk(&self.lines[y], k, width);
-                self.cursor = (self.cursor.0.clamp(start, end), y);
+                let nx = snap_visible_back(&self.lines[y], self.cursor.0.clamp(start, end), width);
+                self.cursor = (nx, y);
             }
             return;
         }
@@ -1116,6 +1203,11 @@ impl Buffer {
             let width = self.wrap_width.max(1);
             let row = visual_row_of(line, self.cursor.0, width);
             let (start, _) = visual_chunk(line, row, width);
+            // a cursor on whitespace elided by the wrap renders at the
+            // start of the row that follows it
+            if self.cursor.0 < start {
+                return 0;
+            }
             return line
                 .chars()
                 .skip(start)
@@ -1462,6 +1554,84 @@ mod tests {
         assert_eq!(visual_len("", 10), 1);
         // a zero width degenerates to single-char rows instead of looping
         assert_eq!(visual_chunks("abc", 0).count(), 3);
+    }
+
+    #[test]
+    fn word_wrap_breaks_at_word_boundaries() {
+        // rows end after the last whitespace that fits
+        let rows: Vec<(usize, usize)> = visual_chunks("hello world foo", 8).collect();
+        assert_eq!(rows, vec![(0, 6), (6, 12), (12, 15)]);
+        // a word longer than the width is hard-broken
+        let rows: Vec<(usize, usize)> = visual_chunks("ab cdefgh", 4).collect();
+        assert_eq!(rows, vec![(0, 3), (3, 7), (7, 9)]);
+        // indentation at the start of a line is preserved
+        let rows: Vec<(usize, usize)> = visual_chunks("  hello", 5).collect();
+        assert_eq!(rows, vec![(0, 2), (2, 7)]);
+    }
+
+    #[test]
+    fn word_wrap_elides_excess_spaces_at_the_wrap_point() {
+        // one space fits on the row, the other two are elided: the second
+        // row starts at the first non-whitespace char
+        let rows: Vec<(usize, usize)> = visual_chunks("abc    def", 4).collect();
+        assert_eq!(rows, vec![(0, 4), (7, 10)]);
+        assert_eq!(visual_len("abc    def", 4), 2);
+        // a trailing run of spaces ends in one empty row
+        assert_eq!(visual_len("abc   ", 3), 2);
+    }
+
+    #[test]
+    fn wrapped_left_right_skip_elided_spaces() {
+        let mut b = empty();
+        typed(&mut b, "hello world");
+        b.toggle_wrap(5); // rows: "hello" | "world", the space is elided
+        // left from "world" lands on "hello"'s last char
+        b.cursor = (6, 0);
+        b.move_left();
+        assert_eq!(b.cursor, (4, 0));
+        // and right from there crosses the wrap point onto "world"
+        b.move_right();
+        assert_eq!(b.cursor, (6, 0));
+        // a cursor placed directly on the hidden space is snapped on move
+        b.cursor = (5, 0);
+        b.move_left();
+        assert_eq!(b.cursor, (4, 0));
+        b.cursor = (5, 0);
+        b.move_right();
+        assert_eq!(b.cursor, (6, 0));
+    }
+
+    #[test]
+    fn wrapped_up_down_never_rest_on_elided_spaces() {
+        let mut b = empty();
+        typed(&mut b, "hello world");
+        b.toggle_wrap(5);
+        // up from "world" clamps into "hello"'s last char, not the
+        // hidden space at the wrap point
+        b.cursor = (6, 0);
+        b.move_up();
+        assert_eq!(b.cursor, (4, 0));
+        // down from "hello" lands on "world"'s first char
+        b.cursor = (0, 0);
+        b.move_down();
+        assert_eq!(b.cursor, (6, 0));
+        // End never rests on the hidden space either
+        b.cursor = (1, 0);
+        b.end();
+        assert_eq!(b.cursor, (4, 0));
+    }
+
+    #[test]
+    fn wrapped_cursor_col_clamps_elided_positions() {
+        let mut b = empty();
+        typed(&mut b, "hello world");
+        b.toggle_wrap(5); // rows: "hello" (0..5) | "world" (6..11)
+        b.cursor = (5, 0); // on the elided space
+        assert_eq!(b.cursor_col(), 0); // renders at "world"'s start
+        b.cursor = (6, 0);
+        assert_eq!(b.cursor_col(), 0);
+        b.cursor = (10, 0);
+        assert_eq!(b.cursor_col(), 4); // end of the wrapped row
     }
 
     #[test]

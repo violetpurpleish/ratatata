@@ -2401,6 +2401,31 @@ mod tests {
         assert_eq!(cell.style().bg, Some(Color::Yellow));
     }
 
+    #[test]
+    fn wrapped_text_breaks_at_words_in_rendering() {
+        let dir = scratch("wrap5");
+        let file = dir.join("a.txt");
+        // 30 words of 6 chars (179 chars); at 108 text cols a row
+        // holds exactly 18 words and wraps after a space
+        let line = "hello ".repeat(30).trim_end().to_string();
+        fs::write(&file, format!("{line}\n")).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        app.handle_key(ctrl('w'));
+        app.message = None;
+        let rows = render(&mut app);
+        let text = |row: &str| -> String { row.chars().skip(31).take(108).collect() };
+        let gutter = |row: &str| -> String { row.chars().skip(29).take(2).collect() };
+
+        // first row ends exactly at the wrap point (after a space)
+        assert_eq!(text(&rows[1]), "hello ".repeat(18));
+        // second row continues with whole words and a blank gutter
+        assert_eq!(gutter(&rows[2]), "  ");
+        assert_eq!(
+            text(&rows[2]).trim_end(),
+            format!("{}hello", "hello ".repeat(11))
+        );
+    }
+
     // ---- mouse -------------------------------------------------------------
 
     #[test]

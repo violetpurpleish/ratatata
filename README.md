@@ -16,7 +16,7 @@ Two panes, one goal: a small, dependency-light editor that stays out of your way
 - **Full mouse support** — click to place the cursor, drag or Shift+click to select, double-click to select a word, triple-click to select a line, scroll wheel to move through text and directories
 - **macOS-friendly keys** — on terminals supporting the kitty keyboard protocol, Cmd+key works like Ctrl (unsupported terminals just ignore the request)
 - **Incremental search** — Ctrl+F opens a search bar: matches are highlighted as you type, Enter / Shift+Enter step to the next / previous match, Esc closes
-- **Soft wrapping** — Ctrl+W wraps long lines at the pane width instead of scrolling horizontally; navigation (arrows, Home/End, PgUp/PgDn, mouse) follows the visual rows, and wrapping re-flows automatically on resize
+- **Word wrap** — Ctrl+W wraps long lines at word boundaries (a single unbreakable word still hard-breaks) instead of scrolling horizontally; navigation (arrows, Home/End, PgUp/PgDn, mouse) follows the visual rows, and wrapping re-flows automatically on resize
 - **Image previews** — opening an image file (png, jpg, gif, webp, bmp, …) renders it in the editor pane via the terminal's graphics protocol: kitty graphics where supported (kitty, Ghostty, WezTerm, iTerm2, …), unicode half-blocks elsewhere. Images are contained within the pane without clipping; small images remain at native size, while larger images are scaled using logical cell dimensions. Esc closes the preview
 - **Safe file handling** — a dirty buffer blocks opening another file, and Ctrl+Q asks for confirmation before discarding unsaved changes
 - **Undo / redo** — Ctrl+Z undoes, Ctrl+Shift+Z redoes; continuous typing, backspacing, deleting and pastes each collapse into a single undo step, and undoing restores the cursor, selection and modified state
@@ -45,7 +45,7 @@ rat [path]
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste |
 | `Ctrl+A` | Select all |
 | `Ctrl+F` | Search (type to filter, `Enter` / `Shift+Enter` next / previous match, `Esc` closes) |
-| `Ctrl+W` | Toggle soft wrapping of long lines (visual rows instead of horizontal scrolling) |
+| `Ctrl+W` | Toggle word wrapping of long lines (visual rows instead of horizontal scrolling) |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | `Ctrl+Q` | Quit (press twice when there are unsaved changes) |
 | `Esc` | Close an image preview / cancel the save-as prompt |
