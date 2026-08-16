@@ -69,7 +69,7 @@ Or run in place:
 cargo run -- [path]
 ```
 
-Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`, separate from the `ratatata` package name). Requires Rust 2024 edition (Rust 1.86+). Works in any terminal that supports crossterm's event and drawing APIs — including tmux/`screen` when mouse reporting is enabled.
+Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`, separate from the `ratatata` package name). Requires a Rust toolchain with Edition 2024 support. Works in any terminal that supports crossterm's event and drawing APIs — including tmux/`screen` when mouse reporting is enabled.
 
 ## Testing
 
