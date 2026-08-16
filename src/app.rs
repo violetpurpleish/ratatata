@@ -60,6 +60,10 @@ const TOPBAR_MAX_ROWS: u16 = 2;
 /// Separator between the shortcut buttons in the top bar.
 const TOPBAR_SEPARATOR: &str = " | ";
 const TOPBAR_SEPARATOR_WIDTH: u16 = 3;
+/// Button background, normal and while hovered (the hovered one is
+/// lighter so it reads as "about to be clicked").
+const TOPBAR_PILL_BG: Color = Color::Rgb(45, 45, 45);
+const TOPBAR_PILL_BG_HOVER: Color = Color::Rgb(90, 90, 90);
 
 /// Background of the current search match (same yellow as the block caret).
 const SEARCH_CURRENT_BG: Color = Color::Yellow;
@@ -1104,6 +1108,7 @@ impl App {
     /// hit-testing.
     fn draw_topbar(&mut self, frame: &mut Frame, area: Rect, pills: &[Shortcut]) {
         self.topbar_buttons.clear();
+        let hovered = self.hovered;
         let mut lines: Vec<Line> = Vec::new();
         let mut row_spans: Vec<Span<'static>> = Vec::new();
         let mut x = area.x;
@@ -1136,7 +1141,8 @@ impl App {
             }
             self.topbar_buttons
                 .push((action, Rect::new(x, area.y + lines.len() as u16, w, 1)));
-            row_spans.extend(pill_spans(action));
+            // the hovered button is drawn highlighted
+            row_spans.extend(pill_spans(action, hovered == Some(action)));
             x += w + TOPBAR_SEPARATOR_WIDTH;
         }
         if !row_spans.is_empty() || lines.is_empty() {
@@ -1648,9 +1654,14 @@ fn pill_width(action: Shortcut) -> u16 {
 }
 
 /// The spans of one shortcut button: the key combo in bold accent color
-/// followed by the action name, on a button-like background.
-fn pill_spans(action: Shortcut) -> Vec<Span<'static>> {
-    let bg = Color::Rgb(45, 45, 45);
+/// followed by the action name, on a button-like background. The hovered
+/// button gets a lighter background and a brighter label.
+fn pill_spans(action: Shortcut, hovered: bool) -> Vec<Span<'static>> {
+    let bg = if hovered {
+        TOPBAR_PILL_BG_HOVER
+    } else {
+        TOPBAR_PILL_BG
+    };
     vec![
         Span::styled(
             format!("{} ", action.key_label()),
@@ -1661,7 +1672,9 @@ fn pill_spans(action: Shortcut) -> Vec<Span<'static>> {
         ),
         Span::styled(
             action.action_label(),
-            Style::default().fg(Color::Gray).bg(bg),
+            Style::default()
+                .fg(if hovered { Color::White } else { Color::Gray })
+                .bg(bg),
         ),
     ]
 }
@@ -3157,6 +3170,42 @@ mod tests {
         app.handle_mouse(mouse(MouseEventKind::Moved, 139, 10));
         let rows = render(&mut app);
         assert!(rows[23].contains("1:1"));
+    }
+
+    #[test]
+    fn hovering_top_bar_button_highlights_it() {
+        let dir = scratch("mbtnhoverbg");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        render_buffer(&mut app);
+        let (_, rect) = app
+            .topbar_buttons
+            .iter()
+            .find(|(a, _)| *a == Shortcut::Save)
+            .copied()
+            .unwrap();
+        assert_eq!(rect.x, 16); // guard against layout drift
+
+        // moving the mouse over the button highlights it...
+        app.handle_mouse(mouse(MouseEventKind::Moved, rect.x + 1, rect.y));
+        let buf = render_buffer(&mut app);
+        for x in rect.x..rect.x + rect.width {
+            assert_eq!(
+                buf.cell((x, 0)).unwrap().style().bg,
+                Some(TOPBAR_PILL_BG_HOVER),
+                "col {x}"
+            );
+        }
+        // ...while a non-hovered button keeps its normal background
+        assert_eq!(buf.cell((0, 0)).unwrap().style().bg, Some(TOPBAR_PILL_BG));
+
+        // moving away restores the normal background
+        app.handle_mouse(mouse(MouseEventKind::Moved, 140, 10));
+        let buf = render_buffer(&mut app);
+        assert_eq!(
+            buf.cell((rect.x + 1, 0)).unwrap().style().bg,
+            Some(TOPBAR_PILL_BG)
+        );
     }
 
     #[test]
