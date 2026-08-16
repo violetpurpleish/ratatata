@@ -1717,7 +1717,7 @@ impl App {
             "○ saved"
         };
         let syntax = if self.highlighter.syntax_name() != "Plain Text" {
-            format!("[{}]", self.highlighter.syntax_name())
+            format!("[{}] ", self.highlighter.syntax_name())
         } else {
             String::new()
         };
@@ -2819,7 +2819,7 @@ mod tests {
         fs::write(&file, "fn main() {}\n").unwrap();
         let mut app = new_app(dir, Some(file)).unwrap();
         let rows = render(&mut app);
-        assert!(row_contains(&rows, "[Rust]"));
+        assert!(row_contains(&rows, "[Rust] ○ saved"));
 
         let dir = scratch("hlsyntax2");
         let file = dir.join("notes.txt");
