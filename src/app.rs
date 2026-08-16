@@ -502,8 +502,8 @@ impl App {
             }
             KeyCode::PageUp => self.sidebar.move_selection(-page.max(1)),
             KeyCode::PageDown => self.sidebar.move_selection(page.max(1)),
-            KeyCode::Enter => self.open_selected(),
-            KeyCode::Backspace => match self.sidebar.ascend() {
+            KeyCode::Enter | KeyCode::Right => self.open_selected(),
+            KeyCode::Backspace | KeyCode::Left => match self.sidebar.ascend() {
                 Ok(()) => {}
                 Err(e) => self.set_message(format!("cannot go up: {e}")),
             },
@@ -2531,6 +2531,29 @@ mod tests {
         assert_eq!(app.sidebar.dir, dir.join("sub"));
         app.handle_key(key(KeyCode::Backspace)); // ascend
         assert_eq!(app.sidebar.dir, dir);
+    }
+
+    #[test]
+    fn sidebar_arrow_keys_open_and_ascend() {
+        let dir = scratch("arrows");
+        fs::create_dir(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub").join("f.txt"), "x").unwrap();
+        let mut app = new_app(dir.clone(), None).unwrap();
+
+        // → enters the selected directory, ← goes back up
+        app.sidebar.select_name("sub");
+        app.handle_key(key(KeyCode::Right)); // descend
+        assert_eq!(app.sidebar.dir, dir.join("sub"));
+        app.handle_key(key(KeyCode::Left)); // ascend
+        assert_eq!(app.sidebar.dir, dir);
+
+        // → on a file opens it in the editor (focus moves)
+        app.sidebar.select_name("sub");
+        app.handle_key(key(KeyCode::Right));
+        app.sidebar.select_name("f.txt");
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.buffer.path, Some(dir.join("sub").join("f.txt")));
+        assert_eq!(app.focus, Focus::Editor);
     }
 
     // ---- headless rendering via ratatui's TestBackend --------------------

@@ -72,7 +72,7 @@ rat [path]
 | `Ctrl+Q` | Quit (press twice when there are unsaved changes) |
 | `Esc` | Close an image preview / cancel the save-as prompt |
 
-**Sidebar:** `↑`/`↓` select, `Enter` open (directory = enter, file = open), `Backspace` go up, `Home`/`End`, `PgUp`/`PgDn` page.
+**Sidebar:** `↑`/`↓` select, `Enter`/`→` open (directory = enter, file = open), `Backspace`/`←` go up, `Home`/`End`, `PgUp`/`PgDn` page.
 
 **Editor:** type to insert, `←`/`→`/`↑`/`↓` move (hold `Shift` to extend the selection), `Home`/`End`, `PgUp`/`PgDn`, `Backspace`, `Delete`, `Enter` auto-indents (the new line keeps the current indentation), `Tab` indents (four spaces, or every selected line), `Shift+Tab` dedents. With wrapping on (`Ctrl+W`), `↑`/`↓`/`Home`/`End`/`PgUp`/`PgDn` move by *visual* rows (a wrapped line spans several).
 
