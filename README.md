@@ -8,6 +8,26 @@ Two panes, one goal: a small, dependency-light editor that stays out of your way
 
 ![Screenshot](https://i.imgur.com/Wq1AbnC.png)
 
+## Installation
+
+```
+cargo install ratatata
+```
+
+Or from source:
+
+```sh
+cargo install --path .
+```
+
+Or run in place:
+
+```sh
+cargo run -- [path]
+```
+
+Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`, separate from the `ratatata` package name). Requires a Rust toolchain with Edition 2024 support. Works in any terminal that supports crossterm's event and drawing APIs — including tmux/`screen` when mouse reporting is enabled.
+
 ## Features
 
 - **Sidebar + editor split** — browse directories on the left, edit files on the right
@@ -56,20 +76,6 @@ rat [path]
 **Editor:** type to insert, `←`/`→`/`↑`/`↓` move (hold `Shift` to extend the selection), `Home`/`End`, `PgUp`/`PgDn`, `Backspace`, `Delete`, `Enter` auto-indents (the new line keeps the current indentation), `Tab` indents (four spaces, or every selected line), `Shift+Tab` dedents. With wrapping on (`Ctrl+W`), `↑`/`↓`/`Home`/`End`/`PgUp`/`PgDn` move by *visual* rows (a wrapped line spans several).
 
 **Mouse:** click the editor to move the cursor, drag or Shift+click to select, double-click selects the word under the cursor, triple-click selects the whole line, scroll to move; single-click the sidebar to select, double-click to open, scroll to browse. The shortcut buttons in the bar at the top are clickable too — hover one for a description in the status bar, click it to run the action (the buttons wrap onto a second row on narrow terminals).
-
-## Installation
-
-```sh
-cargo install --path .
-```
-
-Or run in place:
-
-```sh
-cargo run -- [path]
-```
-
-Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`, separate from the `ratatata` package name). Requires a Rust toolchain with Edition 2024 support. Works in any terminal that supports crossterm's event and drawing APIs — including tmux/`screen` when mouse reporting is enabled.
 
 ## Testing
 
