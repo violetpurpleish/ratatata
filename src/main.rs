@@ -327,7 +327,8 @@ fn print_usage() {
          \x20 Ctrl+F   search (type to filter, Enter/Shift+Enter next/prev, Esc closes)\n\
          \x20 Ctrl+W   toggle word wrapping of long lines\n\
          \x20 Ctrl+Q   quit\n\
-         \x20 mouse:    click editor to move the cursor, drag to select, double-click\n\
+         \x20 mouse:    click editor to move the cursor, Ctrl/Cmd+click a web link to\n\
+         \x20            open it in the default browser, drag to select, double-click\n\
          \x20            selects a word, triple-click selects the line, scroll to move,\n\
          \x20            single-click sidebar to select, double-click to open, scroll to browse\n\
          \x20 sidebar:  arrows/Enter open, Backspace goes up\n\

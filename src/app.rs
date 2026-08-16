@@ -18,6 +18,7 @@ fn printable_char(c: char, modifiers: KeyModifiers) -> char {
 use std::io;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -711,6 +712,16 @@ impl App {
                 } else if self.in_editor(pos) {
                     self.focus = Focus::Editor;
                     let click = self.editor_cursor_at(pos);
+                    // Ctrl/Cmd-click opens an HTTP(S) or `www.` link under
+                    // the pointer instead of entering the normal click/
+                    // selection sequence. A non-link Ctrl/Cmd-click keeps
+                    // the ordinary cursor-placement behavior.
+                    if Self::is_ctrl_or_cmd(event.modifiers)
+                        && self.in_editor_text(pos)
+                        && self.open_link_at(click)
+                    {
+                        return;
+                    }
                     // consecutive clicks on the same position within
                     // EDITOR_CLICK_TTL count up: 2 = double-click (select
                     // word), 3 = triple-click (select line); a different
@@ -868,6 +879,49 @@ impl App {
     fn in_editor(&self, pos: (usize, usize)) -> bool {
         self.editor_area
             .contains(Position::new(pos.0 as u16, pos.1 as u16))
+    }
+
+    /// Whether a position is over rendered editor text rather than its border
+    /// or line-number gutter. This prevents a Ctrl/Cmd-click on the gutter
+    /// from opening a URL that happens to start at column zero.
+    fn in_editor_text(&self, pos: (usize, usize)) -> bool {
+        let area = self.editor_area;
+        let gutter_w = self.buffer.lines.len().to_string().len() + 1;
+        let left = area.x as usize + 1 + gutter_w;
+        let right = area.x as usize + area.width.saturating_sub(1) as usize;
+        let top = area.y as usize + 1;
+        let bottom = area.y as usize + area.height.saturating_sub(1) as usize;
+        pos.0 >= left && pos.0 < right && pos.1 >= top && pos.1 < bottom
+    }
+
+    /// Open the link at a clicked editor position. The URL is owned by this
+    /// point so showing a status message cannot keep a borrow of the buffer
+    /// alive.
+    fn open_link_at(&mut self, click: Option<(usize, usize)>) -> bool {
+        let Some((line, column)) = click else {
+            return false;
+        };
+        let Some(url) = self
+            .buffer
+            .lines
+            .get(line)
+            .and_then(|text| link_at(text, column))
+        else {
+            return false;
+        };
+
+        match open_in_browser(&url) {
+            Ok(()) => self.set_message(format!("opened {url}")),
+            Err(error) => self.set_message(format!("could not open link: {error}")),
+        }
+        true
+    }
+
+    /// Whether a mouse event represents the platform's link-opening modifier.
+    /// Cmd is reported as SUPER by terminals that support the kitty keyboard
+    /// protocol, while Ctrl remains the portable fallback.
+    fn is_ctrl_or_cmd(modifiers: KeyModifiers) -> bool {
+        modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
     }
 
     /// Row within the sidebar's visible entries for a mouse position.
@@ -1755,6 +1809,114 @@ impl App {
     }
 }
 
+/// Find a web link containing `char_index` in one editor line.
+///
+/// Link detection deliberately works on the text rather than syntax
+/// highlighting, so it also works in plain-text and source files. Markdown
+/// punctuation around a URL is ignored, while balanced parentheses inside a
+/// URL are retained. `www.` links are normalized to HTTPS before launching.
+fn link_at(line: &str, char_index: usize) -> Option<String> {
+    let chars: Vec<char> = line.chars().collect();
+    for start in 0..chars.len() {
+        let is_http = starts_with_ascii(&chars, start, "http://")
+            || starts_with_ascii(&chars, start, "https://");
+        let is_www = starts_with_ascii(&chars, start, "www.");
+        if !is_http && !is_www {
+            continue;
+        }
+        // Do not treat the middle of an identifier as the start of a link.
+        if start > 0 && (chars[start - 1].is_ascii_alphanumeric() || chars[start - 1] == '_') {
+            continue;
+        }
+
+        let mut end = chars[start..]
+            .iter()
+            .position(|c| c.is_whitespace())
+            .map_or(chars.len(), |offset| start + offset);
+        end = trim_link_end(&chars, start, end);
+        if start >= end || char_index < start || char_index >= end {
+            continue;
+        }
+
+        let mut url: String = chars[start..end].iter().collect();
+        if is_www {
+            url.insert_str(0, "https://");
+        }
+        return Some(url);
+    }
+    None
+}
+
+/// ASCII case-insensitive prefix matching for URL schemes, whose spelling is
+/// case-insensitive even though the rest of a URL is not necessarily so.
+fn starts_with_ascii(chars: &[char], start: usize, prefix: &str) -> bool {
+    chars
+        .get(start..start.saturating_add(prefix.chars().count()))
+        .is_some_and(|candidate| {
+            candidate
+                .iter()
+                .zip(prefix.chars())
+                .all(|(a, b)| a.eq_ignore_ascii_case(&b))
+        })
+}
+
+/// Remove punctuation commonly placed after a URL in prose or Markdown.
+fn trim_link_end(chars: &[char], start: usize, mut end: usize) -> usize {
+    while end > start
+        && matches!(
+            chars[end - 1],
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"'
+        )
+    {
+        end -= 1;
+    }
+    while let Some(&closing) = chars.get(end.saturating_sub(1)) {
+        let opening = match closing {
+            ')' => '(',
+            ']' => '[',
+            '}' => '{',
+            _ => break,
+        };
+        let opens = chars[start..end].iter().filter(|&&c| c == opening).count();
+        let closes = chars[start..end].iter().filter(|&&c| c == closing).count();
+        if closes > opens {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    end
+}
+
+/// Launch a URL using the operating system's default browser.
+fn open_in_browser(url: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(url).spawn().map(|_| ())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `start` is a shell built-in; the empty title keeps a URL beginning
+        // with a quote from being interpreted as the window title.
+        Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(url).spawn().map(|_| ())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+    {
+        let _ = url;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no browser launcher for this platform",
+        ))
+    }
+}
+
 /// Rendered width of one shortcut button ("Ctrl+O switch").
 fn pill_width(action: Shortcut) -> u16 {
     (action.key_label().width() + action.action_label().width() + 1) as u16
@@ -1995,6 +2157,32 @@ mod tests {
 
     fn char_key(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
+    }
+
+    #[test]
+    fn link_detection_handles_urls_and_surrounding_punctuation() {
+        let line = "See https://example.com/docs, and www.example.org/path.";
+        let https_col = line.find("https://").unwrap();
+        let www_col = line.find("www.").unwrap();
+        assert_eq!(
+            link_at(line, https_col + 10).as_deref(),
+            Some("https://example.com/docs")
+        );
+        assert_eq!(
+            link_at(line, www_col + 5).as_deref(),
+            Some("https://www.example.org/path")
+        );
+        assert_eq!(link_at(line, 0), None);
+    }
+
+    #[test]
+    fn link_detection_keeps_balanced_url_parentheses() {
+        let line = "[site](https://example.com/a_(b)).";
+        let col = line.find("example").unwrap();
+        assert_eq!(
+            link_at(line, col).as_deref(),
+            Some("https://example.com/a_(b)")
+        );
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
