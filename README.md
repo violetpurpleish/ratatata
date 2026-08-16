@@ -6,7 +6,7 @@ A tiny terminal text editor built with [ratatui](https://github.com/ratatui/rata
 
 Two panes, one goal: a small, dependency-light editor that stays out of your way.
 
-![Screenshot](https://github.com/user-attachments/assets/b0e4383e-9163-4dbd-8323-71a63470af4e)
+![Screenshot](https://i.imgur.com/Wq1AbnC.png)
 
 ## Features
 
