@@ -295,6 +295,7 @@ fn print_usage() {
          With no argument, the current directory is shown in the sidebar.\n\
          \n\
          keys (Cmd works like Ctrl on macOS-capable terminals):\n\
+         \x20 Ctrl+N   start a new untitled buffer\n\
          \x20 Ctrl+O   switch between sidebar and editor\n\
          \x20 Ctrl+S   save the current file (asks for a name if untitled)\n\
          \x20 Ctrl+Z   undo (Ctrl+Shift+Z redo)\n\

@@ -97,6 +97,7 @@ enum Shortcut {
     Undo,
     Redo,
     ClosePreview,
+    NewFile,
 }
 
 impl Shortcut {
@@ -115,6 +116,7 @@ impl Shortcut {
             Shortcut::Undo => "Ctrl+Z",
             Shortcut::Redo => "Ctrl+Shift+Z",
             Shortcut::ClosePreview => "Esc",
+            Shortcut::NewFile => "Ctrl+N",
         }
     }
 
@@ -133,6 +135,7 @@ impl Shortcut {
             Shortcut::Undo => "undo",
             Shortcut::Redo => "redo",
             Shortcut::ClosePreview => "close preview",
+            Shortcut::NewFile => "new",
         }
     }
 
@@ -152,6 +155,7 @@ impl Shortcut {
             Shortcut::Undo => "undo the last edit",
             Shortcut::Redo => "redo the last undone edit",
             Shortcut::ClosePreview => "close the image preview",
+            Shortcut::NewFile => "start a new untitled buffer",
         }
     }
 
@@ -163,6 +167,7 @@ impl Shortcut {
             Shortcut::Save => Color::Green,
             Shortcut::Find => Color::Yellow,
             Shortcut::ToggleWrap => Color::Magenta,
+            Shortcut::NewFile => Color::Blue,
             _ => Color::White,
         }
     }
@@ -316,6 +321,7 @@ impl App {
                 KeyCode::Char('a') => Shortcut::SelectAll,
                 KeyCode::Char('f') => Shortcut::Find,
                 KeyCode::Char('w') => Shortcut::ToggleWrap,
+                KeyCode::Char('n') => Shortcut::NewFile,
                 // Ctrl+Z undoes, Ctrl+Shift+Z redoes (CapsLock typos land
                 // on redo, a harmless no-op without history). The shifted
                 // letter may arrive as 'Z' or as 'z'+Shift depending on
@@ -433,10 +439,16 @@ impl App {
                     self.close_image_preview();
                 }
             }
+            Shortcut::NewFile => {
+                // not while the save-as prompt or the search bar is modal
+                if self.save_as_input.is_none() && self.search.is_none() {
+                    self.new_file();
+                }
+            }
             // While an image preview is open the remaining shortcuts do
             // nothing: there is no text to edit, save or search. This arm
-            // comes after Quit/SwitchFocus/ClosePreview (which still work)
-            // and before the rest.
+            // comes after Quit/SwitchFocus/ClosePreview/NewFile (which
+            // still work) and before the rest.
             _ if self.image.is_some() => {}
             Shortcut::Save => self.save(),
             Shortcut::Copy => {
@@ -900,6 +912,24 @@ impl App {
 
     // ---- file operations ---------------------------------------------------
 
+    /// Drop the current buffer (and any image preview) and start a fresh
+    /// untitled one — the same state as launching the app from a directory
+    /// without a file path, except that focus stays on the editor so the
+    /// new file can be typed into immediately. Refuses while the buffer
+    /// has unsaved changes.
+    fn new_file(&mut self) {
+        if self.buffer.dirty {
+            self.set_message("unsaved changes — press Ctrl+S to save first");
+            return;
+        }
+        self.buffer = Buffer::empty();
+        self.image = None;
+        self.highlighter.set_path(None);
+        self.quit_armed = false;
+        self.focus = Focus::Editor;
+        self.set_message("new file — press Ctrl+S to save");
+    }
+
     fn save(&mut self) {
         if self.save_as_input.is_some() {
             return;
@@ -1098,6 +1128,7 @@ impl App {
         } else {
             vec![
                 Shortcut::SwitchFocus,
+                Shortcut::NewFile,
                 Shortcut::Save,
                 Shortcut::Undo,
                 Shortcut::Redo,
@@ -1993,6 +2024,95 @@ mod tests {
         assert!(app.buffer.path.is_none());
     }
 
+    // ---- new file (Ctrl+N) ------------------------------------------------
+
+    #[test]
+    fn ctrl_n_opens_a_new_untitled_buffer() {
+        let dir = scratch("newn");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        assert_eq!(app.buffer.lines, vec!["alpha"]);
+        assert!(app.buffer.path.is_some());
+
+        app.handle_key(ctrl('n'));
+        assert_eq!(app.buffer.lines, vec![""]);
+        assert!(app.buffer.path.is_none());
+        assert!(!app.buffer.dirty);
+        assert!(app.image.is_none());
+        // focus stays on the editor so the new file can be typed into
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.message.is_some());
+
+        // typing lands in the new buffer
+        app.handle_key(char_key('x'));
+        assert_eq!(app.buffer.lines, vec!["x"]);
+    }
+
+    #[test]
+    fn ctrl_n_from_a_clean_untitled_buffer_resets_it() {
+        let dir = scratch("newn2");
+        let mut app = new_app(dir, None).unwrap();
+        app.handle_key(ctrl('o'));
+        app.handle_key(char_key('x'));
+        app.handle_key(ctrl('z')); // undo -> clean again
+        assert!(!app.buffer.dirty);
+
+        app.handle_key(ctrl('n'));
+        assert_eq!(app.buffer.lines, vec![""]);
+        assert!(!app.buffer.dirty);
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
+    fn ctrl_n_refuses_when_the_buffer_is_dirty() {
+        let dir = scratch("newn3");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        app.handle_key(char_key('X'));
+        assert!(app.buffer.dirty);
+
+        app.handle_key(ctrl('n'));
+        assert_eq!(app.buffer.lines, vec!["Xalpha"]); // untouched
+        assert_eq!(
+            app.buffer.path.as_ref().unwrap().file_name().unwrap(),
+            "a.txt"
+        );
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn ctrl_n_while_previewing_starts_a_new_buffer() {
+        let dir = scratch("newn4");
+        write_test_png(&dir.join("pic.png"));
+        let mut app = new_app(dir.clone(), Some(dir.join("pic.png"))).unwrap();
+        assert!(app.image.is_some());
+
+        app.handle_key(ctrl('n'));
+        assert!(app.image.is_none());
+        assert_eq!(app.buffer.lines, vec![""]);
+        assert!(!app.buffer.dirty);
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
+    fn ctrl_n_in_the_save_as_prompt_does_nothing() {
+        let dir = scratch("newn5");
+        let mut app = new_app(dir, None).unwrap();
+        app.handle_key(ctrl('o'));
+        app.handle_key(char_key('x'));
+        app.handle_key(ctrl('s'));
+        assert!(app.save_as_input.is_some());
+        app.handle_key(char_key('a'));
+
+        app.handle_key(ctrl('n'));
+        // the prompt and its text survive, the buffer is untouched
+        assert!(app.save_as_input.is_some());
+        assert_eq!(app.save_as_input.as_deref(), Some("a"));
+        assert_eq!(app.buffer.lines, vec!["x"]);
+    }
+
     // ---- search ------------------------------------------------------------
 
     fn open_search_typed(app: &mut App, query: &str) {
@@ -2106,7 +2226,7 @@ mod tests {
         // current match (line 0, chars 0..5): yellow background
         for x in 31..36 {
             assert_eq!(
-                buf.cell((x, 2)).unwrap().style().bg,
+                buf.cell((x, 3)).unwrap().style().bg,
                 Some(Color::Yellow),
                 "col {x}"
             );
@@ -2114,14 +2234,14 @@ mod tests {
         // the other match (line 1, chars 0..5): the dim match color
         for x in 31..36 {
             assert_eq!(
-                buf.cell((x, 3)).unwrap().style().bg,
+                buf.cell((x, 4)).unwrap().style().bg,
                 Some(Color::Rgb(100, 88, 26)),
                 "col {x}"
             );
         }
         // outside the matches: untouched (Reset, like every plain cell)
-        assert_eq!(buf.cell((36, 2)).unwrap().style().bg, Some(Color::Reset));
-        assert_eq!(buf.cell((31, 4)).unwrap().style().bg, Some(Color::Reset));
+        assert_eq!(buf.cell((36, 3)).unwrap().style().bg, Some(Color::Reset));
+        assert_eq!(buf.cell((31, 5)).unwrap().style().bg, Some(Color::Reset));
 
         // the status bar shows the prompt, the query and the counter
         let rows = render(&mut app);
@@ -2504,25 +2624,25 @@ mod tests {
         let buf = render_buffer(&mut app);
         // "fn" keyword: purple; "main" function name: blue-gray
         // (colors probed from the base16-ocean.dark theme)
-        assert_eq!(buf.cell((31, 2)).unwrap().symbol(), "f");
+        assert_eq!(buf.cell((31, 3)).unwrap().symbol(), "f");
         assert_eq!(
-            buf.cell((31, 2)).unwrap().style().fg,
+            buf.cell((31, 3)).unwrap().style().fg,
             Some(Color::Rgb(180, 142, 173))
         );
-        assert_eq!(buf.cell((34, 2)).unwrap().symbol(), "m");
+        assert_eq!(buf.cell((34, 3)).unwrap().symbol(), "m");
         assert_eq!(
-            buf.cell((34, 2)).unwrap().style().fg,
+            buf.cell((34, 3)).unwrap().style().fg,
             Some(Color::Rgb(143, 161, 179))
         );
         // string content "hi": green
-        assert_eq!(buf.cell((46, 3)).unwrap().symbol(), "h");
+        assert_eq!(buf.cell((46, 4)).unwrap().symbol(), "h");
         assert_eq!(
-            buf.cell((46, 3)).unwrap().style().fg,
+            buf.cell((46, 4)).unwrap().style().fg,
             Some(Color::Rgb(163, 190, 140))
         );
         // punctuation stays uncolored
-        assert_eq!(buf.cell((31, 4)).unwrap().symbol(), "}");
-        assert_eq!(buf.cell((31, 4)).unwrap().style().fg, Some(Color::Reset));
+        assert_eq!(buf.cell((31, 5)).unwrap().symbol(), "}");
+        assert_eq!(buf.cell((31, 5)).unwrap().style().fg, Some(Color::Reset));
     }
 
     #[test]
@@ -2532,7 +2652,7 @@ mod tests {
         fs::write(&file, "test\n").unwrap();
         let mut app = new_app(dir, Some(file)).unwrap();
         let buf = render_buffer(&mut app);
-        let caret = buf.cell((31, 2)).unwrap();
+        let caret = buf.cell((31, 3)).unwrap();
         assert_eq!(caret.symbol(), "t");
         assert_eq!(caret.style().bg, Some(Color::Yellow));
         assert!(!caret.style().add_modifier.contains(Modifier::REVERSED));
@@ -2547,7 +2667,7 @@ mod tests {
         let buf = render_buffer(&mut app);
         for x in 31..99 {
             // exclude the yellow focus border at x=99
-            let cell = buf.cell((x, 2)).unwrap();
+            let cell = buf.cell((x, 3)).unwrap();
             if cell.symbol().is_empty() || cell.symbol() == " " {
                 continue;
             }
@@ -2562,14 +2682,14 @@ mod tests {
         fs::write(&file, "fn main() {\n}\n").unwrap();
         let mut app = new_app(dir, Some(file)).unwrap();
         let buf = render_buffer(&mut app);
-        assert_ne!(buf.cell((31, 1)).unwrap().style().fg, Some(Color::Reset));
+        assert_ne!(buf.cell((31, 2)).unwrap().style().fg, Some(Color::Reset));
         // typing 'x' in front of "fn" must immediately re-highlight:
         // "xfn" is no longer a keyword
         app.handle_key(char_key('x'));
         let buf = render_buffer(&mut app);
-        assert_eq!(buf.cell((31, 2)).unwrap().symbol(), "x");
-        assert_eq!(buf.cell((31, 2)).unwrap().style().fg, Some(Color::Reset));
-        assert_eq!(buf.cell((32, 2)).unwrap().symbol(), "f");
+        assert_eq!(buf.cell((31, 3)).unwrap().symbol(), "x");
+        assert_eq!(buf.cell((31, 3)).unwrap().style().fg, Some(Color::Reset));
+        assert_eq!(buf.cell((32, 3)).unwrap().symbol(), "f");
     }
 
     #[test]
@@ -2650,9 +2770,9 @@ mod tests {
         // the first, a blank gutter on the continuations (cols 29..31 are
         // the editor gutter; border chars are multi-byte, so slice chars)
         let gutter = |row: &str| -> String { row.chars().skip(29).take(2).collect() };
-        assert_eq!(gutter(&rows[2]), "1 ");
-        assert_eq!(gutter(&rows[3]), "  ");
+        assert_eq!(gutter(&rows[3]), "1 ");
         assert_eq!(gutter(&rows[4]), "  ");
+        assert_eq!(gutter(&rows[5]), "  ");
         assert!(row_contains(&rows, &"x".repeat(118)));
         // the status bar shows the persistent wrap indicator
         assert!(rows[23].contains("wrap ○"));
@@ -2661,8 +2781,8 @@ mod tests {
         app.handle_key(ctrl('w'));
         app.message = None;
         let rows = render(&mut app);
-        assert_eq!(gutter(&rows[2]), "1 ");
-        assert_eq!(gutter(&rows[3]), "2 ");
+        assert_eq!(gutter(&rows[3]), "1 ");
+        assert_eq!(gutter(&rows[4]), "2 ");
         assert!(!rows[23].contains("wrap ○"));
     }
 
@@ -2677,11 +2797,11 @@ mod tests {
         render_buffer(&mut app); // sets viewport and wrap width
 
         // terminal col 36 = text col 5 on the second visual row (char 123)
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 36, 3));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 36, 4));
         assert_eq!(app.buffer.cursor, (123, 0));
 
         // gutter of the third visual row lands at its start (char 236)
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 31, 4));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 31, 5));
         assert_eq!(app.buffer.cursor, (236, 0));
     }
 
@@ -2698,7 +2818,7 @@ mod tests {
         // cursor on the first visual row: char 110 is col 110 of it
         app.buffer.cursor = (110, 0);
         let buf = render_buffer(&mut app);
-        let cell = buf.cell((141, 2)).unwrap();
+        let cell = buf.cell((141, 3)).unwrap();
         assert_eq!(cell.symbol(), "x");
         assert_eq!(cell.style().bg, Some(Color::Yellow));
     }
@@ -2721,13 +2841,13 @@ mod tests {
         // first row ends exactly at the wrap point (after a space); the
         // rest of the 118-cell row is blank
         assert_eq!(
-            text(&rows[2]).trim_end(),
+            text(&rows[3]).trim_end(),
             format!("{}hello", "hello ".repeat(18))
         );
         // second row continues with whole words and a blank gutter
-        assert_eq!(gutter(&rows[3]), "  ");
+        assert_eq!(gutter(&rows[4]), "  ");
         assert_eq!(
-            text(&rows[3]).trim_end(),
+            text(&rows[4]).trim_end(),
             format!("{}hello", "hello ".repeat(10))
         );
     }
@@ -2742,13 +2862,13 @@ mod tests {
         let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app); // sets widget areas
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 3));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 4));
         assert_eq!(app.focus, Focus::Editor);
         // terminal col 35 = text col 4 on line 2 (index 1)
         assert_eq!(app.buffer.cursor, (4, 1));
 
         // clicking in the gutter lands at column 0
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 29, 4));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 29, 5));
         assert_eq!(app.buffer.cursor, (0, 2));
     }
 
@@ -2907,13 +3027,13 @@ mod tests {
         let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
-        let click = |kind| mouse(kind, 31, 2); // char 0 of line 0
+        let click = |kind| mouse(kind, 31, 3); // char 0 of line 0
         for _ in 0..3 {
             app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
             app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         }
-        // drag to line 2 (terminal row 4) -> extends line-wise
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 31, 4));
+        // drag to line 2 (terminal row 5) -> extends line-wise
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 31, 5));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         assert_eq!(
             app.buffer.selected_text().as_deref(),
@@ -2990,7 +3110,7 @@ mod tests {
         render_buffer(&mut app);
 
         // single click on the file row (row 1: ".." is row 0)
-        let click = |kind| mouse(kind, 5, 3);
+        let click = |kind| mouse(kind, 5, 4);
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         assert_eq!(app.sidebar.selected, 1);
@@ -3011,7 +3131,7 @@ mod tests {
         let mut app = new_app(dir.clone(), None).unwrap();
         render_buffer(&mut app);
 
-        let click = |kind| mouse(kind, 5, 2); // row 0: ".."
+        let click = |kind| mouse(kind, 5, 3); // row 0: ".."
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
@@ -3197,7 +3317,7 @@ mod tests {
             .find(|(a, _)| *a == Shortcut::Save)
             .copied()
             .unwrap();
-        assert_eq!(rect.x, 17); // guard against layout drift
+        assert_eq!(rect.x, 30); // guard against layout drift
 
         // the bar starts one cell in from the window edge: cell (0,0) is
         // plain margin, not part of the first button
@@ -3268,14 +3388,17 @@ mod tests {
             .map(|row| row.iter().map(|c| c.symbol()).collect())
             .collect();
         assert!(rows[0].contains("Ctrl+O switch"));
-        assert!(rows[0].contains("Ctrl+C copy"));
-        assert!(rows[1].contains("Ctrl+X cut"));
-        assert!(rows[1].contains("Ctrl+Q quit"));
+        assert!(rows[0].contains("Ctrl+N new"));
+        assert!(rows[1].contains("Ctrl+C copy"));
+        assert!(rows[1].contains("Ctrl+W wrap"));
+        // the overflow button (Ctrl+Q) is dropped with an ellipsis marker
+        assert!(rows[1].contains("…"));
+        assert!(!rows[1].contains("Ctrl+Q"));
         assert_eq!(app.topbar_area.height, 2);
 
         // clicking a button on the second row still works
-        click_button(&mut app, Shortcut::Quit);
-        assert!(app.should_quit);
+        click_button(&mut app, Shortcut::ToggleWrap);
+        assert!(app.buffer.wrap);
     }
 
     #[test]
@@ -3303,7 +3426,7 @@ mod tests {
         // a second draw shows the full editing button set again
         render_buffer(&mut app);
         let actions: Vec<Shortcut> = app.topbar_buttons.iter().map(|(a, _)| *a).collect();
-        assert_eq!(actions.len(), 10);
+        assert_eq!(actions.len(), 11);
         assert_eq!(actions[0], Shortcut::SwitchFocus);
     }
 
@@ -3372,6 +3495,9 @@ mod tests {
         assert_eq!(app.focus, Focus::Sidebar);
         app.handle_key(cmd('o'));
         assert_eq!(app.focus, Focus::Editor);
+        app.handle_key(cmd('n')); // Cmd+N starts a new untitled buffer
+        assert_eq!(app.buffer.lines, vec![""]);
+        assert!(app.buffer.path.is_none());
         app.handle_key(cmd('q')); // Cmd+Q quits
         assert!(app.should_quit);
     }
@@ -3467,7 +3593,7 @@ mod tests {
         // cells inside the selection are reversed
         for x in 31..42 {
             assert!(
-                buf.cell((x, 2))
+                buf.cell((x, 3))
                     .unwrap()
                     .style()
                     .add_modifier
@@ -3477,7 +3603,7 @@ mod tests {
         }
         // cells outside are not
         assert!(
-            !buf.cell((43, 2))
+            !buf.cell((43, 3))
                 .unwrap()
                 .style()
                 .add_modifier
@@ -3592,18 +3718,18 @@ mod tests {
         fs::write(&file, "fn main() {\n}\n").unwrap();
         let mut app = new_app(dir, Some(file)).unwrap();
         let buf = render_buffer(&mut app);
-        assert_ne!(buf.cell((31, 1)).unwrap().style().fg, Some(Color::Reset));
+        assert_ne!(buf.cell((31, 2)).unwrap().style().fg, Some(Color::Reset));
 
         // typing breaks the keyword, undo restores both text and color
         app.handle_key(char_key('x'));
         let buf = render_buffer(&mut app);
-        assert_eq!(buf.cell((31, 2)).unwrap().style().fg, Some(Color::Reset));
+        assert_eq!(buf.cell((31, 3)).unwrap().style().fg, Some(Color::Reset));
 
         app.handle_key(ctrl('z'));
         let buf = render_buffer(&mut app);
-        assert_eq!(buf.cell((31, 2)).unwrap().symbol(), "f");
+        assert_eq!(buf.cell((31, 3)).unwrap().symbol(), "f");
         assert_eq!(
-            buf.cell((31, 2)).unwrap().style().fg,
+            buf.cell((31, 3)).unwrap().style().fg,
             Some(Color::Rgb(180, 142, 173))
         );
     }
@@ -3613,10 +3739,11 @@ mod tests {
         let dir = scratch("undoredo8");
         let mut app = new_app(dir, None).unwrap();
         let rows = render(&mut app);
-        // the shortcut buttons live in the top bar now
+        // the shortcut buttons live in the top bar now (Ctrl+Q wraps onto
+        // the second row at this width)
         assert!(rows[0].contains("Ctrl+Z undo"));
         assert!(rows[0].contains("Ctrl+Shift+Z redo"));
-        assert!(rows[0].contains("Ctrl+Q quit"));
+        assert!(rows[1].contains("Ctrl+Q quit"));
     }
 
     // ---- image previews ----------------------------------------------------
