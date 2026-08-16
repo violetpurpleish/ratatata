@@ -1156,11 +1156,45 @@ impl Buffer {
 
     // ---- scrolling / rendering --------------------------------------------
 
+    /// Clamp the vertical viewport to the content currently in the buffer.
+    /// Unlike [`ensure_visible`], this never moves the cursor or otherwise
+    /// reanchors the viewport to it; it is used by independent scrolling
+    /// (for example, the mouse wheel).
+    pub fn clamp_scroll(&mut self, view_h: usize) {
+        let view_h = view_h.max(1);
+        let max_scroll = self.total_visual_rows().saturating_sub(view_h);
+        self.scroll.1 = self.scroll.1.min(max_scroll);
+        if self.wrap {
+            // horizontal scrolling is meaningless while wrapping
+            self.scroll.0 = 0;
+        }
+    }
+
+    /// Move the vertical viewport without moving the cursor.
+    ///
+    /// With wrapping, `delta` is measured in visual rows; otherwise it is
+    /// measured in logical lines. The offset is clamped so the viewport
+    /// never scrolls past the end of the buffer.
+    pub fn scroll_vertical(&mut self, delta: isize, view_h: usize) {
+        self.clamp_scroll(view_h);
+        let view_h = view_h.max(1);
+        let max_scroll = self.total_visual_rows().saturating_sub(view_h);
+        self.scroll.1 = if delta < 0 {
+            self.scroll.1.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.scroll.1.saturating_add(delta as usize)
+        }
+        .min(max_scroll);
+    }
+
     /// Scroll so the cursor is inside the visible viewport
     /// (`view_w` x `view_h` chars). With wrapping `scroll.y` is a visual
     /// row and `view_h` counts rows; without wrapping it is a logical
     /// line and `view_w` is the horizontal window.
     pub fn ensure_visible(&mut self, view_h: usize, view_w: usize) {
+        let view_h = view_h.max(1);
+        let view_w = view_w.max(1);
+        self.clamp_scroll(view_h);
         // guard against an out-of-range cursor (shouldn't happen through
         // normal movement, which clamps)
         self.clamp_x();
@@ -1517,6 +1551,25 @@ mod tests {
         b.ensure_visible(10, 30);
         assert_eq!(b.scroll.1, 3);
         assert_eq!(b.scroll.0, 1);
+    }
+
+    #[test]
+    fn vertical_scroll_is_independent_of_cursor() {
+        let mut b = empty();
+        b.lines = (0..20).map(|i| format!("line {i}")).collect();
+        b.cursor = (0, 0);
+
+        b.scroll_vertical(3, 5);
+        assert_eq!(b.cursor, (0, 0));
+        assert_eq!(b.scroll.1, 3);
+
+        b.scroll_vertical(100, 5);
+        assert_eq!(b.cursor, (0, 0));
+        assert_eq!(b.scroll.1, 15);
+
+        b.scroll_vertical(-4, 5);
+        assert_eq!(b.cursor, (0, 0));
+        assert_eq!(b.scroll.1, 11);
     }
 
     #[test]

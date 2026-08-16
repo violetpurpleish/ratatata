@@ -25,7 +25,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::buffer::{Buffer, visual_chunk, visual_row_of};
@@ -202,6 +202,11 @@ pub struct App {
     quit_armed: bool,
     /// Viewport sizes from the last draw, used for paging and scrolling.
     editor_text: (u16, u16),
+    /// Cursor position from the last editor draw. The editor only reanchors
+    /// the viewport when this changes (or when the viewport is resized), so
+    /// an independent mouse-wheel scroll is not immediately undone by the
+    /// next draw.
+    last_drawn_cursor: Option<(usize, usize)>,
     sidebar_height: u16,
     /// Widget areas from the last draw, used for mouse hit-testing.
     sidebar_area: Rect,
@@ -268,6 +273,7 @@ impl App {
             search: None,
             quit_armed: false,
             editor_text: (0, 0),
+            last_drawn_cursor: None,
             sidebar_height: 0,
             sidebar_area: Rect::default(),
             editor_area: Rect::default(),
@@ -793,22 +799,16 @@ impl App {
                 if self.in_sidebar(pos) {
                     self.sidebar.move_selection(1);
                 } else {
-                    for _ in 0..3 {
-                        self.buffer.move_down();
-                    }
-                    self.ensure_cursor_visible();
-                    self.reanchor_search();
+                    // Scrolling the editor changes only the viewport. The
+                    // caret stays where it is, even when it moves off-screen.
+                    self.scroll_editor(3);
                 }
             }
             MouseEventKind::ScrollUp => {
                 if self.in_sidebar(pos) {
                     self.sidebar.move_selection(-1);
                 } else {
-                    for _ in 0..3 {
-                        self.buffer.move_up();
-                    }
-                    self.ensure_cursor_visible();
-                    self.reanchor_search();
+                    self.scroll_editor(-3);
                 }
             }
             MouseEventKind::ScrollLeft if !self.buffer.wrap => {
@@ -825,6 +825,12 @@ impl App {
     fn ensure_cursor_visible(&mut self) {
         let (w, h) = self.editor_text;
         self.buffer.ensure_visible(h as usize, w as usize);
+    }
+
+    /// Move the editor viewport without moving or reanchoring the cursor.
+    fn scroll_editor(&mut self, rows: isize) {
+        self.buffer
+            .scroll_vertical(rows, self.editor_text.1 as usize);
     }
 
     fn in_topbar(&self, pos: (usize, usize)) -> bool {
@@ -1015,16 +1021,6 @@ impl App {
         let cursor = self.buffer.cursor;
         search.refresh(&self.buffer.lines, cursor);
         self.jump_to_current_match();
-    }
-
-    /// Keep the current match anchored to the cursor without moving it
-    /// (used when scrolling with the mouse while searching).
-    fn reanchor_search(&mut self) {
-        let Some(search) = self.search.as_mut() else {
-            return;
-        };
-        let cursor = self.buffer.cursor;
-        search.refresh(&self.buffer.lines, cursor);
     }
 
     /// Move the cursor onto the current search match and clear any
@@ -1291,9 +1287,18 @@ impl App {
         let gutter_w = self.buffer.lines.len().to_string().len() + 1;
         let text_w = inner.width.saturating_sub(gutter_w as u16) as usize;
         let text_h = inner.height as usize;
-        self.editor_text = (text_w as u16, text_h as u16);
+        let viewport = (text_w as u16, text_h as u16);
+        let viewport_changed = self.editor_text != viewport;
+        self.editor_text = viewport;
         self.buffer.wrap_width = text_w;
-        self.buffer.ensure_visible(text_h, text_w);
+        // Clamp a viewport that may have become too far down after an edit,
+        // but do not otherwise reanchor it to the cursor. This distinction is
+        // what lets the mouse wheel scroll through the file independently.
+        self.buffer.clamp_scroll(text_h);
+        if viewport_changed || self.last_drawn_cursor != Some(self.buffer.cursor) {
+            self.buffer.ensure_visible(text_h, text_w);
+        }
+        self.last_drawn_cursor = Some(self.buffer.cursor);
 
         // With wrapping every logical line may occupy several visual
         // rows; `scroll.y` is then a visual row, the gutter shows the
@@ -1406,6 +1411,7 @@ impl App {
                     }
                 }
             }
+            self.draw_editor_scrollbar(frame, area, text_h);
             return;
         }
 
@@ -1470,25 +1476,67 @@ impl App {
             // Ratatui can position the terminal cursor, but cannot give it a
             // color. Render a block caret ourselves so it remains distinct
             // from the reversed selection style (and leave the native cursor
-            // hidden).
+            // hidden). Independent scrolling can put the caret outside the
+            // viewport, in which case there is deliberately nothing to draw.
+            let cursor_visible = self.buffer.cursor.1 >= self.buffer.scroll.1
+                && self.buffer.cursor.1 < self.buffer.scroll.1.saturating_add(text_h)
+                && self.buffer.cursor.0 >= self.buffer.scroll.0
+                && self.buffer.cursor.0 <= self.buffer.scroll.0.saturating_add(text_w);
             let cx = area.x + 1 + gutter_w as u16 + self.buffer.cursor_col() as u16;
-            let cy = area.y + 1 + (self.buffer.cursor.1 - self.buffer.scroll.1) as u16;
             let inner_right = area.x + area.width.saturating_sub(1);
             let inner_bottom = area.y + area.height.saturating_sub(1);
-            if cx < inner_right && cy < inner_bottom {
-                let symbol = self
-                    .buffer
-                    .lines
-                    .get(self.buffer.cursor.1)
-                    .and_then(|line| line.chars().nth(self.buffer.cursor.0))
-                    .map_or_else(|| " ".to_string(), |c| c.to_string());
-                let caret = Paragraph::new(Span::styled(
-                    symbol,
-                    caret_style.unwrap_or_default().bg(Color::Yellow),
-                ));
-                frame.render_widget(caret, Rect::new(cx, cy, 1, 1));
+            if cursor_visible && cx < inner_right {
+                let cy = area.y + 1 + (self.buffer.cursor.1 - self.buffer.scroll.1) as u16;
+                if cy < inner_bottom {
+                    let symbol = self
+                        .buffer
+                        .lines
+                        .get(self.buffer.cursor.1)
+                        .and_then(|line| line.chars().nth(self.buffer.cursor.0))
+                        .map_or_else(|| " ".to_string(), |c| c.to_string());
+                    let caret = Paragraph::new(Span::styled(
+                        symbol,
+                        caret_style.unwrap_or_default().bg(Color::Yellow),
+                    ));
+                    frame.render_widget(caret, Rect::new(cx, cy, 1, 1));
+                }
             }
         }
+        self.draw_editor_scrollbar(frame, area, text_h);
+    }
+
+    /// Draw the vertical editor scrollbar over the block's right border. The
+    /// border column is used rather than the text area, so adding the
+    /// scrollbar does not steal a column from the editor or change wrapping.
+    fn draw_editor_scrollbar(&self, frame: &mut Frame, area: Rect, viewport: usize) {
+        let content_length = self.buffer.total_visual_rows();
+        let viewport = viewport.max(1);
+        if content_length <= viewport || area.width == 0 || area.height <= 2 {
+            return;
+        }
+
+        let scrollbar_area = Rect::new(area.x + area.width - 1, area.y + 1, 1, area.height - 2);
+        // Ratatui's scrollbar position spans the number of possible
+        // positions, not the number of content rows. Supplying the number
+        // of viewport starts makes `scroll == content - viewport` land on
+        // the final scrollbar cell instead of leaving a gap below the thumb.
+        let scroll_positions = content_length.saturating_sub(viewport).saturating_add(1);
+        let mut state = ScrollbarState::new(scroll_positions)
+            .position(self.buffer.scroll.1)
+            .viewport_content_length(viewport);
+        let thumb_style = if self.focus == Focus::Editor {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("█")
+            .track_style(Style::default().fg(Color::DarkGray))
+            .thumb_style(thumb_style);
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
     }
 
     fn draw_status(&mut self, frame: &mut Frame, area: Rect) {
@@ -2759,6 +2807,31 @@ mod tests {
         assert!(!row_contains(&rows, "line 000"));
     }
 
+    #[test]
+    fn renders_editor_scrollbar_for_long_content() {
+        let dir = scratch("render-scrollbar");
+        let file = dir.join("long.txt");
+        let content: String = (0..200).map(|i| format!("line {i:03}\n")).collect();
+        fs::write(&file, content).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        let buf = render_buffer(&mut app);
+        let scrollbar_x = app.editor_area.x + app.editor_area.width - 1;
+        let scrollbar = (app.editor_area.y + 1..app.editor_area.y + app.editor_area.height - 1)
+            .map(|y| buf.cell((scrollbar_x, y)).unwrap().symbol())
+            .collect::<String>();
+        assert!(scrollbar.contains('█'));
+        assert!(scrollbar.contains('│'));
+
+        // At the final viewport the thumb reaches the bottom of the track.
+        app.buffer.scroll.1 = app
+            .buffer
+            .total_visual_rows()
+            .saturating_sub(app.editor_text.1 as usize);
+        let buf = render_buffer(&mut app);
+        let bottom = app.editor_area.y + app.editor_area.height - 2;
+        assert_eq!(buf.cell((scrollbar_x, bottom)).unwrap().symbol(), "█");
+    }
+
     // ---- wrapping ----------------------------------------------------------
 
     #[test]
@@ -3115,10 +3188,16 @@ mod tests {
         render_buffer(&mut app);
 
         assert_eq!(app.buffer.cursor, (0, 0));
+        assert_eq!(app.buffer.scroll.1, 0);
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, 60, 10));
-        assert_eq!(app.buffer.cursor, (0, 3));
+        assert_eq!(app.buffer.cursor, (0, 0));
+        assert_eq!(app.buffer.scroll.1, 3);
+        let rows = render(&mut app);
+        assert!(row_contains(&rows, "line 3"));
+        assert!(!row_contains(&rows, "line 0"));
         app.handle_mouse(mouse(MouseEventKind::ScrollUp, 60, 10));
         assert_eq!(app.buffer.cursor, (0, 0));
+        assert_eq!(app.buffer.scroll.1, 0);
 
         // wheel over the sidebar moves the selection
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 5));
