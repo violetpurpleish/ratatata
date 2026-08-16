@@ -1362,7 +1362,7 @@ impl App {
                     let mut spans = vec![num];
                     spans.extend(clip_ops(
                         line,
-                        &ops,
+                        ops,
                         cstart,
                         cend - cstart,
                         sel,
@@ -1454,7 +1454,7 @@ impl App {
             let mut spans = vec![num];
             spans.extend(clip_ops(
                 line,
-                &ops,
+                ops,
                 self.buffer.scroll.0,
                 text_w,
                 sel,

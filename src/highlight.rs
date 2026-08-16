@@ -41,6 +41,11 @@ pub struct Highlighter {
     parse_states: Vec<ParseState>,
     /// Highlight scope stack after line `i`.
     scope_stacks: Vec<ScopeStack>,
+    /// Styled byte ranges for each highlighted line. Keeping the rendered
+    /// ranges alongside the parser state is important because the app draws
+    /// repeatedly even when the viewport did not change (for example, when
+    /// the mouse wheel is already at a scroll boundary).
+    highlighted_lines: Vec<Vec<(Option<TuiStyle>, Range<usize>)>>,
 }
 
 impl Highlighter {
@@ -52,6 +57,7 @@ impl Highlighter {
             syntax: syntax_set.find_syntax_plain_text().clone(),
             parse_states: Vec::new(),
             scope_stacks: Vec::new(),
+            highlighted_lines: Vec::new(),
         }
     }
 
@@ -86,32 +92,34 @@ impl Highlighter {
     pub fn invalidate_from(&mut self, line: usize) {
         self.parse_states.truncate(line);
         self.scope_stacks.truncate(line);
+        self.highlighted_lines.truncate(line);
     }
 
     /// Highlight line `y` of `lines`. Returns styled byte ranges covering
     /// the whole line contiguously; `None` means "plain" (the theme's
     /// default style, rendered with the terminal's default colors).
     ///
-    /// Lines must be highlighted in order (increasing `y`, e.g. the visible
-    /// range). If `y` is ahead of the cache — an edit happened above the
-    /// viewport — the gap is re-parsed lazily from the buffer.
+    /// Highlighted ranges are cached with the parser state, so drawing an
+    /// already-highlighted line does not parse it again. If `y` is ahead of
+    /// the cache — for example, after an edit above the viewport — the gap is
+    /// re-parsed lazily from the buffer.
     pub fn highlight_line(
         &mut self,
         lines: &[String],
         y: usize,
-    ) -> Vec<(Option<TuiStyle>, Range<usize>)> {
-        let Some(line) = lines.get(y) else {
-            return Vec::new();
-        };
-        while self.parse_states.len() < y {
-            let gap_y = self.parse_states.len();
-            self.highlight_one(&lines[gap_y], gap_y);
+    ) -> &[(Option<TuiStyle>, Range<usize>)] {
+        if y >= lines.len() {
+            return &[];
         }
-        self.highlight_one(line, y)
+        while self.parse_states.len() <= y {
+            let line_y = self.parse_states.len();
+            self.highlight_one(&lines[line_y], line_y);
+        }
+        &self.highlighted_lines[y]
     }
 
     /// Highlight one line, given that `parse_states.len() == y`.
-    fn highlight_one(&mut self, line: &str, y: usize) -> Vec<(Option<TuiStyle>, Range<usize>)> {
+    fn highlight_one(&mut self, line: &str, y: usize) {
         let (mut parse_state, initial_stack) = if y == 0 {
             (ParseState::new(&self.syntax), ScopeStack::new())
         } else {
@@ -141,7 +149,7 @@ impl Highlighter {
 
         self.parse_states.push(parse_state);
         self.scope_stacks.push(highlight_state.path.clone());
-        out
+        self.highlighted_lines.push(out);
     }
 
     /// Map a syntect style to a ratatui style. The theme's default style
@@ -199,11 +207,11 @@ mod tests {
         content.split('\n').map(str::to_string).collect()
     }
 
-    fn styled_ranges(
-        h: &mut Highlighter,
+    fn styled_ranges<'a>(
+        h: &'a mut Highlighter,
         lines: &[String],
         y: usize,
-    ) -> Vec<(Option<TuiStyle>, Range<usize>)> {
+    ) -> &'a [(Option<TuiStyle>, Range<usize>)] {
         h.highlight_line(lines, y)
     }
 
@@ -289,12 +297,29 @@ mod tests {
         for y in 0..lines.len() {
             let ops = h.highlight_line(&lines, y);
             let mut line_pos = 0;
-            for (_, r) in &ops {
+            for (_, r) in ops {
                 assert_eq!(r.start, line_pos, "gap on line {y}");
                 line_pos = r.end;
             }
             assert_eq!(line_pos, lines[y].len(), "line {y} not fully covered");
         }
+    }
+
+    #[test]
+    fn repeated_highlight_uses_cached_ranges() {
+        let mut h = highlighter("main.rs");
+        let lines = lines_of("fn main() {}\n");
+        let first = h.highlight_line(&lines, 0).to_vec();
+
+        for _ in 0..100 {
+            assert_eq!(h.highlight_line(&lines, 0), first.as_slice());
+        }
+
+        // Re-rendering the same viewport must not append parser state or
+        // re-run the syntax highlighter for the already cached line.
+        assert_eq!(h.parse_states.len(), 1);
+        assert_eq!(h.scope_stacks.len(), 1);
+        assert_eq!(h.highlighted_lines.len(), 1);
     }
 
     #[test]
@@ -320,8 +345,8 @@ mod tests {
         assert_eq!(h.parse_states.len(), 7);
         h.invalidate_from(0);
         let ops = styled_ranges(&mut h, &lines, 7);
-        assert_eq!(h.parse_states.len(), 8);
         assert!(!ops.is_empty());
+        assert_eq!(h.parse_states.len(), 8);
     }
 
     #[test]
