@@ -2,6 +2,11 @@
 name = "ratatata"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A tiny terminal text editor built with ratatui."
+repository = "https://github.com/gitwyrm/ratatata"
+readme = "README.md"
+exclude = ["resources/"]
 
 [[bin]]
 name = "rat"
