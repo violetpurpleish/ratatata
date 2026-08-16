@@ -54,6 +54,12 @@ const EDITOR_CLICK_TTL: Duration = Duration::from_millis(250);
 
 const SIDEBAR_WIDTH: u16 = 28;
 const STATUS_HEIGHT: u16 = 1;
+/// The shortcut bar at the top wraps onto a second row when the buttons
+/// don't fit; anything beyond that is omitted (with an ellipsis marker).
+const TOPBAR_MAX_ROWS: u16 = 2;
+/// Separator between the shortcut buttons in the top bar.
+const TOPBAR_SEPARATOR: &str = " | ";
+const TOPBAR_SEPARATOR_WIDTH: u16 = 3;
 
 /// Background of the current search match (same yellow as the block caret).
 const SEARCH_CURRENT_BG: Color = Color::Yellow;
@@ -64,6 +70,94 @@ const SEARCH_OTHER_BG: Color = Color::Rgb(100, 88, 26);
 pub enum Focus {
     Sidebar,
     Editor,
+}
+
+/// The actions behind the keyboard shortcuts and the clickable buttons in
+/// the top bar. Both input paths route through [`App::invoke_shortcut`], so
+/// the keys and the mouse always behave identically.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shortcut {
+    Quit,
+    SwitchFocus,
+    Save,
+    Copy,
+    Cut,
+    Paste,
+    SelectAll,
+    Find,
+    ToggleWrap,
+    Undo,
+    Redo,
+    ClosePreview,
+}
+
+impl Shortcut {
+    /// The key combo shown on the button.
+    fn key_label(self) -> &'static str {
+        match self {
+            Shortcut::Quit => "Ctrl+Q",
+            Shortcut::SwitchFocus => "Ctrl+O",
+            Shortcut::Save => "Ctrl+S",
+            Shortcut::Copy => "Ctrl+C",
+            Shortcut::Cut => "Ctrl+X",
+            Shortcut::Paste => "Ctrl+V",
+            Shortcut::SelectAll => "Ctrl+A",
+            Shortcut::Find => "Ctrl+F",
+            Shortcut::ToggleWrap => "Ctrl+W",
+            Shortcut::Undo => "Ctrl+Z",
+            Shortcut::Redo => "Ctrl+Shift+Z",
+            Shortcut::ClosePreview => "Esc",
+        }
+    }
+
+    /// The short action name shown on the button.
+    fn action_label(self) -> &'static str {
+        match self {
+            Shortcut::Quit => "quit",
+            Shortcut::SwitchFocus => "switch",
+            Shortcut::Save => "save",
+            Shortcut::Copy => "copy",
+            Shortcut::Cut => "cut",
+            Shortcut::Paste => "paste",
+            Shortcut::SelectAll => "select all",
+            Shortcut::Find => "search",
+            Shortcut::ToggleWrap => "wrap",
+            Shortcut::Undo => "undo",
+            Shortcut::Redo => "redo",
+            Shortcut::ClosePreview => "close preview",
+        }
+    }
+
+    /// Longer description shown in the status bar while the button is
+    /// hovered.
+    fn description(self) -> &'static str {
+        match self {
+            Shortcut::Quit => "quit — press again to confirm unsaved changes",
+            Shortcut::SwitchFocus => "switch between sidebar and editor",
+            Shortcut::Save => "save the current file (asks for a name if untitled)",
+            Shortcut::Copy => "copy the selection to the clipboard",
+            Shortcut::Cut => "cut the selection to the clipboard",
+            Shortcut::Paste => "paste from the clipboard",
+            Shortcut::SelectAll => "select the whole buffer",
+            Shortcut::Find => "search — type to filter, Enter/Shift+Enter next/prev, Esc closes",
+            Shortcut::ToggleWrap => "toggle word wrapping of long lines",
+            Shortcut::Undo => "undo the last edit",
+            Shortcut::Redo => "redo the last undone edit",
+            Shortcut::ClosePreview => "close the image preview",
+        }
+    }
+
+    /// Accent color of the key combo on the button.
+    fn key_color(self) -> Color {
+        match self {
+            Shortcut::Quit => Color::Red,
+            Shortcut::SwitchFocus => Color::Cyan,
+            Shortcut::Save => Color::Green,
+            Shortcut::Find => Color::Yellow,
+            Shortcut::ToggleWrap => Color::Magenta,
+            _ => Color::White,
+        }
+    }
 }
 
 /// A click on the editor: (time, buffer position, consecutive-click count).
@@ -99,6 +193,14 @@ pub struct App {
     /// Widget areas from the last draw, used for mouse hit-testing.
     sidebar_area: Rect,
     editor_area: Rect,
+    /// The shortcut-button bar at the top: the bar's area (for clicks that
+    /// land on the bar itself) and each button's rectangle from the last
+    /// draw.
+    topbar_area: Rect,
+    topbar_buttons: Vec<(Shortcut, Rect)>,
+    /// Shortcut button the mouse is currently over, whose description is
+    /// shown in the status bar.
+    hovered: Option<Shortcut>,
     /// Last click on the sidebar, for double-click detection.
     last_sidebar_click: Option<(Instant, usize)>,
     /// Last click in the editor, for double-click (word) and triple-click
@@ -156,6 +258,9 @@ impl App {
             sidebar_height: 0,
             sidebar_area: Rect::default(),
             editor_area: Rect::default(),
+            topbar_area: Rect::default(),
+            topbar_buttons: Vec::new(),
+            hovered: None,
             last_sidebar_click: None,
             last_editor_click: None,
         })
@@ -190,90 +295,34 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
             || key.modifiers.contains(KeyModifiers::SUPER);
         if ctrl {
-            match key.code {
-                KeyCode::Char('q') => {
-                    if self.buffer.dirty && !self.quit_armed {
-                        self.quit_armed = true;
-                        self.set_message("unsaved changes — press Ctrl+Q again to quit anyway");
-                    } else {
-                        self.should_quit = true;
-                    }
-                    return;
-                }
-                KeyCode::Char('o') => {
-                    if self.save_as_input.is_none() {
-                        self.focus = match self.focus {
-                            Focus::Sidebar => Focus::Editor,
-                            Focus::Editor => Focus::Sidebar,
-                        };
-                    }
-                    return;
-                }
-                // While an image preview is open the other shortcuts do
-                // nothing: there is no text to edit, save or search. This
-                // arm must come after 'q'/'o' (which still work) and before
-                // the rest.
-                _ if self.image.is_some() => return,
-                KeyCode::Char('s') => {
-                    self.save();
-                    return;
-                }
-                KeyCode::Char('c') => {
-                    if self.save_as_input.is_none() && self.search.is_none() {
-                        self.copy_selection();
-                    }
-                    return;
-                }
-                KeyCode::Char('x') => {
-                    if self.save_as_input.is_none() && self.search.is_none() {
-                        self.cut_selection();
-                    }
-                    return;
-                }
-                KeyCode::Char('v') => {
-                    self.paste_clipboard();
-                    return;
-                }
-                KeyCode::Char('a') => {
-                    if self.save_as_input.is_none() && self.search.is_none() {
-                        self.buffer.select_all();
-                    }
-                    return;
-                }
-                KeyCode::Char('f') => {
-                    self.open_search();
-                    return;
-                }
-                // Ctrl+W toggles soft wrapping of long lines (visual
-                // rows instead of horizontal scrolling).
-                KeyCode::Char('w') => {
-                    let (w, _) = self.editor_text;
-                    let wrap = self.buffer.toggle_wrap(w as usize);
-                    self.set_message(if wrap {
-                        "word wrap on"
-                    } else {
-                        "word wrap off"
-                    });
-                    self.ensure_cursor_visible();
-                    return;
-                }
+            // Every Ctrl/Cmd shortcut routes through the same action as
+            // its clickable button in the top bar, so the keyboard and the
+            // mouse always behave identically.
+            let action = match key.code {
+                KeyCode::Char('q') => Shortcut::Quit,
+                KeyCode::Char('o') => Shortcut::SwitchFocus,
+                KeyCode::Char('s') => Shortcut::Save,
+                KeyCode::Char('c') => Shortcut::Copy,
+                KeyCode::Char('x') => Shortcut::Cut,
+                KeyCode::Char('v') => Shortcut::Paste,
+                KeyCode::Char('a') => Shortcut::SelectAll,
+                KeyCode::Char('f') => Shortcut::Find,
+                KeyCode::Char('w') => Shortcut::ToggleWrap,
                 // Ctrl+Z undoes, Ctrl+Shift+Z redoes (CapsLock typos land
                 // on redo, a harmless no-op without history). The shifted
                 // letter may arrive as 'Z' or as 'z'+Shift depending on
                 // the terminal, so accept both.
-                KeyCode::Char('z') | KeyCode::Char('Z') => {
-                    if self.save_as_input.is_none() && self.search.is_none() {
-                        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                        if key.code == KeyCode::Char('z') && !shift {
-                            self.undo();
-                        } else {
-                            self.redo();
-                        }
-                    }
-                    return;
+                KeyCode::Char('z') | KeyCode::Char('Z')
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        || key.code == KeyCode::Char('Z') =>
+                {
+                    Shortcut::Redo
                 }
+                KeyCode::Char('z') => Shortcut::Undo,
                 _ => return,
-            }
+            };
+            self.invoke_shortcut(action);
+            return;
         }
 
         // An image preview keeps the editor read-only, but it must not make
@@ -281,7 +330,7 @@ impl App {
         // navigation (including opening another entry) must continue to work.
         if self.image.is_some() {
             if key.code == KeyCode::Esc {
-                self.close_image_preview();
+                self.invoke_shortcut(Shortcut::ClosePreview);
             } else if self.focus == Focus::Sidebar {
                 self.handle_sidebar_key(key);
             }
@@ -345,6 +394,80 @@ impl App {
         match self.focus {
             Focus::Sidebar => self.handle_sidebar_key(key),
             Focus::Editor => self.handle_editor_key(key),
+        }
+    }
+
+    /// Run a shortcut action, whether it came from a key or from a click
+    /// on its top-bar button. The guards mirror the original key handling:
+    /// modal prompts (save-as, search) and image previews keep the
+    /// irrelevant actions inert.
+    fn invoke_shortcut(&mut self, action: Shortcut) {
+        match action {
+            Shortcut::Quit => {
+                if self.buffer.dirty && !self.quit_armed {
+                    self.quit_armed = true;
+                    self.set_message("unsaved changes — press Ctrl+Q again to quit anyway");
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            Shortcut::SwitchFocus => {
+                // not while the save-as prompt is modal
+                if self.save_as_input.is_none() {
+                    self.focus = match self.focus {
+                        Focus::Sidebar => Focus::Editor,
+                        Focus::Editor => Focus::Sidebar,
+                    };
+                }
+            }
+            Shortcut::ClosePreview => {
+                if self.image.is_some() {
+                    self.close_image_preview();
+                }
+            }
+            // While an image preview is open the remaining shortcuts do
+            // nothing: there is no text to edit, save or search. This arm
+            // comes after Quit/SwitchFocus/ClosePreview (which still work)
+            // and before the rest.
+            _ if self.image.is_some() => {}
+            Shortcut::Save => self.save(),
+            Shortcut::Copy => {
+                if self.save_as_input.is_none() && self.search.is_none() {
+                    self.copy_selection();
+                }
+            }
+            Shortcut::Cut => {
+                if self.save_as_input.is_none() && self.search.is_none() {
+                    self.cut_selection();
+                }
+            }
+            Shortcut::Paste => self.paste_clipboard(),
+            Shortcut::SelectAll => {
+                if self.save_as_input.is_none() && self.search.is_none() {
+                    self.buffer.select_all();
+                }
+            }
+            Shortcut::Find => self.open_search(),
+            Shortcut::ToggleWrap => {
+                let (w, _) = self.editor_text;
+                let wrap = self.buffer.toggle_wrap(w as usize);
+                self.set_message(if wrap {
+                    "word wrap on"
+                } else {
+                    "word wrap off"
+                });
+                self.ensure_cursor_visible();
+            }
+            Shortcut::Undo => {
+                if self.save_as_input.is_none() && self.search.is_none() {
+                    self.undo();
+                }
+            }
+            Shortcut::Redo => {
+                if self.save_as_input.is_none() && self.search.is_none() {
+                    self.redo();
+                }
+            }
         }
     }
 
@@ -531,8 +654,19 @@ impl App {
 
     pub fn handle_mouse(&mut self, event: MouseEvent) {
         let pos = (event.column as usize, event.row as usize);
+        // The status bar describes whichever shortcut button the mouse is
+        // over. Moved events can be sparse (or absent) on some terminals,
+        // so recompute the hover on every event rather than only on Moved.
+        self.hovered = self.topbar_action_at(pos);
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // clicking a shortcut button runs the action directly
+                if self.in_topbar(pos) {
+                    if let Some(action) = self.topbar_action_at(pos) {
+                        self.invoke_shortcut(action);
+                    }
+                    return;
+                }
                 self.quit_armed = false;
                 // clicking dismisses the search bar (like most editors)
                 self.search = None;
@@ -671,6 +805,20 @@ impl App {
     fn ensure_cursor_visible(&mut self) {
         let (w, h) = self.editor_text;
         self.buffer.ensure_visible(h as usize, w as usize);
+    }
+
+    fn in_topbar(&self, pos: (usize, usize)) -> bool {
+        self.topbar_area
+            .contains(Position::new(pos.0 as u16, pos.1 as u16))
+    }
+
+    /// The shortcut button under a mouse position, if any.
+    fn topbar_action_at(&self, pos: (usize, usize)) -> Option<Shortcut> {
+        let p = Position::new(pos.0 as u16, pos.1 as u16);
+        self.topbar_buttons
+            .iter()
+            .find(|(_, rect)| rect.contains(p))
+            .map(|(action, _)| *action)
     }
 
     fn in_sidebar(&self, pos: (usize, usize)) -> bool {
@@ -904,17 +1052,102 @@ impl App {
     // ---- drawing -----------------------------------------------------------
 
     pub fn draw(&mut self, frame: &mut Frame) {
-        let [main, status_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)])
-                .areas(frame.area());
+        let pills = self.shortcut_pills();
+        let [top_area, main, status_area] = Layout::vertical([
+            Constraint::Length(shortcut_bar_height(&pills, frame.area().width)),
+            Constraint::Min(0),
+            Constraint::Length(STATUS_HEIGHT),
+        ])
+        .areas(frame.area());
         let [side_area, edit_area] =
             Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)]).areas(main);
+        self.topbar_area = top_area;
         self.sidebar_area = side_area;
         self.editor_area = edit_area;
 
+        self.draw_topbar(frame, top_area, &pills);
         self.draw_sidebar(frame, side_area);
         self.draw_editor(frame, edit_area);
         self.draw_status(frame, status_area);
+    }
+
+    /// The shortcut buttons shown in the top bar for the current mode:
+    /// the full editing set, or the short preview-only set while an image
+    /// is open.
+    fn shortcut_pills(&self) -> Vec<Shortcut> {
+        if self.image.is_some() {
+            vec![
+                Shortcut::ClosePreview,
+                Shortcut::SwitchFocus,
+                Shortcut::Quit,
+            ]
+        } else {
+            vec![
+                Shortcut::SwitchFocus,
+                Shortcut::Save,
+                Shortcut::Undo,
+                Shortcut::Redo,
+                Shortcut::Copy,
+                Shortcut::Cut,
+                Shortcut::Paste,
+                Shortcut::Find,
+                Shortcut::ToggleWrap,
+                Shortcut::Quit,
+            ]
+        }
+    }
+
+    /// The clickable shortcut buttons ("Ctrl+O switch", …) across the top,
+    /// separated by " | ". Buttons flow onto a second row when they don't
+    /// fit; anything still left over is omitted with an ellipsis marker.
+    /// Button rectangles from the last draw are kept for mouse
+    /// hit-testing.
+    fn draw_topbar(&mut self, frame: &mut Frame, area: Rect, pills: &[Shortcut]) {
+        self.topbar_buttons.clear();
+        let mut lines: Vec<Line> = Vec::new();
+        let mut row_spans: Vec<Span<'static>> = Vec::new();
+        let mut x = area.x;
+        for &action in pills {
+            let w = pill_width(action);
+            if x + w > area.x + area.width {
+                // doesn't fit on this row: start the next one
+                lines.push(Line::from(std::mem::take(&mut row_spans)));
+                x = area.x;
+                if lines.len() as u16 >= TOPBAR_MAX_ROWS {
+                    // out of rows: mark the overflow and stop
+                    if let Some(last) = lines.last_mut() {
+                        last.spans
+                            .push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+                    }
+                    break;
+                }
+                if x + w > area.x + area.width {
+                    // even an empty row cannot hold this button: skip it
+                    continue;
+                }
+            }
+            // a separator between the buttons (never before the first one
+            // on a row, so rows don't end with a dangling pipe)
+            if !row_spans.is_empty() {
+                row_spans.push(Span::styled(
+                    TOPBAR_SEPARATOR,
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            self.topbar_buttons
+                .push((action, Rect::new(x, area.y + lines.len() as u16, w, 1)));
+            row_spans.extend(pill_spans(action));
+            x += w + TOPBAR_SEPARATOR_WIDTH;
+        }
+        if !row_spans.is_empty() || lines.is_empty() {
+            lines.push(Line::from(row_spans));
+        }
+        for (i, line) in lines.iter().enumerate() {
+            frame.render_widget(
+                Paragraph::new(line.clone()),
+                Rect::new(area.x, area.y + i as u16, area.width, 1),
+            );
+        }
     }
 
     fn draw_sidebar(&mut self, frame: &mut Frame, area: Rect) {
@@ -1276,16 +1509,13 @@ impl App {
             return;
         }
 
-        // right: position + help
+        // right: cursor position, or a description of the shortcut button
+        // currently hovered in the top bar
         let (x, y) = self.buffer.cursor;
-        let right = if self.image.is_some() {
-            "Esc close preview · Ctrl+O switch · Ctrl+Q quit".to_string()
-        } else {
-            format!(
-                "{}:{}   Ctrl+O switch · Ctrl+S save · Ctrl+Z undo · Ctrl+Shift+Z redo · Ctrl+C/X/V clipboard · Ctrl+F search · Ctrl+W wrap · Ctrl+Q quit",
-                y + 1,
-                x + 1
-            )
+        let right = match self.hovered {
+            Some(action) => action.description().to_string(),
+            None if self.image.is_some() => String::new(),
+            None => format!("{}:{}", y + 1, x + 1),
         };
         // cap the help so the left side (focus, file, modified state) always
         // stays visible, even on narrow terminals
@@ -1410,6 +1640,48 @@ impl App {
             Style::default(),
         )
     }
+}
+
+/// Rendered width of one shortcut button ("Ctrl+O switch").
+fn pill_width(action: Shortcut) -> u16 {
+    (action.key_label().width() + action.action_label().width() + 1) as u16
+}
+
+/// The spans of one shortcut button: the key combo in bold accent color
+/// followed by the action name, on a button-like background.
+fn pill_spans(action: Shortcut) -> Vec<Span<'static>> {
+    let bg = Color::Rgb(45, 45, 45);
+    vec![
+        Span::styled(
+            format!("{} ", action.key_label()),
+            Style::default()
+                .fg(action.key_color())
+                .add_modifier(Modifier::BOLD)
+                .bg(bg),
+        ),
+        Span::styled(
+            action.action_label(),
+            Style::default().fg(Color::Gray).bg(bg),
+        ),
+    ]
+}
+
+/// How many rows the top bar needs to show all buttons at `width`: one
+/// when everything fits, otherwise two (a second row that is still too
+/// small is truncated with an ellipsis marker). Must stay in sync with
+/// [`App::draw_topbar`]'s wrapping.
+fn shortcut_bar_height(pills: &[Shortcut], width: u16) -> u16 {
+    if topbar_total_width(pills) <= width {
+        1
+    } else {
+        TOPBAR_MAX_ROWS
+    }
+}
+
+/// Combined width of all buttons, including the separators between them.
+fn topbar_total_width(pills: &[Shortcut]) -> u16 {
+    let n = pills.len() as u16;
+    pills.iter().map(|&a| pill_width(a)).sum::<u16>() + TOPBAR_SEPARATOR_WIDTH * n.saturating_sub(1)
 }
 
 /// Shorten `s` to at most `max` chars, keeping the end and prefixing "…".
@@ -1808,7 +2080,7 @@ mod tests {
         // current match (line 0, chars 0..5): yellow background
         for x in 31..36 {
             assert_eq!(
-                buf.cell((x, 1)).unwrap().style().bg,
+                buf.cell((x, 2)).unwrap().style().bg,
                 Some(Color::Yellow),
                 "col {x}"
             );
@@ -1816,14 +2088,14 @@ mod tests {
         // the other match (line 1, chars 0..5): the dim match color
         for x in 31..36 {
             assert_eq!(
-                buf.cell((x, 2)).unwrap().style().bg,
+                buf.cell((x, 3)).unwrap().style().bg,
                 Some(Color::Rgb(100, 88, 26)),
                 "col {x}"
             );
         }
         // outside the matches: untouched (Reset, like every plain cell)
-        assert_eq!(buf.cell((36, 1)).unwrap().style().bg, Some(Color::Reset));
-        assert_eq!(buf.cell((31, 3)).unwrap().style().bg, Some(Color::Reset));
+        assert_eq!(buf.cell((36, 2)).unwrap().style().bg, Some(Color::Reset));
+        assert_eq!(buf.cell((31, 4)).unwrap().style().bg, Some(Color::Reset));
 
         // the status bar shows the prompt, the query and the counter
         let rows = render(&mut app);
@@ -1842,7 +2114,7 @@ mod tests {
         open_search_typed(&mut app, "hello");
         assert!(app.search.is_some());
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 1));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 2));
         assert!(app.search.is_none());
         // and the click still moves the cursor (char 4 of line 0)
         assert_eq!(app.buffer.cursor, (4, 0));
@@ -2121,14 +2393,14 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn render(app: &mut App) -> Vec<String> {
-        let backend = TestBackend::new(140, 24);
+        let backend = TestBackend::new(150, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         terminal
             .backend()
             .buffer()
             .content()
-            .chunks(140)
+            .chunks(150)
             .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
             .collect()
     }
@@ -2152,11 +2424,15 @@ mod tests {
         // editor: untitled block, empty buffer with line number 1
         assert!(row_contains(&rows, "untitled"));
         assert!(row_contains(&rows, "1 "));
-        // status bar: untitled + saved indicator + focus tag + help
+        // top bar: the clickable shortcut buttons
+        assert!(row_contains(&rows, "Ctrl+S save"));
+        assert!(row_contains(&rows, "Ctrl+Shift+Z redo"));
+        assert!(row_contains(&rows, "Ctrl+Q quit"));
+        // status bar: focus tag + position; the shortcuts moved to the top
         assert!(row_contains(&rows, "SIDEBAR"));
         assert!(row_contains(&rows, "○ saved"));
-        assert!(row_contains(&rows, "Ctrl+S save"));
         assert!(row_contains(&rows, "1:1"));
+        assert!(!rows[23].contains("Ctrl+S"));
     }
 
     #[test]
@@ -2187,7 +2463,7 @@ mod tests {
     }
 
     fn render_buffer(app: &mut App) -> ratatui::buffer::Buffer {
-        let backend = TestBackend::new(140, 24);
+        let backend = TestBackend::new(150, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         terminal.backend().buffer().clone()
@@ -2202,25 +2478,25 @@ mod tests {
         let buf = render_buffer(&mut app);
         // "fn" keyword: purple; "main" function name: blue-gray
         // (colors probed from the base16-ocean.dark theme)
-        assert_eq!(buf.cell((31, 1)).unwrap().symbol(), "f");
+        assert_eq!(buf.cell((31, 2)).unwrap().symbol(), "f");
         assert_eq!(
-            buf.cell((31, 1)).unwrap().style().fg,
+            buf.cell((31, 2)).unwrap().style().fg,
             Some(Color::Rgb(180, 142, 173))
         );
-        assert_eq!(buf.cell((34, 1)).unwrap().symbol(), "m");
+        assert_eq!(buf.cell((34, 2)).unwrap().symbol(), "m");
         assert_eq!(
-            buf.cell((34, 1)).unwrap().style().fg,
+            buf.cell((34, 2)).unwrap().style().fg,
             Some(Color::Rgb(143, 161, 179))
         );
         // string content "hi": green
-        assert_eq!(buf.cell((46, 2)).unwrap().symbol(), "h");
+        assert_eq!(buf.cell((46, 3)).unwrap().symbol(), "h");
         assert_eq!(
-            buf.cell((46, 2)).unwrap().style().fg,
+            buf.cell((46, 3)).unwrap().style().fg,
             Some(Color::Rgb(163, 190, 140))
         );
         // punctuation stays uncolored
-        assert_eq!(buf.cell((31, 3)).unwrap().symbol(), "}");
-        assert_eq!(buf.cell((31, 3)).unwrap().style().fg, Some(Color::Reset));
+        assert_eq!(buf.cell((31, 4)).unwrap().symbol(), "}");
+        assert_eq!(buf.cell((31, 4)).unwrap().style().fg, Some(Color::Reset));
     }
 
     #[test]
@@ -2230,7 +2506,7 @@ mod tests {
         fs::write(&file, "test\n").unwrap();
         let mut app = new_app(dir, Some(file)).unwrap();
         let buf = render_buffer(&mut app);
-        let caret = buf.cell((31, 1)).unwrap();
+        let caret = buf.cell((31, 2)).unwrap();
         assert_eq!(caret.symbol(), "t");
         assert_eq!(caret.style().bg, Some(Color::Yellow));
         assert!(!caret.style().add_modifier.contains(Modifier::REVERSED));
@@ -2245,7 +2521,7 @@ mod tests {
         let buf = render_buffer(&mut app);
         for x in 31..99 {
             // exclude the yellow focus border at x=99
-            let cell = buf.cell((x, 1)).unwrap();
+            let cell = buf.cell((x, 2)).unwrap();
             if cell.symbol().is_empty() || cell.symbol() == " " {
                 continue;
             }
@@ -2265,9 +2541,9 @@ mod tests {
         // "xfn" is no longer a keyword
         app.handle_key(char_key('x'));
         let buf = render_buffer(&mut app);
-        assert_eq!(buf.cell((31, 1)).unwrap().symbol(), "x");
-        assert_eq!(buf.cell((31, 1)).unwrap().style().fg, Some(Color::Reset));
-        assert_eq!(buf.cell((32, 1)).unwrap().symbol(), "f");
+        assert_eq!(buf.cell((31, 2)).unwrap().symbol(), "x");
+        assert_eq!(buf.cell((31, 2)).unwrap().style().fg, Some(Color::Reset));
+        assert_eq!(buf.cell((32, 2)).unwrap().symbol(), "f");
     }
 
     #[test]
@@ -2336,7 +2612,7 @@ mod tests {
     fn wrapped_long_line_renders_across_rows() {
         let dir = scratch("wrap2");
         let file = dir.join("a.txt");
-        // 140-col test terminal: 28 sidebar + 2 borders -> 108 text cols
+        // 150-col test terminal: 28 sidebar + 2 borders -> 118 text cols
         let line = "x".repeat(250);
         fs::write(&file, format!("{line}\n")).unwrap();
         let mut app = new_app(dir, Some(file)).unwrap();
@@ -2348,10 +2624,10 @@ mod tests {
         // the first, a blank gutter on the continuations (cols 29..31 are
         // the editor gutter; border chars are multi-byte, so slice chars)
         let gutter = |row: &str| -> String { row.chars().skip(29).take(2).collect() };
-        assert_eq!(gutter(&rows[1]), "1 ");
-        assert_eq!(gutter(&rows[2]), "  ");
+        assert_eq!(gutter(&rows[2]), "1 ");
         assert_eq!(gutter(&rows[3]), "  ");
-        assert!(row_contains(&rows, &"x".repeat(108)));
+        assert_eq!(gutter(&rows[4]), "  ");
+        assert!(row_contains(&rows, &"x".repeat(118)));
         // the status bar shows the persistent wrap indicator
         assert!(rows[23].contains("wrap ○"));
 
@@ -2359,8 +2635,8 @@ mod tests {
         app.handle_key(ctrl('w'));
         app.message = None;
         let rows = render(&mut app);
-        assert_eq!(gutter(&rows[1]), "1 ");
-        assert_eq!(gutter(&rows[2]), "2 ");
+        assert_eq!(gutter(&rows[2]), "1 ");
+        assert_eq!(gutter(&rows[3]), "2 ");
         assert!(!rows[23].contains("wrap ○"));
     }
 
@@ -2374,13 +2650,13 @@ mod tests {
         app.handle_key(ctrl('w'));
         render_buffer(&mut app); // sets viewport and wrap width
 
-        // terminal col 36 = text col 5 on the second visual row (char 113)
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 36, 2));
-        assert_eq!(app.buffer.cursor, (113, 0));
+        // terminal col 36 = text col 5 on the second visual row (char 123)
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 36, 3));
+        assert_eq!(app.buffer.cursor, (123, 0));
 
-        // gutter of the third visual row lands at its start (char 216)
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 31, 3));
-        assert_eq!(app.buffer.cursor, (216, 0));
+        // gutter of the third visual row lands at its start (char 236)
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 31, 4));
+        assert_eq!(app.buffer.cursor, (236, 0));
     }
 
     #[test]
@@ -2393,10 +2669,10 @@ mod tests {
         app.handle_key(ctrl('w'));
         render_buffer(&mut app);
 
-        // cursor on the second visual row: char 110 is col 2 of it
+        // cursor on the first visual row: char 110 is col 110 of it
         app.buffer.cursor = (110, 0);
         let buf = render_buffer(&mut app);
-        let cell = buf.cell((33, 2)).unwrap();
+        let cell = buf.cell((141, 2)).unwrap();
         assert_eq!(cell.symbol(), "x");
         assert_eq!(cell.style().bg, Some(Color::Yellow));
     }
@@ -2405,24 +2681,28 @@ mod tests {
     fn wrapped_text_breaks_at_words_in_rendering() {
         let dir = scratch("wrap5");
         let file = dir.join("a.txt");
-        // 30 words of 6 chars (179 chars); at 108 text cols a row
-        // holds exactly 18 words and wraps after a space
+        // 30 words of 6 chars (179 chars); at 118 text cols a row
+        // holds 19 words and wraps after a space
         let line = "hello ".repeat(30).trim_end().to_string();
         fs::write(&file, format!("{line}\n")).unwrap();
         let mut app = new_app(dir, Some(file)).unwrap();
         app.handle_key(ctrl('w'));
         app.message = None;
         let rows = render(&mut app);
-        let text = |row: &str| -> String { row.chars().skip(31).take(108).collect() };
+        let text = |row: &str| -> String { row.chars().skip(31).take(118).collect() };
         let gutter = |row: &str| -> String { row.chars().skip(29).take(2).collect() };
 
-        // first row ends exactly at the wrap point (after a space)
-        assert_eq!(text(&rows[1]), "hello ".repeat(18));
-        // second row continues with whole words and a blank gutter
-        assert_eq!(gutter(&rows[2]), "  ");
+        // first row ends exactly at the wrap point (after a space); the
+        // rest of the 118-cell row is blank
         assert_eq!(
             text(&rows[2]).trim_end(),
-            format!("{}hello", "hello ".repeat(11))
+            format!("{}hello", "hello ".repeat(18))
+        );
+        // second row continues with whole words and a blank gutter
+        assert_eq!(gutter(&rows[3]), "  ");
+        assert_eq!(
+            text(&rows[3]).trim_end(),
+            format!("{}hello", "hello ".repeat(10))
         );
     }
 
@@ -2436,13 +2716,13 @@ mod tests {
         let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app); // sets widget areas
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 2));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 3));
         assert_eq!(app.focus, Focus::Editor);
         // terminal col 35 = text col 4 on line 2 (index 1)
         assert_eq!(app.buffer.cursor, (4, 1));
 
         // clicking in the gutter lands at column 0
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 29, 3));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 29, 4));
         assert_eq!(app.buffer.cursor, (0, 2));
     }
 
@@ -2454,9 +2734,9 @@ mod tests {
         let mut app = with_fake_clipboard(new_app(dir, Some(file)).unwrap());
         render_buffer(&mut app);
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 31, 1));
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 33, 1));
-        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 33, 1));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 31, 2));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 33, 2));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 33, 2));
         assert_eq!(app.buffer.selected_text().as_deref(), Some("fn"));
 
         // Ctrl+C copies the selection to the clipboard
@@ -2472,11 +2752,11 @@ mod tests {
         let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 33, 1));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 33, 2));
         let shift_click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 36,
-            row: 1,
+            row: 2,
             modifiers: KeyModifiers::SHIFT,
         };
         app.handle_mouse(shift_click);
@@ -2492,7 +2772,7 @@ mod tests {
         render_buffer(&mut app);
 
         // terminal col 37 = char 6 = 'b' of "brave"
-        let click = |kind| mouse(kind, 37, 1);
+        let click = |kind| mouse(kind, 37, 2);
         // first click just places the cursor
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
@@ -2515,7 +2795,7 @@ mod tests {
         let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
-        let click = |kind| mouse(kind, 31, 1); // char 0 of line 0
+        let click = |kind| mouse(kind, 31, 2); // char 0 of line 0
         for _ in 0..3 {
             app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
             app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
@@ -2538,7 +2818,7 @@ mod tests {
         let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
-        let click = |kind| mouse(kind, 37, 1); // char 6 = 'b' of "brave"
+        let click = |kind| mouse(kind, 37, 2); // char 6 = 'b' of "brave"
         // the user clicks once to place the cursor...
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
@@ -2562,12 +2842,12 @@ mod tests {
         let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
-        let click = |kind| mouse(kind, 37, 1); // char 6 = 'b' of "brave"
+        let click = |kind| mouse(kind, 37, 2); // char 6 = 'b' of "brave"
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         // drag into "world" (char 16) -> extends word-wise
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 47, 1));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 47, 2));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         assert_eq!(
             app.buffer.selected_text().as_deref(),
@@ -2583,12 +2863,12 @@ mod tests {
         let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
-        let click = |kind| mouse(kind, 37, 1); // char 6 = 'b' of "brave"
+        let click = |kind| mouse(kind, 37, 2); // char 6 = 'b' of "brave"
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         // hand jitter while holding the second click: still inside "brave"
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 39, 1));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 39, 2));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         assert_eq!(app.buffer.selected_text().as_deref(), Some("brave"));
     }
@@ -2601,13 +2881,13 @@ mod tests {
         let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
 
-        let click = |kind| mouse(kind, 31, 1); // char 0 of line 0
+        let click = |kind| mouse(kind, 31, 2); // char 0 of line 0
         for _ in 0..3 {
             app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
             app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         }
-        // drag to line 2 (terminal row 3) -> extends line-wise
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 31, 3));
+        // drag to line 2 (terminal row 4) -> extends line-wise
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 31, 4));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         assert_eq!(
             app.buffer.selected_text().as_deref(),
@@ -2624,7 +2904,7 @@ mod tests {
         render_buffer(&mut app);
 
         // double-click "brave" -> word selected
-        let click = |kind| mouse(kind, 37, 1);
+        let click = |kind| mouse(kind, 37, 2);
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
@@ -2632,7 +2912,7 @@ mod tests {
         assert_eq!(app.buffer.selected_text().as_deref(), Some("brave"));
 
         // clicking a different position right away is a plain click again
-        let other = mouse(MouseEventKind::Down(MouseButton::Left), 31, 1);
+        let other = mouse(MouseEventKind::Down(MouseButton::Left), 31, 2);
         app.handle_mouse(other);
         assert!(!app.buffer.has_selection());
         assert_eq!(app.buffer.cursor, (0, 0));
@@ -2647,7 +2927,7 @@ mod tests {
         render_buffer(&mut app);
 
         // terminal col 36 = char 5 = the space between the words
-        let click = |kind| mouse(kind, 36, 1);
+        let click = |kind| mouse(kind, 36, 2);
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
@@ -2684,7 +2964,7 @@ mod tests {
         render_buffer(&mut app);
 
         // single click on the file row (row 1: ".." is row 0)
-        let click = |kind| mouse(kind, 5, 2);
+        let click = |kind| mouse(kind, 5, 3);
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         assert_eq!(app.sidebar.selected, 1);
@@ -2705,13 +2985,235 @@ mod tests {
         let mut app = new_app(dir.clone(), None).unwrap();
         render_buffer(&mut app);
 
-        let click = |kind| mouse(kind, 5, 1); // row 0: ".."
+        let click = |kind| mouse(kind, 5, 2); // row 0: ".."
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         // opened the parent of the scratch dir
         assert_ne!(app.sidebar.dir, dir);
+    }
+
+    // ---- shortcut buttons in the top bar --------------------------------
+
+    /// Click the button for `action` (built by the last draw) and return
+    /// the `App` for further assertions.
+    fn click_button(app: &mut App, action: Shortcut) {
+        let (_, rect) = app
+            .topbar_buttons
+            .iter()
+            .find(|(a, _)| *a == action)
+            .unwrap_or_else(|| panic!("no {action:?} button in the top bar"));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            rect.x + rect.width / 2,
+            rect.y,
+        ));
+    }
+
+    #[test]
+    fn clicking_save_button_saves_the_file() {
+        let dir = scratch("mbtnsave");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha").unwrap();
+        let mut app = new_app(dir.clone(), Some(file)).unwrap();
+        render_buffer(&mut app); // builds the button rectangles
+
+        app.handle_key(char_key('X'));
+        assert!(app.buffer.dirty);
+        click_button(&mut app, Shortcut::Save);
+        assert!(!app.buffer.dirty);
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "Xalpha");
+    }
+
+    #[test]
+    fn clicking_switch_button_toggles_focus() {
+        let dir = scratch("mbtnswitch");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        render_buffer(&mut app);
+
+        assert_eq!(app.focus, Focus::Editor);
+        click_button(&mut app, Shortcut::SwitchFocus);
+        assert_eq!(app.focus, Focus::Sidebar);
+        click_button(&mut app, Shortcut::SwitchFocus);
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
+    fn clicking_undo_and_redo_buttons_work() {
+        let dir = scratch("mbtnundo");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+
+        app.handle_key(char_key('X'));
+        assert_eq!(app.buffer.lines, vec!["Xalpha"]);
+        click_button(&mut app, Shortcut::Undo);
+        assert_eq!(app.buffer.lines, vec!["alpha"]);
+        click_button(&mut app, Shortcut::Redo);
+        assert_eq!(app.buffer.lines, vec!["Xalpha"]);
+    }
+
+    #[test]
+    fn clicking_quit_button_requires_two_clicks_when_dirty() {
+        let dir = scratch("mbtnquit");
+        let mut app = new_app(dir, None).unwrap();
+        app.handle_key(ctrl('o'));
+        app.handle_key(char_key('x'));
+        render_buffer(&mut app);
+
+        click_button(&mut app, Shortcut::Quit);
+        assert!(!app.should_quit); // armed, not quit
+        click_button(&mut app, Shortcut::Quit);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn clicking_quit_button_quits_when_clean() {
+        let dir = scratch("mbtnquitclean");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        render_buffer(&mut app);
+
+        click_button(&mut app, Shortcut::Quit);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn clicking_search_button_opens_search() {
+        let dir = scratch("mbtnsearch");
+        fs::write(dir.join("a.txt"), "hello world\nhello again\n").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        render_buffer(&mut app);
+
+        click_button(&mut app, Shortcut::Find);
+        assert!(app.search.is_some());
+        // typing narrows the query; clicking again steps to the next
+        // match, exactly like Ctrl+F
+        for c in "hello".chars() {
+            app.handle_key(char_key(c));
+        }
+        assert_eq!(app.buffer.cursor, (0, 0)); // first match
+        click_button(&mut app, Shortcut::Find);
+        assert_eq!(app.buffer.cursor, (0, 1)); // second match
+    }
+
+    #[test]
+    fn clicking_wrap_button_toggles_wrapping() {
+        let dir = scratch("mbtnwrapbtn");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        render_buffer(&mut app);
+        assert!(!app.buffer.wrap);
+        click_button(&mut app, Shortcut::ToggleWrap);
+        assert!(app.buffer.wrap);
+        assert!(app.message.is_some());
+        click_button(&mut app, Shortcut::ToggleWrap);
+        assert!(!app.buffer.wrap);
+    }
+
+    #[test]
+    fn clicking_top_bar_gap_does_nothing() {
+        let dir = scratch("mbtngap");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        render_buffer(&mut app);
+        assert_eq!(app.focus, Focus::Editor);
+
+        // after the last button there is empty bar; clicking it must not
+        // move focus, arm quit, or do anything else
+        let end = app
+            .topbar_buttons
+            .iter()
+            .map(|(_, r)| r.x + r.width)
+            .max()
+            .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), end + 2, 0));
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(!app.should_quit);
+        assert!(!app.buffer.dirty);
+    }
+
+    #[test]
+    fn hovering_top_bar_button_describes_it_in_the_status_bar() {
+        let dir = scratch("mbtnhover");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        render_buffer(&mut app);
+        let (_, rect) = app
+            .topbar_buttons
+            .iter()
+            .find(|(a, _)| *a == Shortcut::Save)
+            .unwrap();
+
+        // moving the mouse over the button shows its description...
+        app.handle_mouse(mouse(MouseEventKind::Moved, rect.x + 1, rect.y));
+        let rows = render(&mut app);
+        assert!(rows[23].contains("save the current file"));
+
+        // ...and moving away restores the cursor position
+        app.handle_mouse(mouse(MouseEventKind::Moved, 139, 10));
+        let rows = render(&mut app);
+        assert!(rows[23].contains("1:1"));
+    }
+
+    #[test]
+    fn top_bar_wraps_onto_a_second_row_on_narrow_terminals() {
+        let dir = scratch("mbtnwrap");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+
+        // 80 columns: the buttons flow onto a second row but stay visible
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(80)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect();
+        assert!(rows[0].contains("Ctrl+O switch"));
+        assert!(rows[0].contains("Ctrl+C copy"));
+        assert!(rows[1].contains("Ctrl+X cut"));
+        assert!(rows[1].contains("Ctrl+Q quit"));
+        assert_eq!(app.topbar_area.height, 2);
+
+        // clicking a button on the second row still works
+        click_button(&mut app, Shortcut::Quit);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn top_bar_in_image_mode_has_preview_buttons() {
+        let dir = scratch("mbtnimg");
+        write_test_png(&dir.join("pic.png"));
+        let mut app = new_app(dir.clone(), Some(dir.join("pic.png"))).unwrap();
+        render_buffer(&mut app);
+        let actions: Vec<Shortcut> = app.topbar_buttons.iter().map(|(a, _)| *a).collect();
+        assert_eq!(
+            actions,
+            vec![
+                Shortcut::ClosePreview,
+                Shortcut::SwitchFocus,
+                Shortcut::Quit
+            ]
+        );
+        assert_eq!(app.topbar_area.height, 1);
+
+        // clicking "close preview" drops back to an empty editor buffer
+        click_button(&mut app, Shortcut::ClosePreview);
+        assert!(app.image.is_none());
+        assert_eq!(app.buffer.lines, vec![""]);
+
+        // a second draw shows the full editing button set again
+        render_buffer(&mut app);
+        let actions: Vec<Shortcut> = app.topbar_buttons.iter().map(|(a, _)| *a).collect();
+        assert_eq!(actions.len(), 10);
+        assert_eq!(actions[0], Shortcut::SwitchFocus);
     }
 
     // ---- clipboard ---------------------------------------------------------
@@ -2852,7 +3354,7 @@ mod tests {
         // cells inside the selection are reversed
         for x in 31..42 {
             assert!(
-                buf.cell((x, 1))
+                buf.cell((x, 2))
                     .unwrap()
                     .style()
                     .add_modifier
@@ -2862,7 +3364,7 @@ mod tests {
         }
         // cells outside are not
         assert!(
-            !buf.cell((43, 1))
+            !buf.cell((43, 2))
                 .unwrap()
                 .style()
                 .add_modifier
@@ -2982,23 +3484,26 @@ mod tests {
         // typing breaks the keyword, undo restores both text and color
         app.handle_key(char_key('x'));
         let buf = render_buffer(&mut app);
-        assert_eq!(buf.cell((31, 1)).unwrap().style().fg, Some(Color::Reset));
+        assert_eq!(buf.cell((31, 2)).unwrap().style().fg, Some(Color::Reset));
 
         app.handle_key(ctrl('z'));
         let buf = render_buffer(&mut app);
-        assert_eq!(buf.cell((31, 1)).unwrap().symbol(), "f");
+        assert_eq!(buf.cell((31, 2)).unwrap().symbol(), "f");
         assert_eq!(
-            buf.cell((31, 1)).unwrap().style().fg,
+            buf.cell((31, 2)).unwrap().style().fg,
             Some(Color::Rgb(180, 142, 173))
         );
     }
 
     #[test]
-    fn status_bar_lists_undo_shortcut() {
+    fn top_bar_lists_undo_shortcut() {
         let dir = scratch("undoredo8");
         let mut app = new_app(dir, None).unwrap();
         let rows = render(&mut app);
-        assert!(row_contains(&rows, "Ctrl+Z undo"));
+        // the shortcut buttons live in the top bar now
+        assert!(rows[0].contains("Ctrl+Z undo"));
+        assert!(rows[0].contains("Ctrl+Shift+Z redo"));
+        assert!(rows[0].contains("Ctrl+Q quit"));
     }
 
     // ---- image previews ----------------------------------------------------
@@ -3111,7 +3616,7 @@ mod tests {
         // color is image-rs's resize math (aspect-fit + triangle filter),
         // so assert the structure: a half-block, colored, with a red/blue
         // blend that contains no green.
-        let cell = buf.cell((29, 1)).unwrap();
+        let cell = buf.cell((29, 2)).unwrap();
         assert!(matches!(cell.symbol(), "▀" | "▄"), "{:?}", cell.symbol());
         let fg = cell.style().fg;
         let Some(Color::Rgb(r, g, b)) = fg else {
@@ -3133,7 +3638,7 @@ mod tests {
         let rendered_x: Vec<u16> = (29..=138)
             .filter(|&x| {
                 matches!(
-                    buf.cell((x, 1)).and_then(|c| c.style().fg),
+                    buf.cell((x, 2)).and_then(|c| c.style().fg),
                     Some(Color::Rgb(..))
                 )
             })
