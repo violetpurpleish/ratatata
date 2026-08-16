@@ -5,9 +5,10 @@
 //! point onward are re-parsed — and only when they become visible. This is
 //! the caching pattern recommended in syntect's own `HighlightState` docs.
 //!
-//! The heavy assets (bundled syntax definitions and themes) are loaded once
-//! into process-wide statics; this also sidesteps the lifetime problem of
-//! `syntect::highlighting::Highlighter`, which borrows its `Theme`.
+//! The heavy assets (bundled syntax definitions and the Catppuccin Mocha theme
+//! from `two-face`) are loaded once into process-wide statics; this also
+//! sidesteps the lifetime problem of `syntect::highlighting::Highlighter`,
+//! which borrows its `Theme`.
 
 use std::ops::Range;
 use std::path::Path;
@@ -16,11 +17,10 @@ use std::sync::OnceLock;
 use ratatui::style::{Color, Modifier, Style as TuiStyle};
 use syntect::highlighting::{
     FontStyle, HighlightState, Highlighter as SyntectHighlighter, RangedHighlightIterator, Style,
-    Theme, ThemeSet,
+    Theme,
 };
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
-
-const THEME_NAME: &str = "base16-ocean.dark";
+use two_face::theme::{EmbeddedLazyThemeSet, EmbeddedThemeName};
 
 fn syntax_set() -> &'static SyntaxSet {
     static SET: OnceLock<SyntaxSet> = OnceLock::new();
@@ -28,9 +28,9 @@ fn syntax_set() -> &'static SyntaxSet {
 }
 
 fn theme() -> &'static Theme {
-    static SET: OnceLock<ThemeSet> = OnceLock::new();
-    let themes = SET.get_or_init(ThemeSet::load_defaults);
-    themes.themes.get(THEME_NAME).expect("built-in theme")
+    static SET: OnceLock<EmbeddedLazyThemeSet> = OnceLock::new();
+    SET.get_or_init(two_face::theme::extra)
+        .get(EmbeddedThemeName::CatppuccinMocha)
 }
 
 pub struct Highlighter {

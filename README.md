@@ -32,6 +32,7 @@ Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`
 
 - **Sidebar + editor split** — browse directories on the left, edit files on the right
 - **Clickable shortcut bar** — the keyboard shortcuts are shown as buttons in a bar at the top; click one to run it, hover it for a longer description in the status bar. The keys and the buttons are the same actions, so they always behave identically
+- **Catppuccin Mocha UI theme** — semantic application colors supplied by [ratatui-themes](https://crates.io/crates/ratatui-themes), including themed panels, selections, search matches, caret, status bar and shortcut buttons
 - **Syntax highlighting** — Sublime Text grammars via [syntect](https://github.com/trishume/syntect), detected by extension and first-line heuristics; re-highlights incrementally as you type, only re-parsing lines from the edit point onward
 - **Clipboard integration** — copy/cut/paste through the system clipboard ([arboard](https://github.com/1Password/arboard)), with bracketed-paste support for terminals that send it
 - **Full mouse support** — click to place the cursor, drag or Shift+click to select, double-click to select a word, triple-click to select a line, scroll wheel to move through text without moving the editor cursor (with a scrollbar) and directories
@@ -107,4 +108,4 @@ src/
 └── clipboard.rs  system clipboard behind a small trait (tests use a fake)
 ```
 
-Highlighting follows the pattern recommended in syntect's `HighlightState` docs: the parse state and scope stack after each line are cached, so an edit invalidates only the lines from the edit point onward, and they're re-parsed only when they become visible. The syntax definitions and theme (`base16-ocean.dark`) are loaded once into process-wide statics.
+Highlighting follows the pattern recommended in syntect's `HighlightState` docs: the parse state and scope stack after each line are cached, so an edit invalidates only the lines from the edit point onward, and they're re-parsed only when they become visible. The syntax definitions and Catppuccin Mocha theme (embedded by [two-face](https://crates.io/crates/two-face)) are loaded once into process-wide statics.

@@ -19,10 +19,12 @@ arboard = "3.6.1"
 crossterm = "0.29.0"
 image = "0.25.10"
 ratatui = "0.30.2"
+ratatui-themes = "0.3.0"
 # chafa (the default) needs a system libchafa, so only the pure-Rust
 # protocols are enabled; unicode half-blocks remain the universal fallback.
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-default-fancy"] }
 unicode-width = "0.2.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]

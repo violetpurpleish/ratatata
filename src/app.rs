@@ -26,6 +26,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui_themes::{Theme, ThemeName, ThemePalette};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::buffer::{Buffer, visual_chunk, visual_row_of};
@@ -64,15 +65,21 @@ const TOPBAR_SEPARATOR_WIDTH: u16 = 3;
 /// (0,0), because most terminals report a synthetic (0,0) event when the
 /// mouse leaves the window.
 const TOPBAR_INDENT: u16 = 1;
-/// Button background, normal and while hovered (the hovered one is
-/// lighter so it reads as "about to be clicked").
-const TOPBAR_PILL_BG: Color = Color::Rgb(45, 45, 45);
-const TOPBAR_PILL_BG_HOVER: Color = Color::Rgb(90, 90, 90);
+/// The fixed application theme. The palette is copied out of the theme so
+/// rendering helpers can use semantic colors without reconstructing it.
+const THEME: Theme = Theme::new(ThemeName::CatppuccinMocha);
+const PALETTE: ThemePalette = THEME.palette();
+/// Accent used for whichever panel and scrollbar currently have focus.
+const FOCUS_COLOR: Color = PALETTE.accent;
+
+/// Background used while a shortcut button is hovered, so it reads as
+/// "about to be clicked". Idle buttons stay on the theme's base background.
+const TOPBAR_PILL_BG_HOVER: Color = PALETTE.muted;
 
 /// Background of the current search match (same yellow as the block caret).
-const SEARCH_CURRENT_BG: Color = Color::Yellow;
+const SEARCH_CURRENT_BG: Color = PALETTE.warning;
 /// Background of the other search matches.
-const SEARCH_OTHER_BG: Color = Color::Rgb(100, 88, 26);
+const SEARCH_OTHER_BG: Color = PALETTE.selection;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
@@ -162,13 +169,13 @@ impl Shortcut {
     /// Accent color of the key combo on the button.
     fn key_color(self) -> Color {
         match self {
-            Shortcut::Quit => Color::Red,
-            Shortcut::SwitchFocus => Color::Cyan,
-            Shortcut::Save => Color::Green,
-            Shortcut::Find => Color::Yellow,
-            Shortcut::ToggleWrap => Color::Magenta,
-            Shortcut::NewFile => Color::Blue,
-            _ => Color::White,
+            Shortcut::Quit => PALETTE.error,
+            Shortcut::SwitchFocus => PALETTE.info,
+            Shortcut::Save => PALETTE.success,
+            Shortcut::Find => PALETTE.warning,
+            Shortcut::ToggleWrap => PALETTE.secondary,
+            Shortcut::NewFile => PALETTE.accent,
+            _ => PALETTE.fg,
         }
     }
 }
@@ -1092,6 +1099,14 @@ impl App {
     // ---- drawing -----------------------------------------------------------
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        // Paint the terminal with the theme's base color first. Individual
+        // widgets and syntax spans then layer their semantic foregrounds and
+        // backgrounds over it.
+        frame.render_widget(
+            Block::default().style(Style::default().bg(PALETTE.bg)),
+            frame.area(),
+        );
+
         let pills = self.shortcut_pills();
         let [top_area, main, status_area] = Layout::vertical([
             Constraint::Length(shortcut_bar_height(&pills, frame.area().width)),
@@ -1162,7 +1177,7 @@ impl App {
                     // out of rows: mark the overflow and stop
                     if let Some(last) = lines.last_mut() {
                         last.spans
-                            .push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+                            .push(Span::styled("…", Style::default().fg(PALETTE.muted)));
                     }
                     break;
                 }
@@ -1176,7 +1191,7 @@ impl App {
             if row_spans.len() > 1 {
                 row_spans.push(Span::styled(
                     TOPBAR_SEPARATOR,
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(PALETTE.muted),
                 ));
             }
             self.topbar_buttons
@@ -1208,38 +1223,38 @@ impl App {
                 Kind::File => entry.name.clone(),
             };
             let mut style = match entry.kind {
-                Kind::Parent => Style::default().fg(Color::DarkGray),
-                Kind::Dir => Style::default().fg(Color::Cyan),
-                Kind::File => Style::default().fg(Color::Gray),
+                Kind::Parent => Style::default().fg(PALETTE.muted),
+                Kind::Dir => Style::default().fg(PALETTE.info),
+                Kind::File => Style::default().fg(PALETTE.fg),
             };
             if entry.is_hidden() {
                 style = style.add_modifier(Modifier::DIM);
             }
             let selected = i == self.sidebar.selected;
             if selected {
-                style = style.bg(Color::DarkGray);
+                style = style.bg(PALETTE.selection);
             }
             let marker = if selected { "▶ " } else { "  " };
             rows.push(Line::from(vec![
-                Span::styled(marker, Style::default().fg(Color::Yellow)),
+                Span::styled(marker, Style::default().fg(PALETTE.warning)),
                 Span::styled(display, style),
             ]));
         }
         if rows.is_empty() {
             rows.push(Line::from(Span::styled(
                 "(empty)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(PALETTE.muted),
             )));
         }
 
         let title = truncate(&self.sidebar.dir.display().to_string(), area.width as usize);
         let block = Block::bordered()
-            .title(Span::styled(title, Style::default().fg(Color::Cyan)))
+            .title(Span::styled(title, Style::default().fg(PALETTE.info)))
             .title_style(Style::default().add_modifier(Modifier::BOLD))
             .border_style(if self.focus == Focus::Sidebar {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(FOCUS_COLOR)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(PALETTE.muted)
             });
         let paragraph = Paragraph::new(rows)
             .block(block)
@@ -1264,12 +1279,12 @@ impl App {
         let title = truncate(&title, area.width as usize);
 
         let block = Block::bordered()
-            .title(Span::styled(title, Style::default().fg(Color::Green)))
+            .title(Span::styled(title, Style::default().fg(PALETTE.success)))
             .title_style(Style::default().add_modifier(Modifier::BOLD))
             .border_style(if self.focus == Focus::Editor {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(FOCUS_COLOR)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(PALETTE.muted)
             });
 
         // An image preview replaces the text: render the block and the image
@@ -1345,7 +1360,7 @@ impl App {
                     let num = if chunk_k == 0 {
                         Span::styled(
                             format!("{:>width$} ", y + 1, width = gutter_w - 1),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(PALETTE.muted),
                         )
                     } else {
                         Span::raw(" ".repeat(gutter_w))
@@ -1381,7 +1396,7 @@ impl App {
             if rows.is_empty() {
                 rows.push(Line::from(Span::styled(
                     "(empty)",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(PALETTE.muted),
                 )));
             }
 
@@ -1405,7 +1420,7 @@ impl App {
                             .map_or_else(|| " ".to_string(), |c| c.to_string());
                         let caret = Paragraph::new(Span::styled(
                             symbol,
-                            caret_style.unwrap_or_default().bg(Color::Yellow),
+                            caret_style.unwrap_or_default().bg(PALETTE.warning),
                         ));
                         frame.render_widget(caret, Rect::new(cx, cy, 1, 1));
                     }
@@ -1422,7 +1437,7 @@ impl App {
         for y in start..end {
             let num = Span::styled(
                 format!("{:>width$} ", y + 1, width = gutter_w - 1),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(PALETTE.muted),
             );
             let ops = self.highlighter.highlight_line(&self.buffer.lines, y);
             let line = &self.buffer.lines[y];
@@ -1465,7 +1480,7 @@ impl App {
         if rows.is_empty() {
             rows.push(Line::from(Span::styled(
                 "(empty)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(PALETTE.muted),
             )));
         }
 
@@ -1475,7 +1490,7 @@ impl App {
         if self.focus == Focus::Editor && self.save_as_input.is_none() {
             // Ratatui can position the terminal cursor, but cannot give it a
             // color. Render a block caret ourselves so it remains distinct
-            // from the reversed selection style (and leave the native cursor
+            // from the themed selection style (and leave the native cursor
             // hidden). Independent scrolling can put the caret outside the
             // viewport, in which case there is deliberately nothing to draw.
             let cursor_visible = self.buffer.cursor.1 >= self.buffer.scroll.1
@@ -1496,7 +1511,7 @@ impl App {
                         .map_or_else(|| " ".to_string(), |c| c.to_string());
                     let caret = Paragraph::new(Span::styled(
                         symbol,
-                        caret_style.unwrap_or_default().bg(Color::Yellow),
+                        caret_style.unwrap_or_default().bg(PALETTE.warning),
                     ));
                     frame.render_widget(caret, Rect::new(cx, cy, 1, 1));
                 }
@@ -1525,16 +1540,16 @@ impl App {
             .position(self.buffer.scroll.1)
             .viewport_content_length(viewport);
         let thumb_style = if self.focus == Focus::Editor {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(FOCUS_COLOR)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(PALETTE.muted)
         };
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None)
             .track_symbol(Some("│"))
             .thumb_symbol("█")
-            .track_style(Style::default().fg(Color::DarkGray))
+            .track_style(Style::default().fg(PALETTE.muted))
             .thumb_style(thumb_style);
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
     }
@@ -1549,12 +1564,12 @@ impl App {
                 Span::styled(
                     prompt,
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(PALETTE.warning)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(input.clone(), Style::default().fg(Color::White)),
+                Span::styled(input.clone(), Style::default().fg(PALETTE.fg)),
             ]))
-            .style(Style::default().bg(Color::Rgb(30, 30, 30)));
+            .style(Style::default().bg(PALETTE.bg));
             frame.render_widget(paragraph, area);
             frame.set_cursor_position(Position::new(area.x + prompt_w + input_w, area.y));
             return;
@@ -1569,20 +1584,20 @@ impl App {
                 .chars()
                 .map(|c| c.width().unwrap_or(0))
                 .sum::<usize>() as u16;
-            let base = Style::default().bg(Color::Rgb(30, 30, 30));
+            let base = Style::default().bg(PALETTE.bg);
             let counter: Vec<Span> = if search.query.is_empty() {
                 Vec::new()
             } else if search.match_count() == 0 {
                 vec![Span::styled(
                     "no matches",
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(PALETTE.warning)
                         .add_modifier(Modifier::BOLD),
                 )]
             } else {
                 vec![Span::styled(
                     format!("{}/{}", search.current_index() + 1, search.match_count()),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(PALETTE.info),
                 )]
             };
             let counter_w = counter.iter().map(|s| s.content.width() as u16).sum();
@@ -1593,10 +1608,10 @@ impl App {
                     Span::styled(
                         prompt,
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(PALETTE.warning)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(search.query.clone(), Style::default().fg(Color::White)),
+                    Span::styled(search.query.clone(), Style::default().fg(PALETTE.fg)),
                 ]))
                 .style(base),
                 left_area,
@@ -1621,7 +1636,7 @@ impl App {
 
         let [left_area, right_area] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).areas(area);
-        let base = Style::default().bg(Color::Rgb(30, 30, 30)).fg(Color::Gray);
+        let base = Style::default().bg(PALETTE.bg).fg(PALETTE.fg);
 
         // left: focus + file + modified state, or a transient message
         let (left_spans, left_style): (Vec<Span>, Style) =
@@ -1631,13 +1646,13 @@ impl App {
                     // is showing
                     let mut spans = vec![Span::styled(
                         msg.clone(),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(PALETTE.warning),
                     )];
                     if self.buffer.dirty {
                         spans.push(Span::styled(
                             " ● modified",
                             Style::default()
-                                .fg(Color::Yellow)
+                                .fg(PALETTE.warning)
                                 .add_modifier(Modifier::BOLD),
                         ));
                     }
@@ -1677,19 +1692,19 @@ impl App {
                     Span::styled(
                         tag,
                         Style::default()
-                            .fg(Color::Magenta)
+                            .fg(PALETTE.secondary)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(format!(" {path} ")),
-                    Span::styled(dims, Style::default().fg(Color::DarkGray)),
-                    Span::styled(view, Style::default().fg(Color::Cyan)),
+                    Span::styled(dims, Style::default().fg(PALETTE.muted)),
+                    Span::styled(view, Style::default().fg(PALETTE.info)),
                 ],
                 Style::default(),
             );
         }
         let (tag, tag_color) = match self.focus {
-            Focus::Sidebar => ("SIDEBAR", Color::Cyan),
-            Focus::Editor => ("EDITOR", Color::Green),
+            Focus::Sidebar => ("SIDEBAR", PALETTE.info),
+            Focus::Editor => ("EDITOR", PALETTE.success),
         };
         let path = self
             .buffer
@@ -1722,16 +1737,16 @@ impl App {
                     Style::default().fg(tag_color).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!(" {path} ")),
-                Span::styled(syntax, Style::default().fg(Color::DarkGray)),
-                Span::styled(wrap, Style::default().fg(Color::Cyan)),
+                Span::styled(syntax, Style::default().fg(PALETTE.muted)),
+                Span::styled(wrap, Style::default().fg(PALETTE.info)),
                 Span::styled(
                     dirty,
                     if self.buffer.dirty {
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(PALETTE.warning)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::Green)
+                        Style::default().fg(PALETTE.success)
                     },
                 ),
             ],
@@ -1746,28 +1761,20 @@ fn pill_width(action: Shortcut) -> u16 {
 }
 
 /// The spans of one shortcut button: the key combo in bold accent color
-/// followed by the action name, on a button-like background. The hovered
-/// button gets a lighter background and a brighter label.
+/// followed by the action name. Only the hovered button gets a background
+/// and brighter label; idle buttons blend into the top bar.
 fn pill_spans(action: Shortcut, hovered: bool) -> Vec<Span<'static>> {
-    let bg = if hovered {
-        TOPBAR_PILL_BG_HOVER
-    } else {
-        TOPBAR_PILL_BG
-    };
+    let mut key_style = Style::default()
+        .fg(action.key_color())
+        .add_modifier(Modifier::BOLD);
+    let mut label_style = Style::default().fg(if hovered { PALETTE.fg } else { PALETTE.muted });
+    if hovered {
+        key_style = key_style.bg(TOPBAR_PILL_BG_HOVER);
+        label_style = label_style.bg(TOPBAR_PILL_BG_HOVER);
+    }
     vec![
-        Span::styled(
-            format!("{} ", action.key_label()),
-            Style::default()
-                .fg(action.key_color())
-                .add_modifier(Modifier::BOLD)
-                .bg(bg),
-        ),
-        Span::styled(
-            action.action_label(),
-            Style::default()
-                .fg(if hovered { Color::White } else { Color::Gray })
-                .bg(bg),
-        ),
+        Span::styled(format!("{} ", action.key_label()), key_style),
+        Span::styled(action.action_label(), label_style),
     ]
 }
 
@@ -1844,10 +1851,10 @@ fn snap_char_down(s: &str, mut b: usize) -> usize {
 
 /// Clip styled byte-ranges from the highlighter to the visible char slice
 /// `[start_char, start_char + width)`, producing the `Span`s to render.
-/// `None` styles render as plain text (terminal default colors); spans
-/// overlapping `sel` (a byte range on this line) are shown reversed, and
-/// spans inside a search match (`matches`, char ranges with a "current
-/// match" flag) get the match background.
+/// `None` styles render as plain text; spans overlapping `sel` (a byte range
+/// on this line) get the theme's selection background, and spans inside a
+/// search match (`matches`, char ranges with a "current match" flag) get the
+/// match background.
 fn clip_ops<'a>(
     line: &'a str,
     ops: &[(Option<Style>, Range<usize>)],
@@ -1909,7 +1916,10 @@ fn clip_ops<'a>(
                 style = style.bg(bg);
             }
             if sel.is_some_and(|(sa, sb)| ca >= sa && cb <= sb) {
-                style = style.add_modifier(Modifier::REVERSED);
+                if style.fg.is_none() {
+                    style = style.fg(PALETTE.fg);
+                }
+                style = style.bg(PALETTE.selection);
             }
             let text = &line[ca..cb];
             if style == Style::default() {
@@ -2275,7 +2285,7 @@ mod tests {
         for x in 31..36 {
             assert_eq!(
                 buf.cell((x, 3)).unwrap().style().bg,
-                Some(Color::Yellow),
+                Some(SEARCH_CURRENT_BG),
                 "col {x}"
             );
         }
@@ -2283,13 +2293,14 @@ mod tests {
         for x in 31..36 {
             assert_eq!(
                 buf.cell((x, 4)).unwrap().style().bg,
-                Some(Color::Rgb(100, 88, 26)),
+                Some(SEARCH_OTHER_BG),
                 "col {x}"
             );
         }
-        // outside the matches: untouched (Reset, like every plain cell)
-        assert_eq!(buf.cell((36, 3)).unwrap().style().bg, Some(Color::Reset));
-        assert_eq!(buf.cell((31, 5)).unwrap().style().bg, Some(Color::Reset));
+        // outside the matches: untouched (the theme's base background,
+        // like every plain cell)
+        assert_eq!(buf.cell((36, 3)).unwrap().style().bg, Some(PALETTE.bg));
+        assert_eq!(buf.cell((31, 5)).unwrap().style().bg, Some(PALETTE.bg));
 
         // the status bar shows the prompt, the query and the counter
         let rows = render(&mut app);
@@ -2358,7 +2369,7 @@ mod tests {
         let parts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(parts, vec!["hello", " world"]);
         // match keeps the syntax fg and gains the match background
-        assert_eq!(spans[0].style.bg, Some(Color::Rgb(100, 88, 26)));
+        assert_eq!(spans[0].style.bg, Some(SEARCH_OTHER_BG));
         assert_eq!(spans[0].style.fg, Some(Color::Blue));
         assert_eq!(spans[1].style.bg, None);
     }
@@ -2609,6 +2620,41 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    #[test]
+    fn uses_catppuccin_mocha_theme() {
+        assert_eq!(THEME.name, ThemeName::CatppuccinMocha);
+        assert_eq!(PALETTE.bg, Color::Rgb(30, 30, 46));
+        assert_eq!(PALETTE.accent, Color::Rgb(137, 180, 250));
+        assert_eq!(PALETTE.selection, Color::Rgb(49, 50, 68));
+    }
+
+    #[test]
+    fn focused_panels_use_theme_accent() {
+        let dir = scratch("focus-color");
+        let file = dir.join("notes.txt");
+        fs::write(&file, "hello\n").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+
+        let buf = render_buffer(&mut app);
+        assert_eq!(
+            buf.cell((app.editor_area.x, app.editor_area.y + 1))
+                .unwrap()
+                .style()
+                .fg,
+            Some(FOCUS_COLOR)
+        );
+
+        app.focus = Focus::Sidebar;
+        let buf = render_buffer(&mut app);
+        assert_eq!(
+            buf.cell((app.sidebar_area.x, app.sidebar_area.y + 1))
+                .unwrap()
+                .style()
+                .fg,
+            Some(FOCUS_COLOR)
+        );
+    }
+
     fn render(app: &mut App) -> Vec<String> {
         let backend = TestBackend::new(150, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2693,27 +2739,30 @@ mod tests {
         fs::write(&file, "fn main() {\n    let msg = \"hi\";\n}\n").unwrap();
         let mut app = new_app(dir, Some(file)).unwrap();
         let buf = render_buffer(&mut app);
-        // "fn" keyword: purple; "main" function name: blue-gray
-        // (colors probed from the base16-ocean.dark theme)
+        // "fn" keyword: mauve; "main" function name: blue
+        // (colors probed from the Catppuccin Mocha theme)
         assert_eq!(buf.cell((31, 3)).unwrap().symbol(), "f");
         assert_eq!(
             buf.cell((31, 3)).unwrap().style().fg,
-            Some(Color::Rgb(180, 142, 173))
+            Some(Color::Rgb(203, 166, 247))
         );
         assert_eq!(buf.cell((34, 3)).unwrap().symbol(), "m");
         assert_eq!(
             buf.cell((34, 3)).unwrap().style().fg,
-            Some(Color::Rgb(143, 161, 179))
+            Some(Color::Rgb(137, 180, 250))
         );
         // string content "hi": green
         assert_eq!(buf.cell((46, 4)).unwrap().symbol(), "h");
         assert_eq!(
             buf.cell((46, 4)).unwrap().style().fg,
-            Some(Color::Rgb(163, 190, 140))
+            Some(Color::Rgb(166, 227, 161))
         );
-        // punctuation stays uncolored
+        // punctuation uses Catppuccin's muted overlay color
         assert_eq!(buf.cell((31, 5)).unwrap().symbol(), "}");
-        assert_eq!(buf.cell((31, 5)).unwrap().style().fg, Some(Color::Reset));
+        assert_eq!(
+            buf.cell((31, 5)).unwrap().style().fg,
+            Some(Color::Rgb(147, 153, 178))
+        );
     }
 
     #[test]
@@ -2725,7 +2774,7 @@ mod tests {
         let buf = render_buffer(&mut app);
         let caret = buf.cell((31, 3)).unwrap();
         assert_eq!(caret.symbol(), "t");
-        assert_eq!(caret.style().bg, Some(Color::Yellow));
+        assert_eq!(caret.style().bg, Some(PALETTE.warning));
         assert!(!caret.style().add_modifier.contains(Modifier::REVERSED));
     }
 
@@ -2737,7 +2786,7 @@ mod tests {
         let mut app = new_app(dir, Some(file)).unwrap();
         let buf = render_buffer(&mut app);
         for x in 31..99 {
-            // exclude the yellow focus border at x=99
+            // exclude the accent-colored focus border at x=99
             let cell = buf.cell((x, 3)).unwrap();
             if cell.symbol().is_empty() || cell.symbol() == " " {
                 continue;
@@ -2816,11 +2865,21 @@ mod tests {
         let mut app = new_app(dir, Some(file)).unwrap();
         let buf = render_buffer(&mut app);
         let scrollbar_x = app.editor_area.x + app.editor_area.width - 1;
-        let scrollbar = (app.editor_area.y + 1..app.editor_area.y + app.editor_area.height - 1)
+        let mut scrollbar_range =
+            app.editor_area.y + 1..app.editor_area.y + app.editor_area.height - 1;
+        let scrollbar = scrollbar_range
+            .clone()
             .map(|y| buf.cell((scrollbar_x, y)).unwrap().symbol())
             .collect::<String>();
         assert!(scrollbar.contains('█'));
         assert!(scrollbar.contains('│'));
+        let thumb_y = scrollbar_range
+            .find(|&y| buf.cell((scrollbar_x, y)).unwrap().symbol() == "█")
+            .unwrap();
+        assert_eq!(
+            buf.cell((scrollbar_x, thumb_y)).unwrap().style().fg,
+            Some(FOCUS_COLOR)
+        );
 
         // At the final viewport the thumb reaches the bottom of the track.
         app.buffer.scroll.1 = app
@@ -2830,6 +2889,10 @@ mod tests {
         let buf = render_buffer(&mut app);
         let bottom = app.editor_area.y + app.editor_area.height - 2;
         assert_eq!(buf.cell((scrollbar_x, bottom)).unwrap().symbol(), "█");
+        assert_eq!(
+            buf.cell((scrollbar_x, bottom)).unwrap().style().fg,
+            Some(FOCUS_COLOR)
+        );
     }
 
     // ---- wrapping ----------------------------------------------------------
@@ -2916,7 +2979,7 @@ mod tests {
         let buf = render_buffer(&mut app);
         let cell = buf.cell((141, 3)).unwrap();
         assert_eq!(cell.symbol(), "x");
-        assert_eq!(cell.style().bg, Some(Color::Yellow));
+        assert_eq!(cell.style().bg, Some(PALETTE.warning));
     }
 
     #[test]
@@ -3423,7 +3486,7 @@ mod tests {
 
         // the bar starts one cell in from the window edge: cell (0,0) is
         // plain margin, not part of the first button
-        assert_eq!(buf.cell((0, 0)).unwrap().style().bg, Some(Color::Reset));
+        assert_eq!(buf.cell((0, 0)).unwrap().style().bg, Some(PALETTE.bg));
 
         // moving the mouse over the button highlights it...
         app.handle_mouse(mouse(MouseEventKind::Moved, rect.x + 1, rect.y));
@@ -3435,15 +3498,15 @@ mod tests {
                 "col {x}"
             );
         }
-        // ...while a non-hovered button keeps its normal background
-        assert_eq!(buf.cell((1, 0)).unwrap().style().bg, Some(TOPBAR_PILL_BG));
+        // ...while a non-hovered button blends into the base background
+        assert_eq!(buf.cell((1, 0)).unwrap().style().bg, Some(PALETTE.bg));
 
-        // moving away restores the normal background
+        // moving away restores the base background
         app.handle_mouse(mouse(MouseEventKind::Moved, 140, 10));
         let buf = render_buffer(&mut app);
         assert_eq!(
             buf.cell((rect.x + 1, 0)).unwrap().style().bg,
-            Some(TOPBAR_PILL_BG)
+            Some(PALETTE.bg)
         );
     }
 
@@ -3467,7 +3530,7 @@ mod tests {
         // away instead of sticking on the first button
         app.handle_mouse(mouse(MouseEventKind::Moved, 0, 0));
         let buf = render_buffer(&mut app);
-        assert_eq!(buf.cell((1, 0)).unwrap().style().bg, Some(TOPBAR_PILL_BG));
+        assert_eq!(buf.cell((1, 0)).unwrap().style().bg, Some(PALETTE.bg));
         let rows = render(&mut app);
         assert!(rows[23].contains("1:1"));
     }
@@ -3652,9 +3715,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["fn ", "ma", "in"]
         );
-        assert!(!spans[0].style.add_modifier.contains(Modifier::REVERSED));
-        assert!(spans[1].style.add_modifier.contains(Modifier::REVERSED));
-        assert!(!spans[2].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(spans[0].style.bg, None);
+        assert_eq!(spans[1].style.bg, Some(PALETTE.selection));
+        assert_eq!(spans[2].style.bg, None);
         assert_eq!(spans[0].style.fg, Some(Color::Blue));
         assert_eq!(spans[1].style.fg, Some(Color::Blue));
         assert_eq!(spans[2].style.fg, Some(Color::Blue));
@@ -3676,14 +3739,14 @@ mod tests {
 
         let selected: Vec<&str> = spans
             .iter()
-            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .filter(|span| span.style.bg == Some(PALETTE.selection))
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(selected, vec!["directories"]);
     }
 
     #[test]
-    fn selection_renders_reversed() {
+    fn selection_renders_with_theme_background() {
         let dir = scratch("mselrender");
         let file = dir.join("a.txt");
         fs::write(&file, "hello world\n").unwrap();
@@ -3692,25 +3755,16 @@ mod tests {
         app.buffer.begin_selection();
         app.buffer.end();
         let buf = render_buffer(&mut app);
-        // cells inside the selection are reversed
+        // cells inside the selection use the Catppuccin selection color
         for x in 31..42 {
-            assert!(
-                buf.cell((x, 3))
-                    .unwrap()
-                    .style()
-                    .add_modifier
-                    .contains(Modifier::REVERSED),
+            assert_eq!(
+                buf.cell((x, 3)).unwrap().style().bg,
+                Some(PALETTE.selection),
                 "col {x}"
             );
         }
-        // cells outside are not
-        assert!(
-            !buf.cell((43, 3))
-                .unwrap()
-                .style()
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        );
+        // cells outside retain the themed base background
+        assert_eq!(buf.cell((43, 3)).unwrap().style().bg, Some(PALETTE.bg));
     }
 
     // ---- undo / redo ------------------------------------------------------
@@ -3832,7 +3886,7 @@ mod tests {
         assert_eq!(buf.cell((31, 3)).unwrap().symbol(), "f");
         assert_eq!(
             buf.cell((31, 3)).unwrap().style().fg,
-            Some(Color::Rgb(180, 142, 173))
+            Some(Color::Rgb(203, 166, 247))
         );
     }
 
