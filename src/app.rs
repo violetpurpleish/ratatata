@@ -847,11 +847,13 @@ impl App {
                     self.scroll_editor(-3);
                 }
             }
-            MouseEventKind::ScrollLeft if !self.buffer.wrap => {
-                // horizontal scrolling is meaningless while wrapping
+            MouseEventKind::ScrollLeft if self.in_editor(pos) && !self.buffer.wrap => {
+                // Horizontal scrolling only belongs to the editor. In
+                // particular, do not let a horizontal wheel gesture over the
+                // sidebar move the editor viewport.
                 self.buffer.scroll.0 = self.buffer.scroll.0.saturating_sub(3);
             }
-            MouseEventKind::ScrollRight if !self.buffer.wrap => {
+            MouseEventKind::ScrollRight if self.in_editor(pos) && !self.buffer.wrap => {
                 self.buffer.scroll.0 += 3;
             }
             _ => {}
@@ -3563,6 +3565,19 @@ mod tests {
         // wheel over the sidebar moves the selection
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 5));
         assert_eq!(app.sidebar.selected, 1);
+
+        // Horizontal wheel events over the sidebar must not scroll the editor.
+        // The editor is already at the left edge, so a rightward event makes
+        // the regression visible without depending on the file contents.
+        assert_eq!(app.buffer.scroll.0, 0);
+        app.handle_mouse(mouse(MouseEventKind::ScrollRight, 5, 5));
+        assert_eq!(app.buffer.scroll.0, 0);
+
+        // The same event still scrolls when it is actually over the editor.
+        app.handle_mouse(mouse(MouseEventKind::ScrollRight, 60, 10));
+        assert_eq!(app.buffer.scroll.0, 3);
+        app.handle_mouse(mouse(MouseEventKind::ScrollLeft, 60, 10));
+        assert_eq!(app.buffer.scroll.0, 0);
     }
 
     #[test]
