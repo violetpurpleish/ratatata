@@ -175,10 +175,12 @@ fn logical_cell_size_for_platform(
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = backing_scale;
         non_macos_logical_cell_size(physical_cell_size)
     }
 }
 
+#[cfg(target_os = "macos")]
 fn macos_logical_cell_size_or_fallback(
     physical_cell_size: FontSize,
     backing_scale: Option<f64>,
@@ -187,13 +189,14 @@ fn macos_logical_cell_size_or_fallback(
         .unwrap_or_else(image_view::fallback_logical_cell_size)
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg(any(not(target_os = "macos"), test))]
 fn non_macos_logical_cell_size(physical_cell_size: FontSize) -> FontSize {
     physical_cell_size
 }
 
 /// Convert backing-pixel cell dimensions into logical dimensions. Rounding is
 /// necessary because ratatui-image represents cell dimensions as integers.
+#[cfg(any(target_os = "macos", test))]
 fn logical_cell_size_from_scale(
     backing_cell_size: FontSize,
     backing_scale: Option<f64>,
