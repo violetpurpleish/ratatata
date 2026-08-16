@@ -1342,13 +1342,6 @@ impl App {
             .block(block)
             .scroll((self.sidebar.scroll as u16, 0));
         frame.render_widget(paragraph, area);
-
-        // Put the terminal cursor on the selected row while the sidebar has
-        // focus. The editor draws its own colored caret.
-        if self.focus == Focus::Sidebar {
-            let row = (self.sidebar.selected - self.sidebar.scroll) as u16;
-            frame.set_cursor_position(Position::new(area.x + 1, area.y + 1 + row));
-        }
     }
 
     fn draw_editor(&mut self, frame: &mut Frame, area: Rect) {
@@ -2964,6 +2957,19 @@ mod tests {
 
     fn row_contains(rows: &[String], needle: &str) -> bool {
         rows.iter().any(|r| r.contains(needle))
+    }
+
+    #[test]
+    fn focused_sidebar_hides_native_cursor() {
+        let dir = scratch("sidebar-cursor");
+        fs::write(dir.join("notes.txt"), "hello world").unwrap();
+        let mut app = new_app(dir, None).unwrap();
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        assert!(!terminal.backend().cursor_visible());
     }
 
     #[test]
