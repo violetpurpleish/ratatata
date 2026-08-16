@@ -1766,7 +1766,7 @@ fn snap_char_down(s: &str, mut b: usize) -> usize {
 /// Clip styled byte-ranges from the highlighter to the visible char slice
 /// `[start_char, start_char + width)`, producing the `Span`s to render.
 /// `None` styles render as plain text (terminal default colors); spans
-/// overlapping `sel` (byte range on this line) are shown reversed, and
+/// overlapping `sel` (a byte range on this line) are shown reversed, and
 /// spans inside a search match (`matches`, char ranges with a "current
 /// match" flag) get the match background.
 fn clip_ops<'a>(
@@ -1779,7 +1779,6 @@ fn clip_ops<'a>(
 ) -> Vec<Span<'a>> {
     let start_byte = char_index_to_byte(line, start_char);
     let end_byte = char_index_to_byte(line, start_char + width);
-    let sel = sel.map(|(a, b)| (char_index_to_byte(line, a), char_index_to_byte(line, b)));
     let matches: Vec<(usize, usize, bool)> = matches
         .iter()
         .map(|&(a, b, current)| {
@@ -3431,6 +3430,28 @@ mod tests {
         assert_eq!(spans[0].style.fg, Some(Color::Blue));
         assert_eq!(spans[1].style.fg, Some(Color::Blue));
         assert_eq!(spans[2].style.fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn selection_byte_range_is_not_reinterpreted_as_char_range() {
+        let line = "— browse directories on the left";
+        let start = line.find("directories").unwrap();
+        let end = start + "directories".len();
+        let spans = clip_ops(
+            line,
+            &[(None, 0..line.len())],
+            0,
+            line.chars().count(),
+            Some((start, end)),
+            &[],
+        );
+
+        let selected: Vec<&str> = spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(selected, vec!["directories"]);
     }
 
     #[test]
