@@ -60,6 +60,10 @@ const TOPBAR_MAX_ROWS: u16 = 2;
 /// Separator between the shortcut buttons in the top bar.
 const TOPBAR_SEPARATOR: &str = " | ";
 const TOPBAR_SEPARATOR_WIDTH: u16 = 3;
+/// Left margin of the top bar: the first button must not start at cell
+/// (0,0), because most terminals report a synthetic (0,0) event when the
+/// mouse leaves the window.
+const TOPBAR_INDENT: u16 = 1;
 /// Button background, normal and while hovered (the hovered one is
 /// lighter so it reads as "about to be clicked").
 const TOPBAR_PILL_BG: Color = Color::Rgb(45, 45, 45);
@@ -816,8 +820,14 @@ impl App {
             .contains(Position::new(pos.0 as u16, pos.1 as u16))
     }
 
-    /// The shortcut button under a mouse position, if any.
+    /// The shortcut button under a mouse position, if any. Cell (0,0) is
+    /// deliberately never a hit: the top bar starts one cell in, and
+    /// terminals that report a synthetic (0,0) event when the mouse
+    /// leaves the window must not light up (or trigger) anything.
     fn topbar_action_at(&self, pos: (usize, usize)) -> Option<Shortcut> {
+        if pos == (0, 0) {
+            return None;
+        }
         let p = Position::new(pos.0 as u16, pos.1 as u16);
         self.topbar_buttons
             .iter()
@@ -1102,22 +1112,25 @@ impl App {
     }
 
     /// The clickable shortcut buttons ("Ctrl+O switch", …) across the top,
-    /// separated by " | ". Buttons flow onto a second row when they don't
-    /// fit; anything still left over is omitted with an ellipsis marker.
-    /// Button rectangles from the last draw are kept for mouse
-    /// hit-testing.
+    /// separated by " | " and indented one cell from the window edge.
+    /// Buttons flow onto a second row when they don't fit; anything still
+    /// left over is omitted with an ellipsis marker. Button rectangles
+    /// from the last draw are kept for mouse hit-testing.
     fn draw_topbar(&mut self, frame: &mut Frame, area: Rect, pills: &[Shortcut]) {
         self.topbar_buttons.clear();
         let hovered = self.hovered;
         let mut lines: Vec<Line> = Vec::new();
-        let mut row_spans: Vec<Span<'static>> = Vec::new();
-        let mut x = area.x;
+        // every row begins with a one-cell margin so the first button
+        // never sits at the window edge at (0,0)
+        let mut row_spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+        let mut x = area.x + TOPBAR_INDENT;
         for &action in pills {
             let w = pill_width(action);
             if x + w > area.x + area.width {
                 // doesn't fit on this row: start the next one
                 lines.push(Line::from(std::mem::take(&mut row_spans)));
-                x = area.x;
+                x = area.x + TOPBAR_INDENT;
+                row_spans.push(Span::raw(" "));
                 if lines.len() as u16 >= TOPBAR_MAX_ROWS {
                     // out of rows: mark the overflow and stop
                     if let Some(last) = lines.last_mut() {
@@ -1133,7 +1146,7 @@ impl App {
             }
             // a separator between the buttons (never before the first one
             // on a row, so rows don't end with a dangling pipe)
-            if !row_spans.is_empty() {
+            if row_spans.len() > 1 {
                 row_spans.push(Span::styled(
                     TOPBAR_SEPARATOR,
                     Style::default().fg(Color::DarkGray),
@@ -1680,11 +1693,12 @@ fn pill_spans(action: Shortcut, hovered: bool) -> Vec<Span<'static>> {
 }
 
 /// How many rows the top bar needs to show all buttons at `width`: one
-/// when everything fits, otherwise two (a second row that is still too
-/// small is truncated with an ellipsis marker). Must stay in sync with
-/// [`App::draw_topbar`]'s wrapping.
+/// when everything fits (including the left margin and the separators),
+/// otherwise two (a second row that is still too small is truncated with
+/// an ellipsis marker). Must stay in sync with [`App::draw_topbar`]'s
+/// wrapping.
 fn shortcut_bar_height(pills: &[Shortcut], width: u16) -> u16 {
-    if topbar_total_width(pills) <= width {
+    if TOPBAR_INDENT + topbar_total_width(pills) <= width {
         1
     } else {
         TOPBAR_MAX_ROWS
@@ -3177,14 +3191,18 @@ mod tests {
         let dir = scratch("mbtnhoverbg");
         fs::write(dir.join("a.txt"), "alpha").unwrap();
         let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
-        render_buffer(&mut app);
+        let buf = render_buffer(&mut app);
         let (_, rect) = app
             .topbar_buttons
             .iter()
             .find(|(a, _)| *a == Shortcut::Save)
             .copied()
             .unwrap();
-        assert_eq!(rect.x, 16); // guard against layout drift
+        assert_eq!(rect.x, 17); // guard against layout drift
+
+        // the bar starts one cell in from the window edge: cell (0,0) is
+        // plain margin, not part of the first button
+        assert_eq!(buf.cell((0, 0)).unwrap().style().bg, Some(Color::Reset));
 
         // moving the mouse over the button highlights it...
         app.handle_mouse(mouse(MouseEventKind::Moved, rect.x + 1, rect.y));
@@ -3197,7 +3215,7 @@ mod tests {
             );
         }
         // ...while a non-hovered button keeps its normal background
-        assert_eq!(buf.cell((0, 0)).unwrap().style().bg, Some(TOPBAR_PILL_BG));
+        assert_eq!(buf.cell((1, 0)).unwrap().style().bg, Some(TOPBAR_PILL_BG));
 
         // moving away restores the normal background
         app.handle_mouse(mouse(MouseEventKind::Moved, 140, 10));
@@ -3206,6 +3224,31 @@ mod tests {
             buf.cell((rect.x + 1, 0)).unwrap().style().bg,
             Some(TOPBAR_PILL_BG)
         );
+    }
+
+    #[test]
+    fn mouse_leaving_terminal_clears_hover_highlight() {
+        let dir = scratch("mbtnleave");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        render_buffer(&mut app);
+
+        // hover the first button...
+        app.handle_mouse(mouse(MouseEventKind::Moved, 2, 0));
+        let buf = render_buffer(&mut app);
+        assert_eq!(
+            buf.cell((1, 0)).unwrap().style().bg,
+            Some(TOPBAR_PILL_BG_HOVER)
+        );
+
+        // ...then the terminal reports (0,0) when the mouse leaves the
+        // window: the highlight (and the status-bar description) must go
+        // away instead of sticking on the first button
+        app.handle_mouse(mouse(MouseEventKind::Moved, 0, 0));
+        let buf = render_buffer(&mut app);
+        assert_eq!(buf.cell((1, 0)).unwrap().style().bg, Some(TOPBAR_PILL_BG));
+        let rows = render(&mut app);
+        assert!(rows[23].contains("1:1"));
     }
 
     #[test]
