@@ -941,7 +941,17 @@ impl Buffer {
             let row = visual_row_of(&self.lines[y], x, width);
             if row > 0 {
                 let (start, end) = visual_chunk(&self.lines[y], row - 1, width);
-                let nx = snap_visible_back(&self.lines[y], x.clamp(start, end), width);
+                // `end` is exclusive, and a cursor at `end` belongs to the
+                // following visual row (`visual_row_of` uses `x < end`).
+                // Clamping to `end` therefore leaves Up at the start of the
+                // current row and repeated Up appears to stop. Keep the
+                // target inside the previous row instead.
+                let target = if start < end {
+                    x.clamp(start, end - 1)
+                } else {
+                    start
+                };
+                let nx = snap_visible_back(&self.lines[y], target, width);
                 self.cursor = (nx, y);
             } else if y > 0 {
                 self.cursor.1 -= 1;
@@ -967,7 +977,14 @@ impl Buffer {
             let row = visual_row_of(&self.lines[y], x, width);
             if row + 1 < visual_len(&self.lines[y], width) {
                 let (start, end) = visual_chunk(&self.lines[y], row + 1, width);
-                let nx = snap_visible_back(&self.lines[y], x.clamp(start, end), width);
+                // As above, do not put the cursor at the exclusive end of a
+                // visual row: that position is rendered on the next row.
+                let target = if start < end {
+                    x.clamp(start, end - 1)
+                } else {
+                    start
+                };
+                let nx = snap_visible_back(&self.lines[y], target, width);
                 self.cursor = (nx, y);
             } else if y + 1 < self.lines.len() {
                 self.cursor.1 += 1;
@@ -1710,10 +1727,10 @@ mod tests {
         b.move_up();
         assert_eq!(b.cursor, (3, 0));
         // from a continuation row, up goes to the previous row of the
-        // same line (x clamped into it)
+        // same line without landing on its exclusive end boundary
         b.cursor = (5, 0);
         b.move_up();
-        assert_eq!(b.cursor, (4, 0));
+        assert_eq!(b.cursor, (3, 0));
     }
 
     #[test]

@@ -383,12 +383,30 @@ impl App {
         }
 
         // The search bar is modal like the save-as prompt: Esc closes it,
-        // Enter/Shift+Enter step through the matches, everything else that
-        // is printable edits the query. Ctrl/Super combinations returned
-        // above, so any remaining Char is printable input.
+        // Enter/Shift+Enter step through the matches, and printable input
+        // edits the query. Navigation keys dismiss the bar and continue to
+        // the focused panel, like clicking in the editor/sidebar does. This
+        // matters in particular after Enter: search remains open after
+        // stepping through a match, so swallowing Up here would make the
+        // editor appear to stop moving vertically until Esc was pressed.
         if self.search.is_some() && key.code == KeyCode::Esc {
             self.search = None;
             return;
+        }
+        if self.search.is_some()
+            && matches!(
+                key.code,
+                KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+            )
+        {
+            self.search = None;
         }
         if let Some(search) = self.search.as_mut() {
             let mut query_changed = false;
@@ -965,9 +983,17 @@ impl App {
             let vrow = (self.buffer.scroll.1 + rel_y).min(self.buffer.total_visual_rows() - 1);
             let (y, k) = self.buffer.vrow_position(vrow)?;
             let line = &self.buffer.lines[y];
-            let (start, _) = visual_chunk(line, k, width);
-            let chunk: String = line.chars().skip(start).collect();
-            let x = start + char_at_col(&chunk, col);
+            let (start, end) = visual_chunk(line, k, width);
+            // Only the clicked visual row participates in horizontal hit
+            // testing. Scanning the rest of the logical line would map a
+            // click in the blank tail of a short wrapped row onto a later
+            // row, which then corrupts vertical navigation.
+            let chunk: String = line
+                .chars()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .collect();
+            let x = start + char_at_col(&chunk, col).min(end.saturating_sub(start));
             return Some((y, x));
         }
         let y = (self.buffer.scroll.1 + rel_y).min(self.buffer.lines.len() - 1);
@@ -2444,6 +2470,84 @@ mod tests {
     }
 
     #[test]
+    fn editor_navigation_dismisses_search() {
+        let dir = scratch("search-navigation");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha\nbeta\ncharlie\n").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+
+        open_search_typed(&mut app, "charlie");
+        assert_eq!(app.buffer.cursor, (0, 2));
+        assert!(app.search.is_some());
+
+        // Search stays open after matching, but an editor navigation key must
+        // not be swallowed by the search prompt.
+        app.handle_key(key(KeyCode::Up));
+        assert!(app.search.is_none());
+        assert_eq!(app.buffer.cursor, (0, 1));
+    }
+
+    #[test]
+    fn wrapped_search_click_then_up_continues_moving() {
+        let dir = scratch("search-wrapped-click");
+        let file = dir.join("README.md");
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let contents = fs::read_to_string(source).unwrap();
+        fs::write(&file, &contents).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+
+        render_sized(&mut app, 60, 24); // establish the viewport width
+        app.handle_key(ctrl('w'));
+        render_sized(&mut app, 60, 24); // establish the wrapped rows
+        open_search_typed(&mut app, "command");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.buffer.cursor, (21, 28));
+
+        // Redraw after the first move, then click the only search result as
+        // a user would. The result starts at char 22 on README.md line 29.
+        render_sized(&mut app, 60, 24);
+        let target = (25, 28); // three characters into "command"
+        let vrow = {
+            let old = app.buffer.cursor;
+            app.buffer.cursor = target;
+            let row = app.buffer.cursor_vrow();
+            app.buffer.cursor = old;
+            row
+        };
+        let inner_x = app.editor_area.x as usize + 1;
+        let inner_y = app.editor_area.y as usize + 1;
+        let gutter_w = app.buffer.lines.len().to_string().len() + 1;
+        let (chunk_start, _) = crate::buffer::visual_chunk(
+            &app.buffer.lines[target.1],
+            vrow - app.buffer.lines[..target.1]
+                .iter()
+                .map(|line| crate::buffer::visual_len(line, app.buffer.wrap_width))
+                .sum::<usize>(),
+            app.buffer.wrap_width,
+        );
+        let click_x = inner_x + gutter_w + target.0 - chunk_start;
+        let click_y = inner_y + vrow - app.buffer.scroll.1;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            click_x as u16,
+            click_y as u16,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            click_x as u16,
+            click_y as u16,
+        ));
+        assert_eq!(app.buffer.cursor, target);
+
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.buffer.cursor, (21, 28));
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.buffer.cursor.1, 27);
+    }
+
+    #[test]
     fn search_without_matches_keeps_cursor_put() {
         let dir = scratch("search4");
         let file = dir.join("a.txt");
@@ -2918,6 +3022,12 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    fn render_sized(app: &mut App, width: u16, height: u16) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
     }
 
     #[test]
