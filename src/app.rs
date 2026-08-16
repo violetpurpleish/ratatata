@@ -28,7 +28,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, visual_chunk, visual_row_of};
 use crate::clipboard::{Clipboard, SystemClipboard};
 use crate::highlight::Highlighter;
 use crate::image_view::{self, ImagePreview};
@@ -242,6 +242,19 @@ impl App {
                 }
                 KeyCode::Char('f') => {
                     self.open_search();
+                    return;
+                }
+                // Ctrl+W toggles soft wrapping of long lines (visual
+                // rows instead of horizontal scrolling).
+                KeyCode::Char('w') => {
+                    let (w, _) = self.editor_text;
+                    let wrap = self.buffer.toggle_wrap(w as usize);
+                    self.set_message(if wrap {
+                        "word wrap on"
+                    } else {
+                        "word wrap off"
+                    });
+                    self.ensure_cursor_visible();
                     return;
                 }
                 // Ctrl+Z undoes, Ctrl+Shift+Z redoes (CapsLock typos land
@@ -644,10 +657,11 @@ impl App {
                     self.reanchor_search();
                 }
             }
-            MouseEventKind::ScrollLeft => {
+            MouseEventKind::ScrollLeft if !self.buffer.wrap => {
+                // horizontal scrolling is meaningless while wrapping
                 self.buffer.scroll.0 = self.buffer.scroll.0.saturating_sub(3);
             }
-            MouseEventKind::ScrollRight => {
+            MouseEventKind::ScrollRight if !self.buffer.wrap => {
                 self.buffer.scroll.0 += 3;
             }
             _ => {}
@@ -700,10 +714,22 @@ impl App {
             .saturating_sub(inner_y as usize)
             .min(inner_h as usize - 1);
         let rel_x = pos.0.saturating_sub(inner_x as usize);
-        let y = (self.buffer.scroll.1 + rel_y).min(self.buffer.lines.len() - 1);
         // clicks in the line-number gutter land at column 0
         let gutter_w = self.buffer.lines.len().to_string().len() + 1;
         let col = rel_x.saturating_sub(gutter_w);
+        if self.buffer.wrap {
+            // the row clicked is a visual row: map it to its logical
+            // line and chunk, then to a char index within the chunk
+            let width = self.buffer.wrap_width.max(1);
+            let vrow = (self.buffer.scroll.1 + rel_y).min(self.buffer.total_visual_rows() - 1);
+            let (y, k) = self.buffer.vrow_position(vrow)?;
+            let line = &self.buffer.lines[y];
+            let (start, _) = visual_chunk(line, k, width);
+            let chunk: String = line.chars().skip(start).collect();
+            let x = start + char_at_col(&chunk, col);
+            return Some((y, x));
+        }
+        let y = (self.buffer.scroll.1 + rel_y).min(self.buffer.lines.len() - 1);
         let line = &self.buffer.lines[y];
         let visible: String = line.chars().skip(self.buffer.scroll.0).collect();
         let x = self.buffer.scroll.0 + char_at_col(&visible, col);
@@ -983,7 +1009,122 @@ impl App {
         let text_w = inner.width.saturating_sub(gutter_w as u16) as usize;
         let text_h = inner.height as usize;
         self.editor_text = (text_w as u16, text_h as u16);
+        self.buffer.wrap_width = text_w;
         self.buffer.ensure_visible(text_h, text_w);
+
+        // With wrapping every logical line may occupy several visual
+        // rows; `scroll.y` is then a visual row, the gutter shows the
+        // line number only on the first row of each line, and the caret
+        // sits on the visual row holding the cursor.
+        if self.buffer.wrap {
+            let width = self.buffer.wrap_width.max(1);
+            let mut rows: Vec<Line> = Vec::with_capacity(text_h);
+            let mut caret_style = None;
+            // the logical line and chunk the viewport starts on
+            let (mut y, mut chunk_k) = self
+                .buffer
+                .vrow_position(self.buffer.scroll.1)
+                .unwrap_or((self.buffer.lines.len(), 0));
+            let mut remaining = text_h;
+            while remaining > 0 && y < self.buffer.lines.len() {
+                let line = &self.buffer.lines[y];
+                let ops = self.highlighter.highlight_line(&self.buffer.lines, y);
+                // selection overlap on this line, in byte offsets
+                let sel = self
+                    .buffer
+                    .selection_on_line(y)
+                    .map(|(a, b)| (char_index_to_byte(line, a), char_index_to_byte(line, b)));
+                // search matches on this line, in char offsets
+                let search_matches: Vec<(usize, usize, bool)> = self
+                    .search
+                    .as_ref()
+                    .map(|s| s.matches_on_line(y).collect())
+                    .unwrap_or_default();
+                // the chunk the cursor sits on within this line
+                let cursor_chunk = if self.focus == Focus::Editor
+                    && self.save_as_input.is_none()
+                    && self.buffer.cursor.1 == y
+                {
+                    Some(visual_row_of(line, self.buffer.cursor.0, width))
+                } else {
+                    None
+                };
+                loop {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let (cstart, cend) = visual_chunk(line, chunk_k, width);
+                    let num = if chunk_k == 0 {
+                        Span::styled(
+                            format!("{:>width$} ", y + 1, width = gutter_w - 1),
+                            Style::default().fg(Color::DarkGray),
+                        )
+                    } else {
+                        Span::raw(" ".repeat(gutter_w))
+                    };
+                    if cursor_chunk == Some(chunk_k) {
+                        let cursor_byte = char_index_to_byte(line, self.buffer.cursor.0);
+                        caret_style = Some(
+                            ops.iter()
+                                .find(|(_, range)| range.contains(&cursor_byte))
+                                .and_then(|(style, _)| *style)
+                                .unwrap_or_default(),
+                        );
+                    }
+                    let mut spans = vec![num];
+                    spans.extend(clip_ops(
+                        line,
+                        &ops,
+                        cstart,
+                        cend - cstart,
+                        sel,
+                        &search_matches,
+                    ));
+                    rows.push(Line::from(spans));
+                    remaining -= 1;
+                    if cend >= line.chars().count() {
+                        y += 1;
+                        chunk_k = 0;
+                        break;
+                    }
+                    chunk_k += 1;
+                }
+            }
+            if rows.is_empty() {
+                rows.push(Line::from(Span::styled(
+                    "(empty)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
+            let paragraph = Paragraph::new(rows).block(block);
+            frame.render_widget(paragraph, area);
+
+            if self.focus == Focus::Editor && self.save_as_input.is_none() {
+                let caret_vrow = self.buffer.cursor_vrow();
+                if caret_vrow >= self.buffer.scroll.1 && caret_vrow < self.buffer.scroll.1 + text_h
+                {
+                    let cx = area.x + 1 + gutter_w as u16 + self.buffer.cursor_col() as u16;
+                    let cy = area.y + 1 + (caret_vrow - self.buffer.scroll.1) as u16;
+                    let inner_right = area.x + area.width.saturating_sub(1);
+                    let inner_bottom = area.y + area.height.saturating_sub(1);
+                    if cx < inner_right && cy < inner_bottom {
+                        let symbol = self
+                            .buffer
+                            .lines
+                            .get(self.buffer.cursor.1)
+                            .and_then(|line| line.chars().nth(self.buffer.cursor.0))
+                            .map_or_else(|| " ".to_string(), |c| c.to_string());
+                        let caret = Paragraph::new(Span::styled(
+                            symbol,
+                            caret_style.unwrap_or_default().bg(Color::Yellow),
+                        ));
+                        frame.render_widget(caret, Rect::new(cx, cy, 1, 1));
+                    }
+                }
+            }
+            return;
+        }
 
         let start = self.buffer.scroll.1;
         let end = (start + text_h).min(self.buffer.lines.len());
@@ -1141,7 +1282,7 @@ impl App {
             "Esc close preview · Ctrl+O switch · Ctrl+Q quit".to_string()
         } else {
             format!(
-                "{}:{}   Ctrl+O switch · Ctrl+S save · Ctrl+Z undo · Ctrl+Shift+Z redo · Ctrl+C/X/V clipboard · Ctrl+F search · Ctrl+Q quit",
+                "{}:{}   Ctrl+O switch · Ctrl+S save · Ctrl+Z undo · Ctrl+Shift+Z redo · Ctrl+C/X/V clipboard · Ctrl+F search · Ctrl+W wrap · Ctrl+Q quit",
                 y + 1,
                 x + 1
             )
@@ -1237,8 +1378,14 @@ impl App {
         } else {
             String::new()
         };
-        let path_max = width
-            .saturating_sub(tag.width() as u16 + dirty.width() as u16 + syntax.width() as u16 + 2);
+        let wrap = if self.buffer.wrap { "wrap " } else { "" };
+        let path_max = width.saturating_sub(
+            tag.width() as u16
+                + dirty.width() as u16
+                + syntax.width() as u16
+                + wrap.width() as u16
+                + 2,
+        );
         let path = truncate(&path, path_max as usize);
         (
             vec![
@@ -1248,6 +1395,7 @@ impl App {
                 ),
                 Span::raw(format!(" {path} ")),
                 Span::styled(syntax, Style::default().fg(Color::DarkGray)),
+                Span::styled(wrap, Style::default().fg(Color::Cyan)),
                 Span::styled(
                     dirty,
                     if self.buffer.dirty {
@@ -2164,6 +2312,93 @@ mod tests {
         let rows = render(&mut app);
         assert!(row_contains(&rows, "line 199"));
         assert!(!row_contains(&rows, "line 000"));
+    }
+
+    // ---- wrapping ----------------------------------------------------------
+
+    #[test]
+    fn ctrl_w_toggles_wrap() {
+        let dir = scratch("wrap1");
+        let file = dir.join("a.txt");
+        fs::write(&file, "some content\n").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        assert!(!app.buffer.wrap);
+
+        app.handle_key(ctrl('w'));
+        assert!(app.buffer.wrap);
+        assert!(app.message.is_some());
+
+        app.handle_key(ctrl('w'));
+        assert!(!app.buffer.wrap);
+    }
+
+    #[test]
+    fn wrapped_long_line_renders_across_rows() {
+        let dir = scratch("wrap2");
+        let file = dir.join("a.txt");
+        // 140-col test terminal: 28 sidebar + 2 borders -> 108 text cols
+        let line = "x".repeat(250);
+        fs::write(&file, format!("{line}\n")).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        app.handle_key(ctrl('w'));
+        app.message = None; // let the wrap indicator show
+        let rows = render(&mut app);
+
+        // the line wraps onto three visual rows: the line number only on
+        // the first, a blank gutter on the continuations (cols 29..31 are
+        // the editor gutter; border chars are multi-byte, so slice chars)
+        let gutter = |row: &str| -> String { row.chars().skip(29).take(2).collect() };
+        assert_eq!(gutter(&rows[1]), "1 ");
+        assert_eq!(gutter(&rows[2]), "  ");
+        assert_eq!(gutter(&rows[3]), "  ");
+        assert!(row_contains(&rows, &"x".repeat(108)));
+        // the status bar shows the persistent wrap indicator
+        assert!(rows[23].contains("wrap ○"));
+
+        // back to no wrapping: one line per row, no indicator
+        app.handle_key(ctrl('w'));
+        app.message = None;
+        let rows = render(&mut app);
+        assert_eq!(gutter(&rows[1]), "1 ");
+        assert_eq!(gutter(&rows[2]), "2 ");
+        assert!(!rows[23].contains("wrap ○"));
+    }
+
+    #[test]
+    fn wrapped_mouse_click_maps_to_visual_rows() {
+        let dir = scratch("wrap3");
+        let file = dir.join("a.txt");
+        let line = "x".repeat(250);
+        fs::write(&file, format!("{line}\n")).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        app.handle_key(ctrl('w'));
+        render_buffer(&mut app); // sets viewport and wrap width
+
+        // terminal col 36 = text col 5 on the second visual row (char 113)
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 36, 2));
+        assert_eq!(app.buffer.cursor, (113, 0));
+
+        // gutter of the third visual row lands at its start (char 216)
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 31, 3));
+        assert_eq!(app.buffer.cursor, (216, 0));
+    }
+
+    #[test]
+    fn wrapped_caret_renders_on_the_cursor_row() {
+        let dir = scratch("wrap4");
+        let file = dir.join("a.txt");
+        let line = "x".repeat(250);
+        fs::write(&file, format!("{line}\n")).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        app.handle_key(ctrl('w'));
+        render_buffer(&mut app);
+
+        // cursor on the second visual row: char 110 is col 2 of it
+        app.buffer.cursor = (110, 0);
+        let buf = render_buffer(&mut app);
+        let cell = buf.cell((33, 2)).unwrap();
+        assert_eq!(cell.symbol(), "x");
+        assert_eq!(cell.style().bg, Some(Color::Yellow));
     }
 
     // ---- mouse -------------------------------------------------------------

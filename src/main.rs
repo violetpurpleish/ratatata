@@ -301,6 +301,7 @@ fn print_usage() {
          \x20 Ctrl+C/X/V  copy / cut / paste\n\
          \x20 Ctrl+A   select all\n\
          \x20 Ctrl+F   search (type to filter, Enter/Shift+Enter next/prev, Esc closes)\n\
+         \x20 Ctrl+W   toggle soft wrapping of long lines\n\
          \x20 Ctrl+Q   quit\n\
          \x20 mouse:    click editor to move the cursor, drag to select, double-click\n\
          \x20            selects a word, triple-click selects the line, scroll to move,\n\

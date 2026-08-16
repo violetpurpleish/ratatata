@@ -57,6 +57,100 @@ fn remove_indent_unit(line: &mut String) -> usize {
     n
 }
 
+// ---- soft wrapping --------------------------------------------------------
+//
+// With wrapping enabled every logical line is split into *visual rows* of
+// at most `width` terminal columns, never splitting a wide (CJK etc.)
+// character across rows. A visual row is a char range `[start, end)` of
+// its logical line; `scroll.y` then counts visual rows instead of lines.
+
+/// Char index where the visual row starting at char `start` of `line`
+/// ends (exclusive): the largest index whose display width fits in
+/// `width` columns. A single character wider than `width` is kept whole
+/// on its own row (it overflows, but is never split).
+fn chunk_end(line: &str, start: usize, width: usize) -> usize {
+    let width = width.max(1);
+    let mut w = 0;
+    for (i, c) in line.chars().enumerate().skip(start) {
+        let cw = c.width().unwrap_or(0);
+        if w + cw > width {
+            // the next char starts a new row; if even the first char
+            // does not fit, keep it on this row anyway
+            return if w == 0 { i + 1 } else { i };
+        }
+        w += cw;
+    }
+    line.chars().count()
+}
+
+/// Iterator over the visual rows of `line` at `width` columns, yielding
+/// `(start_char, end_char)` ranges. An empty line is a single empty row.
+pub(crate) struct VisualChunks<'a> {
+    line: &'a str,
+    width: usize,
+    start: usize,
+    done: bool,
+}
+
+impl Iterator for VisualChunks<'_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<(usize, usize)> {
+        if self.done {
+            return None;
+        }
+        let len = self.line.chars().count();
+        let start = self.start;
+        if start == len {
+            self.done = true;
+            return Some((start, start));
+        }
+        let end = chunk_end(self.line, start, self.width);
+        self.start = end;
+        if end >= len {
+            self.done = true;
+        }
+        Some((start, end))
+    }
+}
+
+/// The visual rows of `line` at `width` columns, as char ranges.
+pub(crate) fn visual_chunks(line: &str, width: usize) -> VisualChunks<'_> {
+    VisualChunks {
+        line,
+        width: width.max(1),
+        start: 0,
+        done: false,
+    }
+}
+
+/// How many visual rows `line` takes at `width` columns (1 when it
+/// fits, including empty lines).
+pub(crate) fn visual_len(line: &str, width: usize) -> usize {
+    visual_chunks(line, width).count()
+}
+
+/// Char range `[start, end)` of the `k`-th visual row (0-based) of
+/// `line` at `width` columns. Past the end the last row is repeated.
+pub(crate) fn visual_chunk(line: &str, k: usize, width: usize) -> (usize, usize) {
+    visual_chunks(line, width)
+        .nth(k)
+        .unwrap_or((char_count(line), char_count(line)))
+}
+
+/// Index of the visual row of `line` that contains char `x` (the last
+/// row when `x` is past the end of the line).
+pub(crate) fn visual_row_of(line: &str, x: usize, width: usize) -> usize {
+    let mut row = 0;
+    for (_, end) in visual_chunks(line, width) {
+        if x < end {
+            return row;
+        }
+        row += 1;
+    }
+    row.saturating_sub(1)
+}
+
 /// Maximum number of undo steps kept in memory (bounded history).
 const MAX_UNDO: usize = 1000;
 
@@ -96,8 +190,16 @@ pub struct Buffer {
     pub lines: Vec<String>,
     /// Cursor position: `(x, y)` where `x` is a char index.
     pub cursor: (usize, usize),
-    /// Scroll offset: `(x, y)` where `x` is a char index.
+    /// Scroll offset: `(x, y)`. Without wrapping `y` is a logical line
+    /// and `x` a char index; with wrapping `y` is a *visual* row (wrapped
+    /// lines occupy several) and `x` is kept at 0.
     pub scroll: (usize, usize),
+    /// Soft-wrap long lines at this many columns. `0` (or `wrap == false`)
+    /// means no wrapping; the app refreshes this from the terminal width
+    /// on every draw, so a resize re-wraps without any user action.
+    pub wrap_width: usize,
+    /// Whether long lines soft-wrap instead of scrolling horizontally.
+    pub wrap: bool,
     /// File this buffer is bound to, if any.
     pub path: Option<PathBuf>,
     /// Whether the buffer has unsaved changes.
@@ -139,6 +241,8 @@ impl Buffer {
             lines: vec![String::new()],
             cursor: (0, 0),
             scroll: (0, 0),
+            wrap_width: 0,
+            wrap: false,
             path: None,
             dirty: false,
             clean_lines: vec![String::new()],
@@ -752,8 +856,61 @@ impl Buffer {
 
     // ---- cursor movement ---------------------------------------------------
 
+    /// Move the cursor up one visual row. With wrapping, moving up from a
+    /// continuation row stays on the same logical line (the previous row);
+    /// at the top of a wrapped line it moves to the previous line's last
+    /// row. `x` is clamped into the target row.
+    pub fn move_up(&mut self) {
+        self.break_chain();
+        if self.wrap {
+            let width = self.wrap_width.max(1);
+            let (x, y) = self.cursor;
+            let row = visual_row_of(&self.lines[y], x, width);
+            if row > 0 {
+                let (start, end) = visual_chunk(&self.lines[y], row - 1, width);
+                self.cursor = (x.clamp(start, end), y);
+            } else if y > 0 {
+                self.cursor.1 -= 1;
+                self.clamp_x();
+            }
+            return;
+        }
+        if self.cursor.1 > 0 {
+            self.cursor.1 -= 1;
+            self.clamp_x();
+        }
+    }
+
+    /// Move the cursor down one visual row. With wrapping, moving down
+    /// from the last row of a wrapped line moves to the next logical
+    /// line; otherwise it stays on the same line (the next row). `x` is
+    /// clamped into the target row.
+    pub fn move_down(&mut self) {
+        self.break_chain();
+        if self.wrap {
+            let width = self.wrap_width.max(1);
+            let (x, y) = self.cursor;
+            let row = visual_row_of(&self.lines[y], x, width);
+            if row + 1 < visual_len(&self.lines[y], width) {
+                let (start, end) = visual_chunk(&self.lines[y], row + 1, width);
+                self.cursor = (x.clamp(start, end), y);
+            } else if y + 1 < self.lines.len() {
+                self.cursor.1 += 1;
+                self.clamp_x();
+            }
+            return;
+        }
+        if self.cursor.1 + 1 < self.lines.len() {
+            self.cursor.1 += 1;
+            self.clamp_x();
+        }
+    }
+
     pub fn move_left(&mut self) {
         self.break_chain();
+        // Character movement is already visual-row-correct: the caret sits
+        // on a char, and the char before the first char of a wrapped row is
+        // the last char of the previous row.
         if self.cursor.0 > 0 {
             self.cursor.0 -= 1;
         } else if self.cursor.1 > 0 {
@@ -773,59 +930,168 @@ impl Buffer {
         }
     }
 
-    pub fn move_up(&mut self) {
-        self.break_chain();
-        if self.cursor.1 > 0 {
-            self.cursor.1 -= 1;
-            self.clamp_x();
-        }
-    }
-
-    pub fn move_down(&mut self) {
-        self.break_chain();
-        if self.cursor.1 + 1 < self.lines.len() {
-            self.cursor.1 += 1;
-            self.clamp_x();
-        }
-    }
-
     pub fn home(&mut self) {
         self.break_chain();
+        if self.wrap {
+            let width = self.wrap_width.max(1);
+            let (x, y) = self.cursor;
+            let row = visual_row_of(&self.lines[y], x, width);
+            let (start, _) = visual_chunk(&self.lines[y], row, width);
+            self.cursor.0 = start;
+            return;
+        }
         self.cursor.0 = 0;
     }
 
     pub fn end(&mut self) {
         self.break_chain();
+        if self.wrap {
+            let width = self.wrap_width.max(1);
+            let (x, y) = self.cursor;
+            let row = visual_row_of(&self.lines[y], x, width);
+            let (_, end) = visual_chunk(&self.lines[y], row, width);
+            self.cursor.0 = end;
+            return;
+        }
         self.cursor.0 = self.line_len(self.cursor.1);
     }
 
     pub fn page_up(&mut self, rows: usize) {
         self.break_chain();
-        if rows > 0 {
-            self.cursor.1 = self.cursor.1.saturating_sub(rows);
-            self.clamp_x();
+        if rows == 0 {
+            return;
         }
+        if self.wrap {
+            let width = self.wrap_width.max(1);
+            let vrow = self.cursor_vrow().saturating_sub(rows);
+            if let Some((y, k)) = self.vrow_position(vrow) {
+                let (start, end) = visual_chunk(&self.lines[y], k, width);
+                self.cursor = (self.cursor.0.clamp(start, end), y);
+            }
+            return;
+        }
+        self.cursor.1 = self.cursor.1.saturating_sub(rows);
+        self.clamp_x();
     }
 
     pub fn page_down(&mut self, rows: usize) {
         self.break_chain();
-        if rows > 0 {
-            let last = self.lines.len() - 1;
-            self.cursor.1 = (self.cursor.1 + rows).min(last);
-            self.clamp_x();
+        if rows == 0 {
+            return;
         }
+        if self.wrap {
+            let width = self.wrap_width.max(1);
+            let vrow = (self.cursor_vrow() + rows).min(self.total_visual_rows().saturating_sub(1));
+            if let Some((y, k)) = self.vrow_position(vrow) {
+                let (start, end) = visual_chunk(&self.lines[y], k, width);
+                self.cursor = (self.cursor.0.clamp(start, end), y);
+            }
+            return;
+        }
+        let last = self.lines.len() - 1;
+        self.cursor.1 = (self.cursor.1 + rows).min(last);
+        self.clamp_x();
+    }
+
+    // ---- soft wrapping -----------------------------------------------------
+
+    /// Toggle soft wrapping of long lines and return the new state.
+    /// `width` is the terminal column width to wrap at (the app refreshes
+    /// it on every draw, so the value only matters until then). When
+    /// leaving wrap mode the viewport is mapped back from visual rows to
+    /// logical lines so it does not jump past the end of the buffer.
+    pub fn toggle_wrap(&mut self, width: usize) -> bool {
+        if self.wrap {
+            let last = self.lines.len().saturating_sub(1);
+            let line = self
+                .vrow_position(self.scroll.1)
+                .map(|(y, _)| y)
+                .unwrap_or(last);
+            self.scroll.1 = line.min(last);
+            self.wrap = false;
+        } else {
+            self.wrap_width = width.max(1);
+            // horizontal scrolling is meaningless while wrapping: the
+            // caret column math assumes scroll.x == 0
+            self.scroll.0 = 0;
+            self.wrap = true;
+        }
+        self.wrap
+    }
+
+    /// Visual row (0-based) of the cursor: with wrapping, its row within
+    /// its line plus the rows of all preceding lines; without wrapping,
+    /// simply its line number.
+    pub fn cursor_vrow(&self) -> usize {
+        if !self.wrap {
+            return self.cursor.1;
+        }
+        let width = self.wrap_width.max(1);
+        let mut vrow = 0;
+        for (y, line) in self.lines.iter().enumerate() {
+            if y == self.cursor.1 {
+                return vrow + visual_row_of(line, self.cursor.0, width);
+            }
+            vrow += visual_len(line, width);
+        }
+        vrow
+    }
+
+    /// `(logical line, chunk index)` of the visual row `vrow`, or `None`
+    /// past the end of the buffer. Without wrapping the chunk index is
+    /// always 0.
+    pub fn vrow_position(&self, vrow: usize) -> Option<(usize, usize)> {
+        let width = self.wrap_width.max(1);
+        let mut remaining = vrow;
+        for (y, line) in self.lines.iter().enumerate() {
+            let n = if self.wrap {
+                visual_len(line, width)
+            } else {
+                1
+            };
+            if remaining < n {
+                return Some((y, if self.wrap { remaining } else { 0 }));
+            }
+            remaining -= n;
+        }
+        None
+    }
+
+    /// How many visual rows the whole buffer takes at the current wrap
+    /// width (the line count when wrapping is off).
+    pub fn total_visual_rows(&self) -> usize {
+        if !self.wrap {
+            return self.lines.len();
+        }
+        let width = self.wrap_width.max(1);
+        self.lines.iter().map(|l| visual_len(l, width)).sum()
     }
 
     // ---- scrolling / rendering --------------------------------------------
 
     /// Scroll so the cursor is inside the visible viewport
-    /// (`view_w` x `view_h` chars).
+    /// (`view_w` x `view_h` chars). With wrapping `scroll.y` is a visual
+    /// row and `view_h` counts rows; without wrapping it is a logical
+    /// line and `view_w` is the horizontal window.
     pub fn ensure_visible(&mut self, view_h: usize, view_w: usize) {
         // guard against an out-of-range cursor (shouldn't happen through
         // normal movement, which clamps)
         self.clamp_x();
         if self.cursor.1 >= self.lines.len() {
             self.cursor.1 = self.lines.len() - 1;
+        }
+        if self.wrap {
+            let cv = self.cursor_vrow();
+            if cv < self.scroll.1 {
+                self.scroll.1 = cv;
+            }
+            if cv >= self.scroll.1 + view_h {
+                self.scroll.1 = cv.saturating_add(1).saturating_sub(view_h);
+            }
+            // horizontal scrolling is meaningless while wrapping; keep
+            // scroll.x at 0 so the caret column math is not offset
+            self.scroll.0 = 0;
+            return;
         }
         if self.cursor.1 < self.scroll.1 {
             self.scroll.1 = self.cursor.1;
@@ -842,9 +1108,21 @@ impl Buffer {
     }
 
     /// Terminal column of the cursor relative to the visible slice,
-    /// accounting for wide (CJK etc.) characters.
+    /// accounting for wide (CJK etc.) characters. With wrapping this is
+    /// the column within the cursor's visual row.
     pub fn cursor_col(&self) -> usize {
         let line = &self.lines[self.cursor.1];
+        if self.wrap {
+            let width = self.wrap_width.max(1);
+            let row = visual_row_of(line, self.cursor.0, width);
+            let (start, _) = visual_chunk(line, row, width);
+            return line
+                .chars()
+                .skip(start)
+                .take(self.cursor.0 - start)
+                .map(|c| c.width().unwrap_or(0))
+                .sum();
+        }
         let to_cursor: usize = line
             .chars()
             .take(self.cursor.0)
@@ -1163,6 +1441,201 @@ mod tests {
         assert_eq!(b.cursor.1, 5);
         b.page_up(100);
         assert_eq!(b.cursor.1, 0);
+    }
+
+    // ---- soft wrapping -----------------------------------------------------
+
+    #[test]
+    fn chunks_respect_width_and_never_split_wide_chars() {
+        // ASCII: rows of at most `width` columns
+        let rows: Vec<(usize, usize)> = visual_chunks("abcdefgh", 4).collect();
+        assert_eq!(rows, vec![(0, 4), (4, 8)]);
+        // wide chars count double: "日本語" is 6 columns, so at width 4
+        // two wide chars fit per row and the third starts the next
+        let rows: Vec<(usize, usize)> = visual_chunks("日本語", 4).collect();
+        assert_eq!(rows, vec![(0, 2), (2, 3)]);
+        // a single char wider than the width is kept whole, never split
+        let rows: Vec<(usize, usize)> = visual_chunks("日x", 1).collect();
+        assert_eq!(rows, vec![(0, 1), (1, 2)]);
+        // an empty line is a single empty row
+        assert_eq!(visual_chunks("", 10).collect::<Vec<_>>(), vec![(0, 0)]);
+        assert_eq!(visual_len("", 10), 1);
+        // a zero width degenerates to single-char rows instead of looping
+        assert_eq!(visual_chunks("abc", 0).count(), 3);
+    }
+
+    #[test]
+    fn wrapped_up_down_follow_visual_rows() {
+        let mut b = empty();
+        typed(&mut b, "abcdef");
+        b.newline();
+        typed(&mut b, "xyz");
+        b.toggle_wrap(4);
+        // visual rows: "abcd" / "ef" / "xyz"
+
+        // down from the first row lands on the second row of the same line
+        b.cursor = (2, 0);
+        b.move_down();
+        assert_eq!(b.cursor, (4, 0));
+        // down from the last row moves to the next line (x clamped)
+        b.move_down();
+        assert_eq!(b.cursor, (3, 1));
+        // up from a following line goes to the previous line (x clamped)
+        b.move_up();
+        assert_eq!(b.cursor, (3, 0));
+        // at the top row of a line nothing moves
+        b.move_up();
+        assert_eq!(b.cursor, (3, 0));
+        // from a continuation row, up goes to the previous row of the
+        // same line (x clamped into it)
+        b.cursor = (5, 0);
+        b.move_up();
+        assert_eq!(b.cursor, (4, 0));
+    }
+
+    #[test]
+    fn wrapped_left_right_cross_visual_rows() {
+        let mut b = empty();
+        typed(&mut b, "abcdef");
+        b.toggle_wrap(4);
+        // at the end of a visual row, right moves onto the next row's
+        // first char; left moves back
+        b.cursor = (3, 0);
+        b.move_right();
+        assert_eq!(b.cursor, (4, 0));
+        b.move_left();
+        assert_eq!(b.cursor, (3, 0));
+        // at the start of a continuation row, left goes to the previous
+        // row's last char (plain char movement crosses the wrap point)
+        b.cursor = (5, 0);
+        b.move_left();
+        assert_eq!(b.cursor, (4, 0));
+    }
+
+    #[test]
+    fn wrapped_home_end_are_visual() {
+        let mut b = empty();
+        typed(&mut b, "abcdef");
+        b.toggle_wrap(4);
+        // Home lands at the start of the visual row, not the line
+        b.cursor = (5, 0);
+        b.home();
+        assert_eq!(b.cursor, (4, 0));
+        b.end();
+        assert_eq!(b.cursor, (6, 0));
+        // End stops at the end of the visual row on the first row
+        b.cursor = (1, 0);
+        b.end();
+        assert_eq!(b.cursor, (4, 0));
+        // Home from the row boundary stays at the boundary: it is the
+        // start of the second visual row
+        b.home();
+        assert_eq!(b.cursor, (4, 0));
+        b.home();
+        assert_eq!(b.cursor, (4, 0));
+    }
+
+    #[test]
+    fn wrapped_page_moves_by_visual_rows() {
+        let mut b = empty();
+        typed(&mut b, "abcdefghij"); // 2 rows at width 5
+        b.newline();
+        typed(&mut b, "xyz");
+        b.toggle_wrap(5);
+        b.cursor = (0, 0);
+        // one page down: the second row of the same line
+        b.page_down(1);
+        assert_eq!(b.cursor, (5, 0));
+        // another: the next line (x clamps into the shorter row)
+        b.page_down(1);
+        assert_eq!(b.cursor, (3, 1));
+        b.page_up(1);
+        assert_eq!(b.cursor, (5, 0));
+        b.page_up(10);
+        assert_eq!(b.cursor, (5, 0)); // clamped to the top row
+        b.page_down(100);
+        assert_eq!(b.cursor, (3, 1)); // clamped to the last row
+    }
+
+    #[test]
+    fn wrapped_ensure_visible_scrolls_visual_rows() {
+        let mut b = empty();
+        typed(&mut b, "abcdefghij"); // 2 rows at width 5
+        for _ in 0..3 {
+            b.newline();
+            typed(&mut b, "k");
+        }
+        // visual rows: line 0 -> 2 rows, lines 1..=3 -> 1 row each
+        b.toggle_wrap(5);
+        // cursor vrow 5 with a 2-row viewport scrolls to vrow 3
+        b.cursor = (0, 3);
+        b.ensure_visible(2, 5);
+        assert_eq!(b.scroll.1, 3);
+        assert_eq!(b.scroll.0, 0); // horizontal scroll is meaningless
+        // a cursor on the second row of a wrapped line scrolls to it
+        b.cursor = (7, 0);
+        b.ensure_visible(1, 5);
+        assert_eq!(b.scroll.1, 1);
+        b.cursor = (0, 0);
+        b.ensure_visible(2, 5);
+        assert_eq!(b.scroll.1, 0);
+    }
+
+    #[test]
+    fn toggle_wrap_round_trips_and_maps_scroll() {
+        let mut b = empty();
+        typed(&mut b, "abcdefghij"); // 2 rows at width 5
+        b.newline();
+        typed(&mut b, "xyz");
+        b.toggle_wrap(5);
+        assert!(b.wrap);
+        assert_eq!(b.scroll.0, 0);
+        // scroll to the last visual row (line 1), then leave wrap mode:
+        // the viewport maps back to the logical line it starts on
+        b.scroll.1 = 2;
+        b.toggle_wrap(5);
+        assert!(!b.wrap);
+        assert_eq!(b.scroll.1, 1);
+        b.toggle_wrap(5);
+        assert!(b.wrap);
+        assert_eq!(b.scroll.0, 0);
+    }
+
+    #[test]
+    fn wrapped_cursor_col_is_within_the_visual_row() {
+        let mut b = empty();
+        typed(&mut b, "日本語"); // 6 columns
+        b.toggle_wrap(4); // rows: "日本" (4 cols) | "語" (2 cols)
+        b.cursor = (0, 0);
+        assert_eq!(b.cursor_col(), 0);
+        b.cursor = (1, 0);
+        assert_eq!(b.cursor_col(), 2);
+        b.cursor = (2, 0);
+        assert_eq!(b.cursor_col(), 0); // start of the wrapped row
+        b.cursor = (3, 0);
+        assert_eq!(b.cursor_col(), 2); // end of the wrapped row
+    }
+
+    #[test]
+    fn vrow_mapping_and_total_rows() {
+        let mut b = empty();
+        typed(&mut b, "abcdefghij"); // 2 rows at width 5
+        b.newline();
+        typed(&mut b, "xyz");
+        b.toggle_wrap(5);
+        b.cursor = (0, 0);
+        assert_eq!(b.total_visual_rows(), 3);
+        assert_eq!(b.cursor_vrow(), 0);
+        assert_eq!(b.vrow_position(0), Some((0, 0)));
+        assert_eq!(b.vrow_position(1), Some((0, 1)));
+        assert_eq!(b.vrow_position(2), Some((1, 0)));
+        assert_eq!(b.vrow_position(3), None);
+        b.cursor = (7, 0);
+        assert_eq!(b.cursor_vrow(), 1);
+        // without wrapping, vrows are plain line numbers
+        b.toggle_wrap(5);
+        assert_eq!(b.total_visual_rows(), 2);
+        assert_eq!(b.vrow_position(1), Some((1, 0)));
     }
 
     // ---- save / load round trips ------------------------------------------
