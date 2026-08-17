@@ -15,7 +15,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -104,12 +104,28 @@ fn enable_terminal_capabilities() -> io::Result<()> {
 }
 
 fn disable_terminal_capabilities() -> io::Result<()> {
-    execute!(
-        io::stdout(),
-        PopKeyboardEnhancementFlags,
-        DisableBracketedPaste,
-        DisableMouseCapture
-    )
+    // Try every mode independently. On platforms where one command is not
+    // supported, executing the commands as one crossterm batch would stop at
+    // that command and could leave mouse capture enabled.
+    let mut stdout = io::stdout();
+    let mut first_error = None;
+
+    for result in [
+        execute!(&mut stdout, PopKeyboardEnhancementFlags),
+        execute!(&mut stdout, DisableBracketedPaste),
+        execute!(&mut stdout, DisableMouseCapture),
+    ] {
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Return the terminal to the shell without leaving input generated while
@@ -126,10 +142,32 @@ fn restore_terminal() {
 /// tracking first, then let crossterm consume everything that was queued while
 /// the application still owned the terminal. This must happen before raw mode
 /// is disabled by [`ratatui::restore`].
+///
+/// The grace period is intentional. A mouse click on the Quit button causes
+/// the app to exit on the button-down report, while the terminal may still
+/// send the matching button-up report. Also, crossterm's zero-duration poll
+/// does not reliably inspect events already buffered in its parser. Keep raw
+/// mode enabled and use short, positive polls so both cases are consumed
+/// before the shell gets control of stdin again.
 fn drain_pending_events() {
-    while let Ok(true) = event::poll(Duration::ZERO) {
-        if event::read().is_err() {
+    const DRAIN_WINDOW: Duration = Duration::from_millis(50);
+    const POLL_INTERVAL: Duration = Duration::from_millis(5);
+    let deadline = Instant::now() + DRAIN_WINDOW;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             break;
+        }
+
+        match event::poll(remaining.min(POLL_INTERVAL)) {
+            Ok(true) => {
+                if event::read().is_err() {
+                    break;
+                }
+            }
+            Ok(false) => {}
+            Err(_) => break,
         }
     }
 }
