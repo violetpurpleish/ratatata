@@ -29,6 +29,16 @@ use ratatui_image::picker::Picker;
 
 use app::App;
 
+/// Restores terminal state when the application exits, including during panic
+/// unwinding.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -50,6 +60,8 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
     };
+    let _terminal_guard = TerminalGuard;
+
     if let Err(e) = enable_terminal_capabilities() {
         eprintln!("warning: cannot enable mouse/paste support: {e}");
     }
@@ -59,17 +71,8 @@ fn main() -> io::Result<()> {
     // half-blocks. Must run after entering the alternate screen but before
     // the event loop reads input (it briefly reads stdin itself).
     let (picker, logical_cell_size) = detect_image_picker();
-    let mut app = match App::new_with_cell_size(dir, file, picker, logical_cell_size) {
-        Ok(app) => app,
-        Err(e) => {
-            restore_terminal();
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    };
-    let result = run(&mut app, &mut terminal);
-    restore_terminal();
-    result
+    let mut app = App::new_with_cell_size(dir, file, picker, logical_cell_size)?;
+    run(&mut app, &mut terminal)
 }
 
 /// Mouse capture, bracketed paste, and the kitty keyboard protocol.
