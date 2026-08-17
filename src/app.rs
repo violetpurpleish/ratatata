@@ -30,7 +30,7 @@ use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, Scroll
 use ratatui_themes::{Theme, ThemeName, ThemePalette};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::buffer::{Buffer, visual_chunk, visual_row_of};
+use crate::buffer::{Buffer, char_width, expand_tabs, visual_chunk, visual_row_of};
 use crate::clipboard::{Clipboard, SystemClipboard};
 use crate::highlight::Highlighter;
 use crate::image_view::{self, ImagePreview};
@@ -1492,7 +1492,16 @@ impl App {
                             .lines
                             .get(self.buffer.cursor.1)
                             .and_then(|line| line.chars().nth(self.buffer.cursor.0))
-                            .map_or_else(|| " ".to_string(), |c| c.to_string());
+                            .map_or_else(
+                                || " ".to_string(),
+                                |c| {
+                                    if c == '\t' {
+                                        " ".to_string()
+                                    } else {
+                                        c.to_string()
+                                    }
+                                },
+                            );
                         let caret = Paragraph::new(Span::styled(
                             symbol,
                             caret_style.unwrap_or_default().bg(PALETTE.warning),
@@ -1583,7 +1592,16 @@ impl App {
                         .lines
                         .get(self.buffer.cursor.1)
                         .and_then(|line| line.chars().nth(self.buffer.cursor.0))
-                        .map_or_else(|| " ".to_string(), |c| c.to_string());
+                        .map_or_else(
+                            || " ".to_string(),
+                            |c| {
+                                if c == '\t' {
+                                    " ".to_string()
+                                } else {
+                                    c.to_string()
+                                }
+                            },
+                        );
                     let caret = Paragraph::new(Span::styled(
                         symbol,
                         caret_style.unwrap_or_default().bg(PALETTE.warning),
@@ -2011,7 +2029,7 @@ fn char_at_col(s: &str, col: usize) -> usize {
         if width >= col {
             return i;
         }
-        width += c.width().unwrap_or(0);
+        width += char_width(c);
     }
     s.chars().count()
 }
@@ -2104,7 +2122,7 @@ fn clip_ops<'a>(
                 }
                 style = style.bg(PALETTE.selection);
             }
-            let text = &line[ca..cb];
+            let text = expand_tabs(&line[ca..cb]);
             if style == Style::default() {
                 out.push(Span::raw(text));
             } else {
@@ -3099,6 +3117,34 @@ mod tests {
             }
             assert_eq!(cell.style().fg, Some(Color::Reset), "col {x}");
         }
+    }
+
+    #[test]
+    fn renders_tab_indentation_in_plain_text_files() {
+        let dir = scratch("tabindent-render");
+        let file = dir.join("actions.coffee");
+        fs::write(
+            &file,
+            "GLOBALS.actions =\n\t\"conversation\": (focused) ->\n",
+        )
+        .unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        let buf = render_buffer(&mut app);
+
+        // Ratatui skips literal tab control characters. The editor keeps the
+        // tab in its buffer, but expands it for display so unsupported files
+        // retain their indentation.
+        for x in 31..35 {
+            assert_eq!(buf.cell((x, 4)).unwrap().symbol(), " ", "column {x}");
+        }
+        assert_eq!(buf.cell((35, 4)).unwrap().symbol(), "\"");
+
+        // The logical cursor is still before the tab. Its one-cell caret
+        // must use a printable placeholder too, rather than a raw tab.
+        app.buffer.cursor = (0, 1);
+        let buf = render_buffer(&mut app);
+        assert_eq!(buf.cell((31, 4)).unwrap().symbol(), " ");
+        assert_eq!(buf.cell((31, 4)).unwrap().style().bg, Some(PALETTE.warning));
     }
 
     #[test]

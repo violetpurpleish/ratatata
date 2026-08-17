@@ -3,6 +3,7 @@
 //! The cursor `x` coordinate is a *char index* into the line (not a byte
 //! offset), so unicode text is handled without panicking.
 
+use std::borrow::Cow;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -24,6 +25,30 @@ fn char_count(s: &str) -> usize {
 
 /// One level of indentation (Tab inserts this many spaces).
 const INDENT_UNIT: &str = "    ";
+/// Number of columns used when displaying a tab character.
+pub(crate) const TAB_WIDTH: usize = INDENT_UNIT.len();
+
+/// Width of a character in the editor's rendered text.
+///
+/// Ratatui deliberately skips control characters when writing a buffer, so a
+/// literal tab would otherwise occupy no columns. Keep tabs in the editable
+/// buffer, but render and lay them out as one regular indentation unit.
+pub(crate) fn char_width(c: char) -> usize {
+    if c == '\t' {
+        TAB_WIDTH
+    } else {
+        c.width().unwrap_or(0)
+    }
+}
+
+/// Replace tabs with their visible indentation while borrowing tab-free text.
+pub(crate) fn expand_tabs(s: &str) -> Cow<'_, str> {
+    if s.contains('\t') {
+        Cow::Owned(s.replace('\t', &" ".repeat(TAB_WIDTH)))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
 
 /// The leading run of spaces/tabs of `s` (the line's indentation).
 fn leading_whitespace(s: &str) -> &str {
@@ -79,7 +104,7 @@ fn chunk_end(line: &str, start: usize, width: usize) -> usize {
     let width = width.max(1);
     let mut w = 0;
     for (i, c) in line.chars().enumerate().skip(start) {
-        let cw = c.width().unwrap_or(0);
+        let cw = char_width(c);
         if w + cw > width {
             // the next char starts a new row; if even the first char
             // does not fit, keep it on this row anyway
@@ -1263,19 +1288,11 @@ impl Buffer {
                 .chars()
                 .skip(start)
                 .take(self.cursor.0 - start)
-                .map(|c| c.width().unwrap_or(0))
+                .map(char_width)
                 .sum();
         }
-        let to_cursor: usize = line
-            .chars()
-            .take(self.cursor.0)
-            .map(|c| c.width().unwrap_or(0))
-            .sum();
-        let to_scroll: usize = line
-            .chars()
-            .take(self.scroll.0)
-            .map(|c| c.width().unwrap_or(0))
-            .sum();
+        let to_cursor: usize = line.chars().take(self.cursor.0).map(char_width).sum();
+        let to_scroll: usize = line.chars().take(self.scroll.0).map(char_width).sum();
         to_cursor.saturating_sub(to_scroll)
     }
 }
@@ -1532,6 +1549,20 @@ mod tests {
         b.move_right();
         b.insert_char('x');
         assert_eq!(b.lines, vec!["axé"]);
+    }
+
+    #[test]
+    fn tabs_have_editor_width_without_changing_buffer_text() {
+        assert_eq!(expand_tabs("\t\tcode"), "        code");
+        assert_eq!(char_width('\t'), TAB_WIDTH);
+
+        let mut b = empty();
+        b.lines = vec!["\t\tcode".to_string()];
+        b.cursor = (1, 0);
+        assert_eq!(b.cursor_col(), TAB_WIDTH);
+        b.cursor = (2, 0);
+        assert_eq!(b.cursor_col(), TAB_WIDTH * 2);
+        assert_eq!(b.lines[0], "\t\tcode");
     }
 
     #[test]
