@@ -362,6 +362,7 @@ fn print_usage() {
          \x20 Ctrl+N   start a new untitled buffer\n\
          \x20 Ctrl+O   switch between sidebar and editor\n\
          \x20 Ctrl+S   save the current file (asks for a name if untitled)\n\
+         \x20 Ctrl+R   reload the current file from disk (refreshes the sidebar too)\n\
          \x20 Ctrl+Z   undo (Ctrl+Shift+Z redo)\n\
          \x20 Ctrl+C/X/V  copy / cut / paste\n\
          \x20 Ctrl+A   select all\n\

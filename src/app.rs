@@ -96,6 +96,7 @@ enum Shortcut {
     Quit,
     SwitchFocus,
     Save,
+    Reload,
     Copy,
     Cut,
     Paste,
@@ -115,7 +116,9 @@ impl Shortcut {
             Shortcut::Quit => "Ctrl+Q",
             Shortcut::SwitchFocus => "Ctrl+O",
             Shortcut::Save => "Ctrl+S",
+            Shortcut::Reload => "Ctrl+R",
             Shortcut::Copy => "Ctrl+C",
+
             Shortcut::Cut => "Ctrl+X",
             Shortcut::Paste => "Ctrl+V",
             Shortcut::SelectAll => "Ctrl+A",
@@ -134,7 +137,9 @@ impl Shortcut {
             Shortcut::Quit => "quit",
             Shortcut::SwitchFocus => "switch",
             Shortcut::Save => "save",
+            Shortcut::Reload => "reload",
             Shortcut::Copy => "copy",
+
             Shortcut::Cut => "cut",
             Shortcut::Paste => "paste",
             Shortcut::SelectAll => "select all",
@@ -154,7 +159,9 @@ impl Shortcut {
             Shortcut::Quit => "quit — press again to confirm unsaved changes",
             Shortcut::SwitchFocus => "switch between sidebar and editor",
             Shortcut::Save => "save the current file (asks for a name if untitled)",
+            Shortcut::Reload => "reload the current file from disk (refuses unsaved changes; sidebar refreshes too)",
             Shortcut::Copy => "copy the selection to the clipboard",
+
             Shortcut::Cut => "cut the selection to the clipboard",
             Shortcut::Paste => "paste from the clipboard",
             Shortcut::SelectAll => "select the whole buffer",
@@ -173,6 +180,7 @@ impl Shortcut {
             Shortcut::Quit => PALETTE.error,
             Shortcut::SwitchFocus => PALETTE.info,
             Shortcut::Save => PALETTE.success,
+            Shortcut::Reload => PALETTE.info,
             Shortcut::Find => PALETTE.warning,
             Shortcut::ToggleWrap => PALETTE.secondary,
             Shortcut::NewFile => PALETTE.accent,
@@ -329,7 +337,9 @@ impl App {
                 KeyCode::Char('q') => Shortcut::Quit,
                 KeyCode::Char('o') => Shortcut::SwitchFocus,
                 KeyCode::Char('s') => Shortcut::Save,
+                KeyCode::Char('r') => Shortcut::Reload,
                 KeyCode::Char('c') => Shortcut::Copy,
+
                 KeyCode::Char('x') => Shortcut::Cut,
                 KeyCode::Char('v') => Shortcut::Paste,
                 KeyCode::Char('a') => Shortcut::SelectAll,
@@ -477,6 +487,9 @@ impl App {
                     self.new_file();
                 }
             }
+            // Reload works while an image preview is open too: it re-reads
+            // the image file from disk.
+            Shortcut::Reload => self.reload_from_disk(),
             // While an image preview is open the remaining shortcuts do
             // nothing: there is no text to edit, save or search. This arm
             // comes after Quit/SwitchFocus/ClosePreview/NewFile (which
@@ -1076,6 +1089,74 @@ impl App {
         }
     }
 
+    /// Re-read the currently open file — the text buffer or the image
+    /// preview — from disk, and refresh the sidebar listing so files that
+    /// were added, removed or renamed show up. The reload is refused while
+    /// the buffer has unsaved changes (they would be lost), but the sidebar
+    /// still refreshes in every case.
+    fn reload_from_disk(&mut self) {
+        let message: Option<String>;
+
+        // an open image preview re-decodes its file
+        let image_path = self.image.as_ref().map(|preview| preview.path.clone());
+        if let Some(path) = image_path {
+            match ImagePreview::open_with_cell_size(
+                path.clone(),
+                &self.picker,
+                self.logical_cell_size,
+            ) {
+                Ok(updated) => {
+                    self.image = Some(updated);
+                    message = Some(format!("reloaded {}", path.display()));
+                }
+                Err(e) => message = Some(format!("cannot reload {}: {e}", path.display())),
+            }
+        } else if self.buffer.dirty {
+            message = Some("unsaved changes — press Ctrl+S to save first".to_string());
+        } else if let Some(path) = self.buffer.path.clone() {
+            // Preserve the viewport, cursor and wrap preference, so the
+            // reload shows the new content where the old one was.
+            let cursor = self.buffer.cursor;
+            let scroll = self.buffer.scroll;
+            let wrap = self.buffer.wrap;
+            let wrap_width = self.buffer.wrap_width;
+            match Buffer::from_path(path.clone()) {
+                Ok(mut buffer) => {
+                    buffer.cursor = cursor;
+                    buffer.scroll = scroll;
+                    if wrap {
+                        buffer.wrap = true;
+                        buffer.wrap_width = wrap_width;
+                    }
+                    self.buffer = buffer;
+                    self.highlighter.set_path(Some(&path));
+                    self.quit_armed = false;
+                    // search matches were computed against the old text
+                    if self.search.is_some() {
+                        self.recompute_search();
+                    }
+                    let (w, h) = self.editor_text;
+                    self.buffer.ensure_visible(h as usize, w as usize);
+                    message = Some(format!("reloaded {}", path.display()));
+                }
+                Err(e) => message = Some(format!("cannot reload {}: {e}", path.display())),
+            }
+        } else {
+            message = Some("no file to reload".to_string());
+        }
+
+        // The sidebar refresh happens even when the file reload was
+        // refused or failed, so external changes always show up in the
+        // listing.
+        if let Err(e) = self.sidebar.reload() {
+            self.set_message(format!("sidebar refresh failed: {e}"));
+            return;
+        }
+        if let Some(msg) = message {
+            self.set_message(msg);
+        }
+    }
+
     // ---- search ------------------------------------------------------------
 
     /// Open the search bar. Ctrl+F while it is already open jumps to the
@@ -1215,6 +1296,7 @@ impl App {
         if self.image.is_some() {
             vec![
                 Shortcut::ClosePreview,
+                Shortcut::Reload,
                 Shortcut::SwitchFocus,
                 Shortcut::Quit,
             ]
@@ -1223,6 +1305,7 @@ impl App {
                 Shortcut::SwitchFocus,
                 Shortcut::NewFile,
                 Shortcut::Save,
+                Shortcut::Reload,
                 Shortcut::Undo,
                 Shortcut::Redo,
                 Shortcut::Copy,
@@ -2849,6 +2932,135 @@ mod tests {
         assert!(app.should_quit);
     }
 
+    // ---- reload (Ctrl+R) ----------------------------------------------------
+
+    #[test]
+    fn ctrl_r_reloads_the_open_file_from_disk() {
+        let dir = scratch("reload1");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha\n").unwrap();
+        let mut app = new_app(dir.clone(), Some(file.clone())).unwrap();
+        assert_eq!(app.buffer.lines, vec!["alpha", ""]);
+        app.buffer.cursor = (2, 0);
+        app.handle_key(ctrl('w')); // wrapping survives the reload
+        assert!(app.buffer.wrap);
+
+        // the file changes on disk (e.g. by another program)
+        fs::write(&file, "beta\ngamma\n").unwrap();
+        app.handle_key(ctrl('r'));
+        assert_eq!(app.buffer.lines, vec!["beta", "gamma", ""]);
+        assert!(!app.buffer.dirty);
+        assert_eq!(app.buffer.path, Some(file));
+        assert!(app.buffer.wrap, "wrapping survives a reload");
+        assert_eq!(app.buffer.cursor, (2, 0));
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn cmd_r_reloads_like_ctrl_r() {
+        let dir = scratch("reloadcmd");
+        let file = dir.join("a.txt");
+        fs::write(&file, "one").unwrap();
+        let mut app = new_app(dir.clone(), Some(file)).unwrap();
+        fs::write(dir.join("a.txt"), "two").unwrap();
+        app.handle_key(cmd('r'));
+        assert_eq!(app.buffer.lines, vec!["two"]);
+    }
+
+    #[test]
+    fn ctrl_r_refuses_unsaved_changes_but_still_refreshes_the_sidebar() {
+        let dir = scratch("reload2");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha\n").unwrap();
+        let mut app = new_app(dir.clone(), Some(file.clone())).unwrap();
+        app.handle_key(char_key('X'));
+        assert!(app.buffer.dirty);
+
+        fs::write(&file, "changed on disk\n").unwrap();
+        fs::write(dir.join("added.txt"), "new\n").unwrap();
+        app.handle_key(ctrl('r'));
+        // the in-memory edit survives; the disk change is not loaded
+        assert_eq!(app.buffer.lines, vec!["Xalpha", ""]);
+        assert_eq!(
+            app.buffer.path.as_ref().unwrap().file_name().unwrap(),
+            "a.txt"
+        );
+        // the sidebar still reflects the external changes
+        assert!(app.sidebar.entries.iter().any(|e| e.name == "added.txt"));
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn ctrl_r_without_a_file_shows_a_message() {
+        let dir = scratch("reload3");
+        let mut app = new_app(dir, None).unwrap();
+        app.handle_key(ctrl('r'));
+        assert_eq!(app.buffer.lines, vec![""]);
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn ctrl_r_reload_failure_keeps_the_buffer_and_refreshes_the_sidebar() {
+        let dir = scratch("reload5");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha\n").unwrap();
+        let mut app = new_app(dir.clone(), Some(file.clone())).unwrap();
+        fs::remove_file(&file).unwrap();
+
+        app.handle_key(ctrl('r'));
+        // the failed reload leaves the buffer as it was...
+        assert_eq!(app.buffer.lines, vec!["alpha", ""]);
+        assert!(!app.buffer.dirty);
+        // ...but the sidebar shows the file is gone
+        assert!(!app.sidebar.entries.iter().any(|e| e.name == "a.txt"));
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn ctrl_r_refreshes_the_sidebar_after_external_changes() {
+        let dir = scratch("reload6");
+        fs::write(dir.join("a.txt"), "x").unwrap();
+        fs::write(dir.join("gone.txt"), "x").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        assert!(app.sidebar.entries.iter().any(|e| e.name == "gone.txt"));
+
+        fs::remove_file(dir.join("gone.txt")).unwrap();
+        fs::write(dir.join("fresh.txt"), "y").unwrap();
+        app.handle_key(ctrl('r'));
+
+        let names: Vec<&str> = app
+            .sidebar
+            .entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(names.contains(&"fresh.txt"));
+        assert!(!names.contains(&"gone.txt"));
+        // the open file itself is unaffected
+        assert_eq!(app.buffer.lines, vec!["x"]);
+    }
+
+    #[test]
+    fn ctrl_r_reloads_the_image_preview() {
+        let dir = scratch("reloadimg");
+        let file = dir.join("pic.png");
+        write_test_png(&file);
+        let mut app = new_app(dir.clone(), Some(file.clone())).unwrap();
+        assert_eq!(app.image.as_ref().unwrap().pixels, (4, 2));
+
+        let mut img = image::RgbImage::new(2, 3);
+        for x in 0..2 {
+            for y in 0..3 {
+                img.put_pixel(x, y, image::Rgb([x as u8 * 100, y as u8 * 80, 0]));
+            }
+        }
+        img.save(&file).unwrap();
+        app.handle_key(ctrl('r'));
+        let preview = app.image.as_ref().unwrap();
+        assert_eq!(preview.pixels, (2, 3));
+        assert_eq!(preview.path, file);
+    }
+
     #[test]
     fn enter_auto_indents() {
         let dir = scratch("autoindent");
@@ -3920,15 +4132,17 @@ mod tests {
         assert!(rows[0].contains("Ctrl+O switch"));
         assert!(rows[0].contains("Ctrl+N new"));
         assert!(rows[1].contains("Ctrl+C copy"));
-        assert!(rows[1].contains("Ctrl+W wrap"));
-        // the overflow button (Ctrl+Q) is dropped with an ellipsis marker
+        assert!(rows[1].contains("Ctrl+F search"));
+        // the overflow buttons (Ctrl+W, Ctrl+Q) are dropped with an
+        // ellipsis marker
         assert!(rows[1].contains("…"));
         assert!(!rows[1].contains("Ctrl+Q"));
+        assert!(!rows[1].contains("Ctrl+W"));
         assert_eq!(app.topbar_area.height, 2);
 
         // clicking a button on the second row still works
-        click_button(&mut app, Shortcut::ToggleWrap);
-        assert!(app.buffer.wrap);
+        click_button(&mut app, Shortcut::Find);
+        assert!(app.search.is_some());
     }
 
     #[test]
@@ -3942,6 +4156,7 @@ mod tests {
             actions,
             vec![
                 Shortcut::ClosePreview,
+                Shortcut::Reload,
                 Shortcut::SwitchFocus,
                 Shortcut::Quit
             ]
@@ -3956,7 +4171,7 @@ mod tests {
         // a second draw shows the full editing button set again
         render_buffer(&mut app);
         let actions: Vec<Shortcut> = app.topbar_buttons.iter().map(|(a, _)| *a).collect();
-        assert_eq!(actions.len(), 11);
+        assert_eq!(actions.len(), 12);
         assert_eq!(actions[0], Shortcut::SwitchFocus);
     }
 

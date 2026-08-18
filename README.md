@@ -41,6 +41,7 @@ Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`
 - **Word wrap** — Ctrl+W wraps long lines at word boundaries (a single unbreakable word still hard-breaks) instead of scrolling horizontally; navigation (arrows, Home/End, PgUp/PgDn, mouse) follows the visual rows, and wrapping re-flows automatically on resize
 - **Image previews** — opening an image file (png, jpg, gif, webp, bmp, …) renders it in the editor pane via the terminal's graphics protocol: kitty graphics where supported (kitty, Ghostty, WezTerm, iTerm2, …), unicode half-blocks elsewhere. Images are contained within the pane without clipping; small images remain at native size, while larger images are scaled using logical cell dimensions. Esc closes the preview
 - **Safe file handling** — a dirty buffer blocks opening another file or starting a new one (Ctrl+N), and Ctrl+Q asks for confirmation before discarding unsaved changes
+- **Reload from disk** — Ctrl+R re-reads the open file (or the image preview) so external changes show up, and refreshes the sidebar listing in the same go; refused while the buffer has unsaved edits
 - **Undo / redo** — Ctrl+Z undoes, Ctrl+Shift+Z redoes; continuous typing, backspacing, deleting and pastes each collapse into a single undo step, and undoing restores the cursor, selection and modified state
 - **Unicode-aware editing** — the cursor tracks *characters*, not bytes, so wide characters and non-ASCII text render and edit correctly
 
@@ -65,6 +66,7 @@ rat [path]
 | `Ctrl+N` | Start a new untitled buffer |
 | `Ctrl+O` | Switch between sidebar and editor |
 | `Ctrl+S` | Save (asks for a name if untitled) |
+| `Ctrl+R` | Reload the current file from disk (and refresh the sidebar) |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste |
 | `Ctrl+A` | Select all |
 | `Ctrl+F` | Search (type to filter, `Enter` / `Shift+Enter` next / previous match, `Esc` closes) |
