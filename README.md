@@ -4,7 +4,15 @@
 
 A tiny terminal text editor built with [ratatui](https://github.com/ratatui/ratatui).
 
-Two panes, one goal: a small, dependency-light editor that stays out of your way.
+Just like [bat](https://github.com/sharkdp/bat) is a modern replacement for cat, rat(atata) aims to be a modern replacement for nano.
+
+- Simple and intuitive to use
+- Syntax highlighting
+- Nothing to learn or remember
+- Full optional mouse control
+- No AI features
+
+In short, a simple editor you can use to quickly edit configuration or code files without worrying if your .env secrets are sent to AI or having to remember how vim/emacs works when editing a remote file over ssh.
 
 ![Screenshot](https://i.imgur.com/5WJN5q4.png)
 
