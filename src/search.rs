@@ -108,11 +108,6 @@ impl Search {
         self.replacement.is_some()
     }
 
-    /// The replacement string, if this is a find-and-replace.
-    pub fn replacement_text(&self) -> Option<&str> {
-        self.replacement.as_deref()
-    }
-
     /// All current matches, in document order.
     pub fn matches(&self) -> &[Match] {
         &self.matches
@@ -320,7 +315,7 @@ mod tests {
         s.enable_replace();
         assert!(s.is_replace());
         assert_eq!(s.query, "foo");
-        assert_eq!(s.replacement_text(), Some(""));
+        assert_eq!(s.replacement.as_deref(), Some(""));
         assert_eq!(s.field, SearchField::Replacement);
 
         let mut empty = Search::new_replace();

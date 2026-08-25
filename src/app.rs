@@ -57,9 +57,12 @@ const EDITOR_CLICK_TTL: Duration = Duration::from_millis(250);
 
 const SIDEBAR_WIDTH: u16 = 28;
 const STATUS_HEIGHT: u16 = 1;
-/// The shortcut bar at the top wraps onto a second row when the buttons
-/// don't fit; anything beyond that is omitted (with an ellipsis marker).
-const TOPBAR_MAX_ROWS: u16 = 2;
+/// The shortcut bar at the top wraps onto extra rows when the buttons
+/// don't fit. A MacBook Air Ghostty window at 1280 logical px is ~120
+/// columns, which needs three rows to keep Quit on screen with 17
+/// buttons. Non-Quit overflow beyond this is marked with an ellipsis;
+/// Quit is pinned and never omitted.
+const TOPBAR_MAX_ROWS: u16 = 3;
 /// Separator between the shortcut buttons in the top bar.
 const TOPBAR_SEPARATOR: &str = " | ";
 const TOPBAR_SEPARATOR_WIDTH: u16 = 3;
@@ -422,15 +425,18 @@ impl App {
                 KeyCode::Char('f') => Shortcut::Find,
                 KeyCode::Char('g') => Shortcut::GoToLine,
                 KeyCode::Char('w') => Shortcut::ToggleWrap,
-                // Ctrl+Shift+H is find-and-replace. Unshifted Ctrl+H stays
-                // hide-dotfiles; CapsLock Ctrl+H is still hide-dotfiles
-                // because only an explicit Shift modifier means replace.
+                // Ctrl+Shift+H is find-and-replace; unshifted Ctrl+H stays
+                // hide-dotfiles. Ghostty (kitty protocol + REPORT_ALTERNATE_KEYS)
+                // folds Shift into the character and drops the SHIFT modifier,
+                // so the event is 'H'+CONTROL — the same shape as Ctrl+Shift+Z.
+                // Accept 'H', or 'h'+Shift, as replace. Bare 'h' is hidden.
                 KeyCode::Char('h') | KeyCode::Char('H')
-                    if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        || key.code == KeyCode::Char('H') =>
                 {
                     Shortcut::Replace
                 }
-                KeyCode::Char('h') | KeyCode::Char('H') => Shortcut::ToggleHidden,
+                KeyCode::Char('h') => Shortcut::ToggleHidden,
                 KeyCode::Char('n') => Shortcut::NewFile,
                 // Ctrl+Z undoes, Ctrl+Shift+Z redoes (CapsLock typos land
                 // on redo, a harmless no-op without history). The shifted
@@ -1681,62 +1687,55 @@ impl App {
 
     /// The clickable shortcut buttons ("Ctrl+O switch", …) across the top,
     /// separated by " | " and indented one cell from the window edge.
-    /// Buttons flow onto a second row when they don't fit; anything still
-    /// left over is omitted with an ellipsis marker. Button rectangles
-    /// from the last draw are kept for mouse hit-testing.
+    /// Buttons wrap onto extra rows when they don't fit. Quit is pinned
+    /// so it is never dropped; any other overflow is marked with an
+    /// ellipsis. Button rectangles from the last draw are kept for mouse
+    /// hit-testing.
     fn draw_topbar(&mut self, frame: &mut Frame, area: Rect, pills: &[Shortcut]) {
         self.topbar_buttons.clear();
         let hovered = self.hovered;
-        let mut lines: Vec<Line> = Vec::new();
-        // every row begins with a one-cell margin so the first button
-        // never sits at the window edge at (0,0)
-        let mut row_spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-        let mut x = area.x + TOPBAR_INDENT;
-        for &action in pills {
-            let w = pill_width(action);
-            if x + w > area.x + area.width {
-                // doesn't fit on this row: start the next one
-                lines.push(Line::from(std::mem::take(&mut row_spans)));
-                x = area.x + TOPBAR_INDENT;
-                row_spans.push(Span::raw(" "));
-                if lines.len() as u16 >= TOPBAR_MAX_ROWS {
-                    // out of rows: mark the overflow and stop
-                    if let Some(last) = lines.last_mut() {
-                        last.spans
-                            .push(Span::styled("…", Style::default().fg(self.pal().muted)));
-                    }
-                    break;
+        let layout = wrap_topbar_pills(pills, area.width);
+        let n_rows = layout.pills.last().map(|p| p.row + 1).unwrap_or(1).max(1);
+        let last_body_row = layout
+            .pills
+            .iter()
+            .rev()
+            .find(|p| p.action != Shortcut::Quit)
+            .map(|p| p.row);
+
+        for row in 0..n_rows {
+            let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+            let mut first = true;
+            for pill in layout.pills.iter().filter(|p| p.row == row) {
+                if !first {
+                    spans.push(Span::styled(
+                        TOPBAR_SEPARATOR,
+                        Style::default().fg(self.pal().muted),
+                    ));
                 }
-                if x + w > area.x + area.width {
-                    // even an empty row cannot hold this button: skip it
-                    continue;
-                }
-            }
-            // a separator between the buttons (never before the first one
-            // on a row, so rows don't end with a dangling pipe)
-            if row_spans.len() > 1 {
-                row_spans.push(Span::styled(
-                    TOPBAR_SEPARATOR,
-                    Style::default().fg(self.pal().muted),
+                first = false;
+                self.topbar_buttons.push((
+                    pill.action,
+                    Rect::new(area.x + pill.x, area.y + row, pill.width, 1),
+                ));
+                spans.extend(pill_spans(
+                    pill.action,
+                    hovered == Some(pill.action),
+                    self.color_support,
                 ));
             }
-            self.topbar_buttons
-                .push((action, Rect::new(x, area.y + lines.len() as u16, w, 1)));
-            // the hovered button is drawn highlighted
-            row_spans.extend(pill_spans(
-                action,
-                hovered == Some(action),
-                self.color_support,
-            ));
-            x += w + TOPBAR_SEPARATOR_WIDTH;
-        }
-        if !row_spans.is_empty() || lines.is_empty() {
-            lines.push(Line::from(row_spans));
-        }
-        for (i, line) in lines.iter().enumerate() {
+            if layout.truncated
+                && last_body_row == Some(row)
+                && !layout
+                    .pills
+                    .iter()
+                    .any(|p| p.row == row && p.action == Shortcut::Quit)
+            {
+                spans.push(Span::styled("…", Style::default().fg(self.pal().muted)));
+            }
             frame.render_widget(
-                Paragraph::new(line.clone()),
-                Rect::new(area.x, area.y + i as u16, area.width, 1),
+                Paragraph::new(Line::from(spans)),
+                Rect::new(area.x, area.y + row, area.width, 1),
             );
         }
     }
@@ -2452,23 +2451,111 @@ fn pill_spans(action: Shortcut, hovered: bool, color_support: ColorSupport) -> V
     ]
 }
 
-/// How many rows the top bar needs to show all buttons at `width`: one
-/// when everything fits (including the left margin and the separators),
-/// otherwise two (a second row that is still too small is truncated with
-/// an ellipsis marker). Must stay in sync with [`App::draw_topbar`]'s
-/// wrapping.
+/// How many rows the top bar needs at `width`. Must stay in sync with
+/// [`App::draw_topbar`] via [`wrap_topbar_pills`].
 fn shortcut_bar_height(pills: &[Shortcut], width: u16) -> u16 {
-    if TOPBAR_INDENT + topbar_total_width(pills) <= width {
-        1
-    } else {
-        TOPBAR_MAX_ROWS
-    }
+    wrap_topbar_pills(pills, width)
+        .pills
+        .last()
+        .map(|p| p.row + 1)
+        .unwrap_or(1)
+        .max(1)
 }
 
-/// Combined width of all buttons, including the separators between them.
-fn topbar_total_width(pills: &[Shortcut]) -> u16 {
-    let n = pills.len() as u16;
-    pills.iter().map(|&a| pill_width(a)).sum::<u16>() + TOPBAR_SEPARATOR_WIDTH * n.saturating_sub(1)
+/// One shortcut button after wrapping.
+#[derive(Clone, Copy, Debug)]
+struct PlacedPill {
+    action: Shortcut,
+    x: u16,
+    row: u16,
+    width: u16,
+}
+
+struct TopbarLayout {
+    pills: Vec<PlacedPill>,
+    truncated: bool,
+}
+
+/// Wrap shortcut buttons into rows. A trailing Quit is pinned: it is always
+/// placed, wrapping onto a new row if needed, and the last allowed body row
+/// reserves space for it so it cannot be the button eaten by the ellipsis.
+fn wrap_topbar_pills(pills: &[Shortcut], width: u16) -> TopbarLayout {
+    let (body, quit) = match pills.split_last() {
+        Some((&Shortcut::Quit, rest)) => (rest, Some(Shortcut::Quit)),
+        _ => (pills, None),
+    };
+    let quit_w = quit.map(pill_width).unwrap_or(0);
+
+    let mut out: Vec<PlacedPill> = Vec::new();
+    let mut row: u16 = 0;
+    let mut x = TOPBAR_INDENT;
+    let mut started_row = false;
+    let mut truncated = false;
+    let mut body_index = 0;
+
+    while body_index < body.len() {
+        let action = body[body_index];
+        let w = pill_width(action);
+        let last_row = row + 1 >= TOPBAR_MAX_ROWS;
+        let reserve = if quit.is_some() && last_row {
+            if started_row {
+                TOPBAR_SEPARATOR_WIDTH + quit_w
+            } else {
+                quit_w
+            }
+        } else {
+            0
+        };
+        let limit = width.saturating_sub(reserve);
+
+        if started_row && x + w > limit {
+            if last_row {
+                truncated = true;
+                break;
+            }
+            row += 1;
+            x = TOPBAR_INDENT;
+            started_row = false;
+            continue;
+        }
+        if x + w > width {
+            truncated = true;
+            body_index += 1;
+            continue;
+        }
+
+        out.push(PlacedPill {
+            action,
+            x,
+            row,
+            width: w,
+        });
+        x = x.saturating_add(w).saturating_add(TOPBAR_SEPARATOR_WIDTH);
+        started_row = true;
+        body_index += 1;
+    }
+    if body_index < body.len() {
+        truncated = true;
+    }
+
+    if let Some(action) = quit {
+        let w = pill_width(action);
+        if started_row && x + w > width {
+            row += 1;
+            x = TOPBAR_INDENT;
+        }
+        out.push(PlacedPill {
+            action,
+            x,
+            row,
+            width: w,
+        });
+    }
+
+    TopbarLayout {
+        pills: out,
+        truncated,
+    }
 }
 
 /// Shorten `s` to at most `max` chars, keeping the end and prefixing "…".
@@ -3334,6 +3421,60 @@ mod tests {
         let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
         app.handle_key(cmd_shift('h'));
         assert!(app.search.as_ref().is_some_and(|s| s.is_replace()));
+    }
+
+    #[test]
+    fn ghostty_ctrl_shift_h_is_replace_not_hide_dotfiles() {
+        // Ghostty with the kitty protocol and REPORT_ALTERNATE_KEYS folds
+        // Shift into the character and drops the SHIFT modifier, so
+        // Ctrl+Shift+H arrives as 'H'+CONTROL — the same shape as
+        // Ctrl+Shift+Z. That must open replace, not toggle hide-dotfiles.
+        let events = [
+            KeyEvent::new(KeyCode::Char('H'), KeyModifiers::CONTROL),
+            KeyEvent::new(
+                KeyCode::Char('H'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SUPER),
+            KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            ),
+        ];
+        for (i, event) in events.into_iter().enumerate() {
+            let dir = scratch(&format!("ghostty-csh-{i}"));
+            fs::write(dir.join(".env"), "SECRET=1").unwrap();
+            fs::write(dir.join("a.txt"), "hello").unwrap();
+            let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+            assert!(app.sidebar.hide_dotfiles);
+            app.handle_key(event);
+            assert!(
+                app.search.as_ref().is_some_and(|s| s.is_replace()),
+                "event {event:?} must open replace"
+            );
+            assert!(
+                app.sidebar.hide_dotfiles,
+                "event {event:?} must not toggle hide-dotfiles"
+            );
+        }
+    }
+
+    #[test]
+    fn unshifted_ctrl_h_still_toggles_dotfiles_not_replace() {
+        let dir = scratch("ctrl-h-not-replace");
+        fs::write(dir.join(".env"), "SECRET=1").unwrap();
+        fs::write(dir.join("a.txt"), "hello").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        app.handle_key(ctrl('h'));
+        assert!(!app.sidebar.hide_dotfiles);
+        assert!(app.search.is_none());
+        app.handle_key(cmd('h'));
+        assert!(app.sidebar.hide_dotfiles);
+        assert!(app.search.is_none());
     }
 
     // ---- go to line (Ctrl+G) ----------------------------------------------
@@ -4979,16 +5120,44 @@ mod tests {
         assert!(rows[0].contains("Ctrl+N new"));
         assert!(rows[1].contains("Ctrl+C copy"));
         assert!(rows[1].contains("Ctrl+V paste"));
-        // the overflow buttons (select-all through quit) are dropped with
-        // an ellipsis marker
-        assert!(rows[1].contains("…"));
-        assert!(!rows[1].contains("Ctrl+Q"));
-        assert!(!rows[1].contains("Ctrl+F"));
-        assert!(!rows[1].contains("Ctrl+W"));
-        assert_eq!(app.topbar_area.height, 2);
+        // Quit is pinned, so a third row keeps it visible instead of
+        // dropping it behind the ellipsis.
+        assert!(row_contains(&rows, "Ctrl+Q quit"));
+        assert_eq!(app.topbar_buttons.last().unwrap().0, Shortcut::Quit);
+        assert_eq!(app.topbar_area.height, 3);
 
         // clicking a button on the second row still works
         click_button(&mut app, Shortcut::Copy);
+    }
+
+    #[test]
+    fn top_bar_keeps_quit_visible_at_1280px_air_width() {
+        // Ghostty on a 13" Air at 1280 logical px is ~120 columns with a
+        // ~10–11px cell. Two rows used to end `Ctrl+H hidden…` and omit Quit.
+        let dir = scratch("mbtnair");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(120)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect();
+        let actions: Vec<Shortcut> = app.topbar_buttons.iter().map(|(a, _)| *a).collect();
+        assert_eq!(actions.len(), 17, "{actions:?}");
+        assert_eq!(*actions.last().unwrap(), Shortcut::Quit);
+        assert!(row_contains(&rows, "Ctrl+Q quit"));
+        assert!(row_contains(&rows, "Ctrl+H hidden"));
+        assert!(row_contains(&rows, "Ctrl+Shift+H replace"));
+        assert!(!rows[0].contains("Ctrl+Q"));
+        assert!(app.topbar_area.height >= 2);
+        click_button(&mut app, Shortcut::Quit);
+        assert!(app.should_quit);
     }
 
     #[test]
@@ -5739,10 +5908,6 @@ mod tests {
         assert_eq!(names(&app), vec!["..".to_string(), "shown.txt".to_string()]);
         let rows = render(&mut app);
         assert!(row_contains(&rows, "Ctrl+H hidden"));
-        // CapsLock Ctrl+H (reported as 'H' without SHIFT) is still hide-dotfiles
-        app.handle_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::CONTROL));
-        assert!(!app.sidebar.hide_dotfiles);
-        assert!(app.search.is_none());
     }
 
     #[test]
