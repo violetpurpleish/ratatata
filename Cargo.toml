@@ -2,6 +2,7 @@
 name = "ratatata"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 description = "A tiny terminal text editor built with ratatui."
 keywords = ["editor", "terminal", "tui", "ratatui", "text-editor"]
@@ -29,8 +30,4 @@ unicode-width = "0.2.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.4", default-features = false }
-objc2-app-kit = {
-    version = "0.3.2",
-    default-features = false,
-    features = ["NSScreen", "objc2-core-foundation"],
-}
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSScreen", "objc2-core-foundation"] }

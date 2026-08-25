@@ -34,20 +34,21 @@ Or run in place:
 cargo run -- [path]
 ```
 
-Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`, separate from the `ratatata` package name). Requires a Rust toolchain with Edition 2024 support. Works in any terminal that supports crossterm's event and drawing APIs — including tmux/`screen` when mouse reporting is enabled.
+Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`, separate from the `ratatata` package name). Requires **Rust 1.90 or later**. Edition 2024 landed in 1.85, but the current dependency tree (`ratatui` 0.30, `image` 0.25, …) needs a newer compiler; `Cargo.toml` also avoids TOML 1.1 multi-line inline tables so an older Cargo is not what blocks the build. Works in any terminal that supports crossterm's event and drawing APIs — including tmux/`screen` when mouse reporting is enabled.
 
 ## Features
 
 - **Sidebar + editor split** — browse directories on the left, edit files on the right
 - **Clickable shortcut bar** — the keyboard shortcuts are shown as buttons in a bar at the top; click one to run it, hover it for a longer description in the status bar. The keys and the buttons are the same actions, so they always behave identically
-- **Catppuccin Mocha UI theme** — semantic application colors supplied by [ratatui-themes](https://crates.io/crates/ratatui-themes), including themed panels, selections, search matches, caret, status bar and shortcut buttons
+- **Catppuccin Mocha UI theme** — semantic application colors supplied by [ratatui-themes](https://crates.io/crates/ratatui-themes), including themed panels, selections, search matches, caret, status bar and shortcut buttons. Truecolor terminals (Ghostty, `COLORTERM=truecolor`, or a `*-direct` terminfo) keep the RGB theme unchanged. Terminals that do not advertise truecolor (for example xfce4-terminal) map the same semantic palette onto ANSI 16; if a colored focus border would be invisible, the focused pane title is reverse/bold instead. There is no theme toggle, and `NO_COLOR` / `FORCE_COLOR` are ignored so a sandbox cannot grayscale Ghostty.
 - **Syntax highlighting** — Sublime Text grammars via [syntect](https://github.com/trishume/syntect), detected by extension and first-line heuristics; re-highlights incrementally as you type, only re-parsing lines from the edit point onward
 - **Clipboard integration** — copy/cut/paste through the system clipboard ([arboard](https://github.com/1Password/arboard)), with bracketed-paste support for terminals that send it
 - **Full mouse support** — click to place the cursor, drag or Shift+click to select, double-click to select a word, triple-click to select a line, Ctrl/Cmd+click a web link to open it in the default browser, scroll wheel to move through text without moving the editor cursor (with a scrollbar) and directories
 - **macOS-friendly keys** — on terminals supporting the kitty keyboard protocol, Cmd+key works like Ctrl (unsupported terminals just ignore the request)
 - **Incremental search** — Ctrl+F opens a search bar: matches are highlighted as you type, Enter / Shift+Enter step to the next / previous match, Esc closes
 - **Word wrap** — Ctrl+W wraps long lines at word boundaries (a single unbreakable word still hard-breaks) instead of scrolling horizontally; navigation (arrows, Home/End, PgUp/PgDn, mouse) follows the visual rows, and wrapping re-flows automatically on resize
-- **Image previews** — opening an image file (png, jpg, gif, webp, bmp, …) renders it in the editor pane via the terminal's graphics protocol: kitty graphics where supported (kitty, Ghostty, WezTerm, iTerm2, …), unicode half-blocks elsewhere. Images are contained within the pane without clipping; small images remain at native size, while larger images are scaled using logical cell dimensions. Esc closes the preview
+- **Image previews** — opening an image file (png, jpg, gif, webp, bmp, …) renders it in the editor pane via the terminal's graphics protocol: kitty graphics where supported (kitty, Ghostty, WezTerm, iTerm2, …), unicode half-blocks elsewhere. Images are contained within the pane without clipping; small images remain at native size, while larger images are scaled using logical cell dimensions. Esc closes the preview and restores the previously open text buffer (including word wrap); closing a preview that was the first thing opened lands on empty untitled
+- **Hide dotfiles** — the sidebar hides names starting with `.` by default (`..` is always listed). Ctrl+H (or the **hidden** shortcut button) toggles them. Hidden entries are dimmed when shown.
 - **Safe file handling** — a dirty buffer blocks opening another file or starting a new one (Ctrl+N), and Ctrl+Q asks for confirmation before discarding unsaved changes
 - **Reload from disk** — Ctrl+R re-reads the open file (or the image preview) so external changes show up, and refreshes the sidebar listing in the same go; refused while the buffer has unsaved edits
 - **Undo / redo** — Ctrl+Z undoes, Ctrl+Shift+Z redoes; continuous typing, backspacing, deleting and pastes each collapse into a single undo step, and undoing restores the cursor, selection and modified state
@@ -83,9 +84,10 @@ rat -V | --version
 | `Ctrl+A` | Select all |
 | `Ctrl+F` | Search (type to filter, `Enter` / `Shift+Enter` next / previous match, `Esc` closes) |
 | `Ctrl+W` | Toggle word wrapping of long lines (visual rows instead of horizontal scrolling) |
+| `Ctrl+H` | Show or hide dotfiles in the sidebar (`..` is never hidden; hidden by default) |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | `Ctrl+Q` | Quit (press twice when there are unsaved changes) |
-| `Esc` | Close an image preview / cancel the save-as prompt |
+| `Esc` | Close an image preview (restores the previous file) / cancel the save-as prompt |
 
 **Sidebar:** `↑`/`↓` select, `Enter`/`→` open (directory = enter, file = open), `Backspace`/`←` go up, `Home`/`End`, `PgUp`/`PgDn` page.
 
@@ -99,7 +101,7 @@ rat -V | --version
 cargo test
 ```
 
-The test suite covers buffer editing, undo/redo coalescing, save/save-as flows, dirty-buffer guards, sidebar navigation, mouse interactions, image-preview opening/closing and rendering, and headless rendering (including syntax-highlight colors) via ratatui's `TestBackend`.
+The test suite covers buffer editing, undo/redo coalescing, save/save-as flows, dirty-buffer guards, sidebar navigation, mouse interactions, image-preview opening/closing/restoring, unwrapped-line clipping, truecolor vs ANSI-16 palettes, hide-dotfiles listing, and headless rendering (including syntax-highlight colors) via ratatui's `TestBackend`.
 
 ## How it works
 
@@ -112,7 +114,9 @@ src/
 │                 save-as flow, status bar
 ├── buffer.rs     line-based text buffer with char-indexed cursor,
 │                 selection, scrolling, undo/redo, load/save
-├── sidebar.rs    scrollable directory listing (dirs first, ".." entry)
+├── sidebar.rs    scrollable directory listing (dirs first, ".." entry,
+│                 optional hide-dotfiles)
+├── theme.rs      truecolor detection and ANSI 16 fallback for the UI palette
 ├── image_view.rs image previews: decode via the `image` crate, render
 │                 through the kitty/sixel/iTerm2 protocols (or half-blocks)
 │                 via ratatui-image

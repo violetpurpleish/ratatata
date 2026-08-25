@@ -22,22 +22,23 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::Frame;
 use ratatui_themes::{Theme, ThemeName, ThemePalette};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::buffer::{Buffer, char_width, expand_tabs, visual_chunk, visual_row_of};
+use crate::buffer::{char_width, expand_tabs, visual_chunk, visual_row_of, Buffer};
 use crate::clipboard::{Clipboard, SystemClipboard};
 use crate::highlight::Highlighter;
 use crate::image_view::{self, ImagePreview};
 use crate::search::Search;
 use crate::sidebar::{Kind, Sidebar};
-use ratatui_image::FontSize;
+use crate::theme::{self, ColorSupport};
 use ratatui_image::picker::Picker;
+use ratatui_image::FontSize;
 
 /// How long transient status messages stay visible.
 const MESSAGE_TTL: Duration = Duration::from_secs(4);
@@ -71,6 +72,8 @@ const TOPBAR_INDENT: u16 = 1;
 const THEME: Theme = Theme::new(ThemeName::CatppuccinMocha);
 const PALETTE: ThemePalette = THEME.palette();
 /// Accent used for whichever panel and scrollbar currently have focus.
+/// Runtime drawing uses `App::pal().accent` so this alias is test-only.
+#[cfg(test)]
 const FOCUS_COLOR: Color = PALETTE.accent;
 
 /// Background used while a shortcut button is hovered, so it reads as
@@ -103,6 +106,7 @@ enum Shortcut {
     SelectAll,
     Find,
     ToggleWrap,
+    ToggleHidden,
     Undo,
     Redo,
     ClosePreview,
@@ -124,6 +128,7 @@ impl Shortcut {
             Shortcut::SelectAll => "Ctrl+A",
             Shortcut::Find => "Ctrl+F",
             Shortcut::ToggleWrap => "Ctrl+W",
+            Shortcut::ToggleHidden => "Ctrl+H",
             Shortcut::Undo => "Ctrl+Z",
             Shortcut::Redo => "Ctrl+Shift+Z",
             Shortcut::ClosePreview => "Esc",
@@ -145,6 +150,7 @@ impl Shortcut {
             Shortcut::SelectAll => "select all",
             Shortcut::Find => "search",
             Shortcut::ToggleWrap => "wrap",
+            Shortcut::ToggleHidden => "hidden",
             Shortcut::Undo => "undo",
             Shortcut::Redo => "redo",
             Shortcut::ClosePreview => "close preview",
@@ -159,7 +165,9 @@ impl Shortcut {
             Shortcut::Quit => "quit — press again to confirm unsaved changes",
             Shortcut::SwitchFocus => "switch between sidebar and editor",
             Shortcut::Save => "save the current file (asks for a name if untitled)",
-            Shortcut::Reload => "reload the current file from disk (refuses unsaved changes; sidebar refreshes too)",
+            Shortcut::Reload => {
+                "reload the current file from disk (refuses unsaved changes; sidebar refreshes too)"
+            }
             Shortcut::Copy => "copy the selection to the clipboard",
 
             Shortcut::Cut => "cut the selection to the clipboard",
@@ -167,6 +175,7 @@ impl Shortcut {
             Shortcut::SelectAll => "select the whole buffer",
             Shortcut::Find => "search — type to filter, Enter/Shift+Enter next/prev, Esc closes",
             Shortcut::ToggleWrap => "toggle word wrapping of long lines",
+            Shortcut::ToggleHidden => "show or hide dotfiles in the sidebar (never hides ..)",
             Shortcut::Undo => "undo the last edit",
             Shortcut::Redo => "redo the last undone edit",
             Shortcut::ClosePreview => "close the image preview",
@@ -183,6 +192,7 @@ impl Shortcut {
             Shortcut::Reload => PALETTE.info,
             Shortcut::Find => PALETTE.warning,
             Shortcut::ToggleWrap => PALETTE.secondary,
+            Shortcut::ToggleHidden => PALETTE.info,
             Shortcut::NewFile => PALETTE.accent,
             _ => PALETTE.fg,
         }
@@ -208,6 +218,12 @@ pub struct App {
     /// Active image preview replacing the text buffer, `None` while editing
     /// text.
     image: Option<ImagePreview>,
+    /// Text buffer (and wrap/cursor/path) stashed while an image preview is
+    /// open, restored when the preview is closed with Esc.
+    previous_buffer: Option<Buffer>,
+    /// Truecolor keeps Catppuccin RGB; ANSI 16 is used only when the
+    /// terminal did not advertise truecolor. Tests default to truecolor.
+    color_support: ColorSupport,
     /// Transient status message with expiry.
     message: Option<(String, Instant)>,
     /// Active "save as" input text, when the buffer has no file name.
@@ -284,6 +300,8 @@ impl App {
             picker,
             logical_cell_size,
             image,
+            previous_buffer: None,
+            color_support: ColorSupport::TrueColor,
             message: None,
             save_as_input: None,
             search: None,
@@ -303,6 +321,33 @@ impl App {
 
     fn set_message(&mut self, msg: impl Into<String>) {
         self.message = Some((msg.into(), Instant::now() + MESSAGE_TTL));
+    }
+
+    /// Select the color path. Tests leave this at truecolor so Catppuccin
+    /// RGB assertions keep matching Ghostty; production sets it from the
+    /// advertised terminal capability.
+    pub(crate) fn set_color_support(&mut self, support: ColorSupport) {
+        self.color_support = support;
+    }
+
+    fn pal(&self) -> ratatui_themes::ThemePalette {
+        theme::ui_palette(self.color_support, PALETTE)
+    }
+
+    fn paint_style(&self, style: Style) -> Style {
+        theme::adapt_style(self.color_support, style)
+    }
+
+    fn pane_block(&self, title: String, title_fg: Color, focused: bool) -> Block<'static> {
+        let (title_style, border_style) = if focused {
+            theme::focused_pane_styles(self.color_support, PALETTE, title_fg)
+        } else {
+            theme::unfocused_pane_styles(self.color_support, PALETTE, title_fg)
+        };
+        Block::bordered()
+            .title(Span::styled(title, title_style))
+            .title_style(title_style)
+            .border_style(border_style)
     }
 
     /// Re-read terminal metrics after a resize without re-querying graphics
@@ -345,6 +390,7 @@ impl App {
                 KeyCode::Char('a') => Shortcut::SelectAll,
                 KeyCode::Char('f') => Shortcut::Find,
                 KeyCode::Char('w') => Shortcut::ToggleWrap,
+                KeyCode::Char('h') => Shortcut::ToggleHidden,
                 KeyCode::Char('n') => Shortcut::NewFile,
                 // Ctrl+Z undoes, Ctrl+Shift+Z redoes (CapsLock typos land
                 // on redo, a harmless no-op without history). The shifted
@@ -490,6 +536,7 @@ impl App {
             // Reload works while an image preview is open too: it re-reads
             // the image file from disk.
             Shortcut::Reload => self.reload_from_disk(),
+            Shortcut::ToggleHidden => self.toggle_hidden_files(),
             // While an image preview is open the remaining shortcuts do
             // nothing: there is no text to edit, save or search. This arm
             // comes after Quit/SwitchFocus/ClosePreview/NewFile (which
@@ -761,7 +808,11 @@ impl App {
                     // stuck selecting the line)
                     let count = match self.last_editor_click {
                         Some((t, p, c)) if t.elapsed() < EDITOR_CLICK_TTL && p == click => {
-                            if c >= 3 { 1 } else { c + 1 }
+                            if c >= 3 {
+                                1
+                            } else {
+                                c + 1
+                            }
                         }
                         _ => 1,
                     };
@@ -1031,6 +1082,7 @@ impl App {
             return;
         }
         self.buffer = Buffer::empty();
+        self.previous_buffer = None;
         self.image = None;
         self.highlighter.set_path(None);
         self.quit_armed = false;
@@ -1229,7 +1281,7 @@ impl App {
                 self.logical_cell_size,
             ) {
                 Ok(preview) => {
-                    self.buffer = Buffer::empty();
+                    self.stash_buffer_for_preview();
                     self.image = Some(preview);
                     self.quit_armed = false;
                     self.focus = Focus::Editor;
@@ -1241,6 +1293,8 @@ impl App {
         }
         match Buffer::from_path(path.clone()) {
             Ok(buffer) => {
+                self.previous_buffer = None;
+                self.image = None;
                 self.buffer = buffer;
                 self.highlighter.set_path(Some(&path));
                 self.quit_armed = false;
@@ -1251,12 +1305,53 @@ impl App {
         }
     }
 
-    /// Close the image preview and drop back to an empty buffer. The
-    /// terminal's copy of the transmitted image is freed when the app exits.
+    /// Put the current text buffer aside for the duration of an image
+    /// preview. Opening another image while already previewing keeps the
+    /// original text buffer so Esc still restores it.
+    fn stash_buffer_for_preview(&mut self) {
+        if self.image.is_none() {
+            self.previous_buffer = Some(std::mem::replace(&mut self.buffer, Buffer::empty()));
+        } else {
+            self.buffer = Buffer::empty();
+        }
+    }
+
+    /// Close the image preview and restore the previously open buffer
+    /// (including wrap). With no stashed buffer this lands on empty untitled,
+    /// which is the startup-preview case.
     fn close_image_preview(&mut self) {
         self.image = None;
-        self.buffer = Buffer::empty();
+        if let Some(buffer) = self.previous_buffer.take() {
+            self.highlighter.set_path(buffer.path.as_deref());
+            self.buffer = buffer;
+            self.last_drawn_cursor = None;
+        } else {
+            self.buffer = Buffer::empty();
+            self.highlighter.set_path(None);
+        }
         self.focus = Focus::Editor;
+    }
+
+    /// Toggle whether the sidebar lists dotfiles. `..` is never hidden.
+    fn toggle_hidden_files(&mut self) {
+        self.sidebar.hide_dotfiles = !self.sidebar.hide_dotfiles;
+        let selected = self
+            .sidebar
+            .entries
+            .get(self.sidebar.selected)
+            .map(|e| e.name.clone());
+        if let Err(e) = self.sidebar.reload() {
+            self.set_message(format!("cannot refresh sidebar: {e}"));
+            return;
+        }
+        if let Some(name) = selected {
+            self.sidebar.select_name(&name);
+        }
+        self.set_message(if self.sidebar.hide_dotfiles {
+            "dotfiles hidden"
+        } else {
+            "dotfiles shown"
+        });
     }
 
     // ---- drawing -----------------------------------------------------------
@@ -1266,7 +1361,7 @@ impl App {
         // widgets and syntax spans then layer their semantic foregrounds and
         // backgrounds over it.
         frame.render_widget(
-            Block::default().style(Style::default().bg(PALETTE.bg)),
+            Block::default().style(Style::default().bg(self.pal().bg)),
             frame.area(),
         );
 
@@ -1313,6 +1408,7 @@ impl App {
                 Shortcut::Paste,
                 Shortcut::Find,
                 Shortcut::ToggleWrap,
+                Shortcut::ToggleHidden,
                 Shortcut::Quit,
             ]
         }
@@ -1342,7 +1438,7 @@ impl App {
                     // out of rows: mark the overflow and stop
                     if let Some(last) = lines.last_mut() {
                         last.spans
-                            .push(Span::styled("…", Style::default().fg(PALETTE.muted)));
+                            .push(Span::styled("…", Style::default().fg(self.pal().muted)));
                     }
                     break;
                 }
@@ -1356,13 +1452,17 @@ impl App {
             if row_spans.len() > 1 {
                 row_spans.push(Span::styled(
                     TOPBAR_SEPARATOR,
-                    Style::default().fg(PALETTE.muted),
+                    Style::default().fg(self.pal().muted),
                 ));
             }
             self.topbar_buttons
                 .push((action, Rect::new(x, area.y + lines.len() as u16, w, 1)));
             // the hovered button is drawn highlighted
-            row_spans.extend(pill_spans(action, hovered == Some(action)));
+            row_spans.extend(pill_spans(
+                action,
+                hovered == Some(action),
+                self.color_support,
+            ));
             x += w + TOPBAR_SEPARATOR_WIDTH;
         }
         if !row_spans.is_empty() || lines.is_empty() {
@@ -1388,39 +1488,32 @@ impl App {
                 Kind::File => entry.name.clone(),
             };
             let mut style = match entry.kind {
-                Kind::Parent => Style::default().fg(PALETTE.muted),
-                Kind::Dir => Style::default().fg(PALETTE.info),
-                Kind::File => Style::default().fg(PALETTE.fg),
+                Kind::Parent => Style::default().fg(self.pal().muted),
+                Kind::Dir => Style::default().fg(self.pal().info),
+                Kind::File => Style::default().fg(self.pal().fg),
             };
             if entry.is_hidden() {
                 style = style.add_modifier(Modifier::DIM);
             }
             let selected = i == self.sidebar.selected;
             if selected {
-                style = style.bg(PALETTE.selection);
+                style = style.bg(self.pal().selection);
             }
             let marker = if selected { "▶ " } else { "  " };
             rows.push(Line::from(vec![
-                Span::styled(marker, Style::default().fg(PALETTE.warning)),
+                Span::styled(marker, Style::default().fg(self.pal().warning)),
                 Span::styled(display, style),
             ]));
         }
         if rows.is_empty() {
             rows.push(Line::from(Span::styled(
                 "(empty)",
-                Style::default().fg(PALETTE.muted),
+                Style::default().fg(self.pal().muted),
             )));
         }
 
         let title = truncate(&self.sidebar.dir.display().to_string(), area.width as usize);
-        let block = Block::bordered()
-            .title(Span::styled(title, Style::default().fg(PALETTE.info)))
-            .title_style(Style::default().add_modifier(Modifier::BOLD))
-            .border_style(if self.focus == Focus::Sidebar {
-                Style::default().fg(FOCUS_COLOR)
-            } else {
-                Style::default().fg(PALETTE.muted)
-            });
+        let block = self.pane_block(title, PALETTE.info, self.focus == Focus::Sidebar);
         let paragraph = Paragraph::new(rows)
             .block(block)
             .scroll((self.sidebar.scroll as u16, 0));
@@ -1436,14 +1529,7 @@ impl App {
             .unwrap_or_else(|| "untitled".to_string());
         let title = truncate(&title, area.width as usize);
 
-        let block = Block::bordered()
-            .title(Span::styled(title, Style::default().fg(PALETTE.success)))
-            .title_style(Style::default().add_modifier(Modifier::BOLD))
-            .border_style(if self.focus == Focus::Editor {
-                Style::default().fg(FOCUS_COLOR)
-            } else {
-                Style::default().fg(PALETTE.muted)
-            });
+        let block = self.pane_block(title, PALETTE.success, self.focus == Focus::Editor);
 
         // An image preview replaces the text: render the block and the image
         // fitted into the inner area (the image keeps its aspect ratio and
@@ -1456,6 +1542,7 @@ impl App {
         }
 
         let inner = block.inner(area);
+        frame.render_widget(block, area);
 
         let gutter_w = self.buffer.lines.len().to_string().len() + 1;
         let text_w = inner.width.saturating_sub(gutter_w as u16) as usize;
@@ -1472,6 +1559,8 @@ impl App {
             self.buffer.ensure_visible(text_h, text_w);
         }
         self.last_drawn_cursor = Some(self.buffer.cursor);
+        let muted = self.pal().muted;
+        let warning = self.pal().warning;
 
         // With wrapping every logical line may occupy several visual
         // rows; `scroll.y` is then a visual row, the gutter shows the
@@ -1518,7 +1607,7 @@ impl App {
                     let num = if chunk_k == 0 {
                         Span::styled(
                             format!("{:>width$} ", y + 1, width = gutter_w - 1),
-                            Style::default().fg(PALETTE.muted),
+                            Style::default().fg(muted),
                         )
                     } else {
                         Span::raw(" ".repeat(gutter_w))
@@ -1533,13 +1622,20 @@ impl App {
                         );
                     }
                     let mut spans = vec![num];
+                    let chunk_cols = line
+                        .chars()
+                        .skip(cstart)
+                        .take(cend.saturating_sub(cstart))
+                        .map(char_width)
+                        .sum();
                     spans.extend(clip_ops(
                         line,
                         ops,
                         cstart,
-                        cend - cstart,
+                        chunk_cols,
                         sel,
                         &search_matches,
+                        self.color_support,
                     ));
                     rows.push(Line::from(spans));
                     remaining -= 1;
@@ -1554,12 +1650,12 @@ impl App {
             if rows.is_empty() {
                 rows.push(Line::from(Span::styled(
                     "(empty)",
-                    Style::default().fg(PALETTE.muted),
+                    Style::default().fg(self.pal().muted),
                 )));
             }
 
-            let paragraph = Paragraph::new(rows).block(block);
-            frame.render_widget(paragraph, area);
+            let paragraph = Paragraph::new(rows);
+            frame.render_widget(paragraph, inner);
 
             if self.focus == Focus::Editor && self.save_as_input.is_none() {
                 let caret_vrow = self.buffer.cursor_vrow();
@@ -1587,7 +1683,7 @@ impl App {
                             );
                         let caret = Paragraph::new(Span::styled(
                             symbol,
-                            caret_style.unwrap_or_default().bg(PALETTE.warning),
+                            self.paint_style(caret_style.unwrap_or_default().bg(warning)),
                         ));
                         frame.render_widget(caret, Rect::new(cx, cy, 1, 1));
                     }
@@ -1604,7 +1700,7 @@ impl App {
         for y in start..end {
             let num = Span::styled(
                 format!("{:>width$} ", y + 1, width = gutter_w - 1),
-                Style::default().fg(PALETTE.muted),
+                Style::default().fg(self.pal().muted),
             );
             let ops = self.highlighter.highlight_line(&self.buffer.lines, y);
             let line = &self.buffer.lines[y];
@@ -1641,18 +1737,19 @@ impl App {
                 text_w,
                 sel,
                 &search_matches,
+                self.color_support,
             ));
             rows.push(Line::from(spans));
         }
         if rows.is_empty() {
             rows.push(Line::from(Span::styled(
                 "(empty)",
-                Style::default().fg(PALETTE.muted),
+                Style::default().fg(self.pal().muted),
             )));
         }
 
-        let paragraph = Paragraph::new(rows).block(block);
-        frame.render_widget(paragraph, area);
+        let paragraph = Paragraph::new(rows);
+        frame.render_widget(paragraph, inner);
 
         if self.focus == Focus::Editor && self.save_as_input.is_none() {
             // Ratatui can position the terminal cursor, but cannot give it a
@@ -1687,7 +1784,7 @@ impl App {
                         );
                     let caret = Paragraph::new(Span::styled(
                         symbol,
-                        caret_style.unwrap_or_default().bg(PALETTE.warning),
+                        self.paint_style(caret_style.unwrap_or_default().bg(warning)),
                     ));
                     frame.render_widget(caret, Rect::new(cx, cy, 1, 1));
                 }
@@ -1716,16 +1813,16 @@ impl App {
             .position(self.buffer.scroll.1)
             .viewport_content_length(viewport);
         let thumb_style = if self.focus == Focus::Editor {
-            Style::default().fg(FOCUS_COLOR)
+            Style::default().fg(self.pal().accent)
         } else {
-            Style::default().fg(PALETTE.muted)
+            Style::default().fg(self.pal().muted)
         };
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None)
             .track_symbol(Some("│"))
             .thumb_symbol("█")
-            .track_style(Style::default().fg(PALETTE.muted))
+            .track_style(Style::default().fg(self.pal().muted))
             .thumb_style(thumb_style);
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
     }
@@ -1740,12 +1837,12 @@ impl App {
                 Span::styled(
                     prompt,
                     Style::default()
-                        .fg(PALETTE.warning)
+                        .fg(self.pal().warning)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(input.clone(), Style::default().fg(PALETTE.fg)),
+                Span::styled(input.clone(), Style::default().fg(self.pal().fg)),
             ]))
-            .style(Style::default().bg(PALETTE.bg));
+            .style(Style::default().bg(self.pal().bg));
             frame.render_widget(paragraph, area);
             frame.set_cursor_position(Position::new(area.x + prompt_w + input_w, area.y));
             return;
@@ -1760,20 +1857,20 @@ impl App {
                 .chars()
                 .map(|c| c.width().unwrap_or(0))
                 .sum::<usize>() as u16;
-            let base = Style::default().bg(PALETTE.bg);
+            let base = Style::default().bg(self.pal().bg);
             let counter: Vec<Span> = if search.query.is_empty() {
                 Vec::new()
             } else if search.match_count() == 0 {
                 vec![Span::styled(
                     "no matches",
                     Style::default()
-                        .fg(PALETTE.warning)
+                        .fg(self.pal().warning)
                         .add_modifier(Modifier::BOLD),
                 )]
             } else {
                 vec![Span::styled(
                     format!("{}/{}", search.current_index() + 1, search.match_count()),
-                    Style::default().fg(PALETTE.info),
+                    Style::default().fg(self.pal().info),
                 )]
             };
             let counter_w = counter.iter().map(|s| s.content.width() as u16).sum();
@@ -1784,10 +1881,10 @@ impl App {
                     Span::styled(
                         prompt,
                         Style::default()
-                            .fg(PALETTE.warning)
+                            .fg(self.pal().warning)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(search.query.clone(), Style::default().fg(PALETTE.fg)),
+                    Span::styled(search.query.clone(), Style::default().fg(self.pal().fg)),
                 ]))
                 .style(base),
                 left_area,
@@ -1812,7 +1909,7 @@ impl App {
 
         let [left_area, right_area] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).areas(area);
-        let base = Style::default().bg(PALETTE.bg).fg(PALETTE.fg);
+        let base = Style::default().bg(self.pal().bg).fg(self.pal().fg);
 
         // left: focus + file + modified state, or a transient message
         let (left_spans, left_style): (Vec<Span>, Style) =
@@ -1822,13 +1919,13 @@ impl App {
                     // is showing
                     let mut spans = vec![Span::styled(
                         msg.clone(),
-                        Style::default().fg(PALETTE.warning),
+                        Style::default().fg(self.pal().warning),
                     )];
                     if self.buffer.dirty {
                         spans.push(Span::styled(
                             " ● modified",
                             Style::default()
-                                .fg(PALETTE.warning)
+                                .fg(self.pal().warning)
                                 .add_modifier(Modifier::BOLD),
                         ));
                     }
@@ -1868,19 +1965,19 @@ impl App {
                     Span::styled(
                         tag,
                         Style::default()
-                            .fg(PALETTE.secondary)
+                            .fg(self.pal().secondary)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(format!(" {path} ")),
-                    Span::styled(dims, Style::default().fg(PALETTE.muted)),
-                    Span::styled(view, Style::default().fg(PALETTE.info)),
+                    Span::styled(dims, Style::default().fg(self.pal().muted)),
+                    Span::styled(view, Style::default().fg(self.pal().info)),
                 ],
                 Style::default(),
             );
         }
         let (tag, tag_color) = match self.focus {
-            Focus::Sidebar => ("SIDEBAR", PALETTE.info),
-            Focus::Editor => ("EDITOR", PALETTE.success),
+            Focus::Sidebar => ("SIDEBAR", self.pal().info),
+            Focus::Editor => ("EDITOR", self.pal().success),
         };
         let path = self
             .buffer
@@ -1913,16 +2010,16 @@ impl App {
                     Style::default().fg(tag_color).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!(" {path} ")),
-                Span::styled(syntax, Style::default().fg(PALETTE.muted)),
-                Span::styled(wrap, Style::default().fg(PALETTE.info)),
+                Span::styled(syntax, Style::default().fg(self.pal().muted)),
+                Span::styled(wrap, Style::default().fg(self.pal().info)),
                 Span::styled(
                     dirty,
                     if self.buffer.dirty {
                         Style::default()
-                            .fg(PALETTE.warning)
+                            .fg(self.pal().warning)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(PALETTE.success)
+                        Style::default().fg(self.pal().success)
                     },
                 ),
             ],
@@ -2047,14 +2144,16 @@ fn pill_width(action: Shortcut) -> u16 {
 /// The spans of one shortcut button: the key combo in bold accent color
 /// followed by the action name. Only the hovered button gets a background
 /// and brighter label; idle buttons blend into the top bar.
-fn pill_spans(action: Shortcut, hovered: bool) -> Vec<Span<'static>> {
+fn pill_spans(action: Shortcut, hovered: bool, color_support: ColorSupport) -> Vec<Span<'static>> {
+    let pal = theme::ui_palette(color_support, PALETTE);
+    let hover_bg = theme::adapt_color(color_support, TOPBAR_PILL_BG_HOVER);
     let mut key_style = Style::default()
-        .fg(action.key_color())
+        .fg(theme::adapt_color(color_support, action.key_color()))
         .add_modifier(Modifier::BOLD);
-    let mut label_style = Style::default().fg(if hovered { PALETTE.fg } else { PALETTE.muted });
+    let mut label_style = Style::default().fg(if hovered { pal.fg } else { pal.muted });
     if hovered {
-        key_style = key_style.bg(TOPBAR_PILL_BG_HOVER);
-        label_style = label_style.bg(TOPBAR_PILL_BG_HOVER);
+        key_style = key_style.bg(hover_bg);
+        label_style = label_style.bg(hover_bg);
     }
     vec![
         Span::styled(format!("{} ", action.key_label()), key_style),
@@ -2133,22 +2232,41 @@ fn snap_char_down(s: &str, mut b: usize) -> usize {
     b
 }
 
-/// Clip styled byte-ranges from the highlighter to the visible char slice
-/// `[start_char, start_char + width)`, producing the `Span`s to render.
+/// Clip styled ranges from the highlighter to the visible slice starting at
+/// `start_char` and occupying at most `max_columns` display columns (tabs
+/// expand to the editor tab width). Interpreting this as a char count let
+/// unwrapped long lines (and tab-expanded text) paint over the editor's
+/// right border.
+///
 /// `None` styles render as plain text; spans overlapping `sel` (a byte range
 /// on this line) get the theme's selection background, and spans inside a
 /// search match (`matches`, char ranges with a "current match" flag) get the
-/// match background.
+/// match background. On ANSI-16 terminals, RGB styles are mapped; the
+/// truecolor path leaves them unchanged.
 fn clip_ops<'a>(
     line: &'a str,
     ops: &[(Option<Style>, Range<usize>)],
     start_char: usize,
-    width: usize,
+    max_columns: usize,
     sel: Option<(usize, usize)>,
     matches: &[(usize, usize, bool)],
+    color_support: ColorSupport,
 ) -> Vec<Span<'a>> {
+    let pal = theme::ui_palette(color_support, PALETTE);
+    let search_current = theme::adapt_color(color_support, SEARCH_CURRENT_BG);
+    let search_other = theme::adapt_color(color_support, SEARCH_OTHER_BG);
+    let mut cols = 0;
+    let mut end_char = start_char;
+    for c in line.chars().skip(start_char) {
+        let cw = char_width(c);
+        if cols + cw > max_columns {
+            break;
+        }
+        cols += cw;
+        end_char += 1;
+    }
     let start_byte = char_index_to_byte(line, start_char);
-    let end_byte = char_index_to_byte(line, start_char + width);
+    let end_byte = char_index_to_byte(line, end_char);
     let matches: Vec<(usize, usize, bool)> = matches
         .iter()
         .map(|&(a, b, current)| {
@@ -2188,22 +2306,22 @@ fn clip_ops<'a>(
             if ca < a || cb > b || ca >= cb {
                 continue;
             }
-            let mut style = style.unwrap_or_default();
+            let mut style = theme::adapt_style(color_support, style.unwrap_or_default());
             if let Some(&(_, _, current)) =
                 matches.iter().find(|&&(ma, mb, _)| ca >= ma && cb <= mb)
             {
                 let bg = if current {
-                    SEARCH_CURRENT_BG
+                    search_current
                 } else {
-                    SEARCH_OTHER_BG
+                    search_other
                 };
                 style = style.bg(bg);
             }
             if sel.is_some_and(|(sa, sb)| ca >= sa && cb <= sb) {
                 if style.fg.is_none() {
-                    style = style.fg(PALETTE.fg);
+                    style = style.fg(pal.fg);
                 }
-                style = style.bg(PALETTE.selection);
+                style = style.bg(pal.selection);
             }
             let text = expand_tabs(&line[ca..cb]);
             if style == Style::default() {
@@ -2800,6 +2918,7 @@ mod tests {
             line.chars().count(),
             None,
             &[(0, 5, false)],
+            ColorSupport::TrueColor,
         );
         let parts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(parts, vec!["hello", " world"]);
@@ -2807,6 +2926,35 @@ mod tests {
         assert_eq!(spans[0].style.bg, Some(SEARCH_OTHER_BG));
         assert_eq!(spans[0].style.fg, Some(Color::Blue));
         assert_eq!(spans[1].style.bg, None);
+    }
+
+    #[test]
+    fn clip_ops_clips_to_display_columns_not_char_count() {
+        let line = "X".repeat(40);
+        let spans = clip_ops(
+            &line,
+            &[(None, 0..line.len())],
+            0,
+            8,
+            None,
+            &[],
+            ColorSupport::TrueColor,
+        );
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "XXXXXXXX");
+
+        let line = "\tABCD";
+        let spans = clip_ops(
+            line,
+            &[(None, 0..line.len())],
+            0,
+            6,
+            None,
+            &[],
+            ColorSupport::TrueColor,
+        );
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "    AB");
     }
 
     // ---- modified printable characters ------------------------------------
@@ -3181,8 +3329,8 @@ mod tests {
 
     // ---- headless rendering via ratatui's TestBackend --------------------
 
-    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
     fn uses_catppuccin_mocha_theme() {
@@ -3735,7 +3883,7 @@ mod tests {
         render_buffer(&mut app);
 
         let click = |kind| mouse(kind, 37, 2); // char 6 = 'b' of "brave"
-        // the user clicks once to place the cursor...
+                                               // the user clicks once to place the cursor...
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         // ...hesitates longer than the editor click window...
@@ -4218,8 +4366,9 @@ mod tests {
         // a second draw shows the full editing button set again
         render_buffer(&mut app);
         let actions: Vec<Shortcut> = app.topbar_buttons.iter().map(|(a, _)| *a).collect();
-        assert_eq!(actions.len(), 12);
+        assert_eq!(actions.len(), 13);
         assert_eq!(actions[0], Shortcut::SwitchFocus);
+        assert!(actions.contains(&Shortcut::ToggleHidden));
     }
 
     // ---- clipboard ---------------------------------------------------------
@@ -4333,6 +4482,7 @@ mod tests {
             line.chars().count(),
             Some((3, 5)),
             &[],
+            ColorSupport::TrueColor,
         );
 
         assert_eq!(
@@ -4362,6 +4512,7 @@ mod tests {
             line.chars().count(),
             Some((start, end)),
             &[],
+            ColorSupport::TrueColor,
         );
 
         let selected: Vec<&str> = spans
@@ -4729,6 +4880,40 @@ mod tests {
     }
 
     #[test]
+    fn esc_restores_previous_buffer_and_wrap_after_image_preview() {
+        let dir = scratch("imgrestore");
+        fs::write(dir.join("notes.txt"), "hello wrap me\n").unwrap();
+        write_test_png(&dir.join("logo.png"));
+        write_test_png(&dir.join("other.png"));
+        let mut app = new_app(dir.clone(), Some(dir.join("notes.txt"))).unwrap();
+        render_buffer(&mut app);
+        app.handle_key(ctrl('w'));
+        assert!(app.buffer.wrap);
+
+        app.handle_key(ctrl('o'));
+        app.sidebar.select_name("logo.png");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.image.is_some());
+        assert_eq!(app.buffer.lines, vec![""]);
+        assert!(app.buffer.path.is_none());
+
+        // opening another image keeps the stashed text buffer
+        app.handle_key(ctrl('o'));
+        app.sidebar.select_name("other.png");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.image.as_ref().unwrap().path, dir.join("other.png"));
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.image.is_none());
+        assert_eq!(app.buffer.lines, vec!["hello wrap me", ""]);
+        assert_eq!(app.buffer.path, Some(dir.join("notes.txt")));
+        assert!(app.buffer.wrap);
+        let rows = render(&mut app);
+        assert!(row_contains(&rows, "notes.txt"));
+        assert!(!row_contains(&rows, "untitled"));
+    }
+
+    #[test]
     fn ctrl_o_and_ctrl_q_still_work_while_previewing() {
         let dir = scratch("imghotkeys");
         let file = dir.join("pic.png");
@@ -4822,5 +5007,106 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("not a valid image"), "{err}");
+    }
+
+    #[test]
+    fn unwrapped_long_line_does_not_paint_over_right_border() {
+        let dir = scratch("longline-border");
+        let file = dir.join("wide.txt");
+        fs::write(&file, format!("{}\n", "X".repeat(500))).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        assert!(!app.buffer.wrap);
+        let buf = render_buffer(&mut app);
+        let border_x = app.editor_area.x + app.editor_area.width - 1;
+        let y = app.editor_area.y + 1;
+        let cell = buf.cell((border_x, y)).unwrap();
+        assert_ne!(
+            cell.symbol(),
+            "X",
+            "unwrapped text painted over the right border"
+        );
+        assert!(
+            matches!(cell.symbol(), "│" | "┃" | "█" | "┤" | "┐" | "┘"),
+            "expected a border or scrollbar glyph, got {:?}",
+            cell.symbol()
+        );
+
+        // tabs expand to several columns; they must clip too
+        let dir = scratch("longline-tabs");
+        let file = dir.join("tabs.txt");
+        fs::write(&file, format!("{}\n", "\t".repeat(80))).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        let buf = render_buffer(&mut app);
+        let border_x = app.editor_area.x + app.editor_area.width - 1;
+        let y = app.editor_area.y + 1;
+        let cell = buf.cell((border_x, y)).unwrap();
+        assert_ne!(
+            cell.symbol(),
+            " ",
+            "tab expansion overwrote the right border"
+        );
+        assert!(matches!(cell.symbol(), "│" | "┃" | "█" | "┤" | "┐" | "┘"));
+    }
+
+    #[test]
+    fn ctrl_h_toggles_dotfiles_in_the_sidebar() {
+        let dir = scratch("apphidden");
+        fs::write(dir.join(".env"), "SECRET=1").unwrap();
+        fs::write(dir.join("shown.txt"), "ok").unwrap();
+        let mut app = new_app(dir, None).unwrap();
+        let names = |app: &App| {
+            app.sidebar
+                .entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(app.sidebar.hide_dotfiles);
+        assert_eq!(names(&app), vec!["..".to_string(), "shown.txt".to_string()]);
+        app.handle_key(ctrl('h'));
+        assert!(!app.sidebar.hide_dotfiles);
+        assert_eq!(
+            names(&app),
+            vec![
+                "..".to_string(),
+                ".env".to_string(),
+                "shown.txt".to_string()
+            ]
+        );
+        assert!(app
+            .message
+            .as_ref()
+            .is_some_and(|(msg, _)| msg.contains("dotfiles shown")));
+        app.handle_key(ctrl('h'));
+        assert!(app.sidebar.hide_dotfiles);
+        assert_eq!(names(&app), vec!["..".to_string(), "shown.txt".to_string()]);
+        let rows = render(&mut app);
+        assert!(row_contains(&rows, "Ctrl+H hidden"));
+    }
+
+    #[test]
+    fn ansi16_fallback_uses_named_colors_instead_of_rgb() {
+        let dir = scratch("ansi16-ui");
+        let file = dir.join("notes.txt");
+        fs::write(&file, "hello\n").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        app.set_color_support(ColorSupport::Ansi16);
+        let buf = render_buffer(&mut app);
+        let border = buf
+            .cell((app.editor_area.x, app.editor_area.y + 1))
+            .unwrap();
+        assert_eq!(border.style().fg, Some(Color::LightBlue));
+        assert_eq!(buf.cell((0, 0)).unwrap().style().bg, Some(Color::Black));
+        // truecolor default is unchanged
+        let dir = scratch("truecolor-ui");
+        let file = dir.join("notes.txt");
+        fs::write(&file, "hello\n").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        let buf = render_buffer(&mut app);
+        let border = buf
+            .cell((app.editor_area.x, app.editor_area.y + 1))
+            .unwrap();
+        assert_eq!(border.style().fg, Some(FOCUS_COLOR));
+        assert_eq!(buf.cell((0, 0)).unwrap().style().bg, Some(PALETTE.bg));
     }
 }

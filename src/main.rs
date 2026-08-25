@@ -10,6 +10,7 @@ mod highlight;
 mod image_view;
 mod search;
 mod sidebar;
+mod theme;
 
 use std::env;
 use std::fs;
@@ -24,8 +25,8 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use ratatui::DefaultTerminal;
-use ratatui_image::FontSize;
 use ratatui_image::picker::Picker;
+use ratatui_image::FontSize;
 
 use app::App;
 
@@ -76,6 +77,7 @@ fn main() -> io::Result<()> {
     // the event loop reads input (it briefly reads stdin itself).
     let (picker, logical_cell_size) = detect_image_picker();
     let mut app = App::new_with_cell_size(dir, file, picker, logical_cell_size)?;
+    app.set_color_support(theme::detect_color_support());
     run(&mut app, &mut terminal)
 }
 
@@ -354,7 +356,11 @@ fn run(app: &mut App, terminal: &mut DefaultTerminal) -> io::Result<()> {
 }
 
 fn print_usage() {
-    eprintln!(
+    eprint!("{}", usage_text());
+}
+
+fn usage_text() -> String {
+    format!(
         "rat — a tiny terminal text editor\n\
          \n\
          usage: rat [path]\n\
@@ -377,15 +383,19 @@ fn print_usage() {
          \x20 Ctrl+A   select all\n\
          \x20 Ctrl+F   search (type to filter, Enter/Shift+Enter next/prev, Esc closes)\n\
          \x20 Ctrl+W   toggle word wrapping of long lines\n\
+         \x20 Ctrl+H   show or hide dotfiles in the sidebar\n\
          \x20 Ctrl+Q   quit\n\
          \x20 mouse:    click editor to move the cursor, Ctrl/Cmd+click a web link to\n\
          \x20            open it in the default browser, drag to select, double-click\n\
          \x20            selects a word, triple-click selects the line, scroll to move,\n\
          \x20            single-click sidebar to select, double-click to open, scroll to browse\n\
          \x20 sidebar:  arrows/Enter open, Backspace goes up\n\
-         \x20 editor:   type, arrows (+Shift to select), Home/End, PgUp/PgDn, Backspace, Delete, Tab\n\n         images:  opening an image file (png/jpg/gif/webp/…) previews it in the\n         \x20            editor pane via the terminal's graphics protocol (kitty, sixel,
-         \x20            iTerm2, or unicode half-blocks as a last resort); Esc closes"
-    );
+         \x20 editor:   type, arrows (+Shift to select), Home/End, PgUp/PgDn, Backspace, Delete, Tab\n\
+         \n\
+         images:  opening an image file (png/jpg/gif/webp/…) previews it in the\n\
+         \x20            editor pane via the terminal's graphics protocol (kitty,\n\
+         \x20            sixel, iTerm2, or unicode half-blocks as a last resort); Esc closes\n"
+    )
 }
 
 #[cfg(test)]
@@ -429,5 +439,39 @@ mod tests {
     fn non_macos_logical_cell_size_uses_reported_dimensions_unchanged() {
         let logical = non_macos_logical_cell_size(FontSize::new(16, 34));
         assert_eq!((logical.width, logical.height), (16, 34));
+    }
+
+    #[test]
+    fn help_text_keeps_images_block_aligned_with_other_sections() {
+        let help = usage_text();
+        assert!(help.contains("rat -V | --version"));
+        assert!(help.contains("-V, --version  Print the version and exit"));
+        assert!(help.contains("Ctrl+W   toggle word wrapping of long lines"));
+        assert!(help.contains("Ctrl+H   show or hide dotfiles in the sidebar"));
+        let images = help
+            .lines()
+            .find(|line| line.trim_start().starts_with("images:"))
+            .expect("images blurb");
+        // the broken continuation used to dump the images header under the
+        // keys list with a deep indent (more spaces than "keys" / "editor")
+        let keys = help
+            .lines()
+            .find(|line| line.contains("keys (Cmd"))
+            .unwrap();
+        let keys_indent = keys.len() - keys.trim_start().len();
+        let images_indent = images.len() - images.trim_start().len();
+        assert_eq!(images_indent, keys_indent, "images={images:?}");
+        assert!(
+            !help.contains("sixel,            iTerm2"),
+            "sixel line must not pick up source-indent spaces:\n{help}"
+        );
+        let sixel = help.lines().find(|line| line.contains("sixel")).unwrap();
+        let mouse_cont = help
+            .lines()
+            .find(|line| line.contains("open it in the default browser"))
+            .unwrap();
+        let sixel_indent = sixel.len() - sixel.trim_start().len();
+        let mouse_indent = mouse_cont.len() - mouse_cont.trim_start().len();
+        assert_eq!(sixel_indent, mouse_indent, "sixel={sixel:?}");
     }
 }
