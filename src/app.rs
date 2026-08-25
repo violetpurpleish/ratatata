@@ -2586,25 +2586,64 @@ mod tests {
     #[test]
     fn wrapped_search_click_then_up_continues_moving() {
         let dir = scratch("search-wrapped-click");
-        let file = dir.join("README.md");
-        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md");
-        let contents = fs::read_to_string(source).unwrap();
+        let file = dir.join("notes.txt");
+        // Self-contained fixture: a few short lines, then a wrapping line
+        // with the search term on a continuation visual row. The previous
+        // version opened README.md and hardcoded a cursor line, which
+        // drifted whenever the docs changed.
+        let long_line = "Installs as the `rat` command (the binary name is set explicitly in Cargo.toml, separate from the package name). Requires a Rust toolchain with Edition 2024 support. Works in any terminal that supports crossterm event and drawing APIs.";
+        let contents = format!(
+            "{}\n{long_line}\n",
+            (0..8)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         fs::write(&file, &contents).unwrap();
         let mut app = new_app(dir, Some(file)).unwrap();
 
         render_sized(&mut app, 60, 24); // establish the viewport width
         app.handle_key(ctrl('w'));
         render_sized(&mut app, 60, 24); // establish the wrapped rows
-        open_search_typed(&mut app, "command");
+
+        let query = "command";
+        let match_line = app
+            .buffer
+            .lines
+            .iter()
+            .position(|line| line.contains(query))
+            .expect("fixture contains the search term");
+        let match_start = app.buffer.lines[match_line]
+            .find(query)
+            .expect("search term is on that line");
+        let wrap_width = app.buffer.wrap_width.max(1);
+        let match_vrow =
+            crate::buffer::visual_row_of(&app.buffer.lines[match_line], match_start, wrap_width);
+        assert!(
+            match_vrow > 0,
+            "fixture must wrap so the match sits on a continuation row"
+        );
+        assert!(match_line > 0, "fixture needs a previous logical line");
+
+        open_search_typed(&mut app, query);
         app.handle_key(key(KeyCode::Enter));
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(key(KeyCode::Up));
-        assert_eq!(app.buffer.cursor, (21, 28));
+        // Up from a continuation row stays on the same logical line.
+        assert_eq!(app.buffer.cursor.1, match_line);
+        assert_eq!(
+            crate::buffer::visual_row_of(
+                &app.buffer.lines[match_line],
+                app.buffer.cursor.0,
+                wrap_width
+            ),
+            match_vrow - 1
+        );
 
-        // Redraw after the first move, then click the only search result as
-        // a user would. The result starts at char 22 on README.md line 29.
+        // Redraw after the first move, then click a few characters into the
+        // only search result as a user would.
         render_sized(&mut app, 60, 24);
-        let target = (25, 28); // three characters into "command"
+        let target = (match_start + 3, match_line);
         let vrow = {
             let old = app.buffer.cursor;
             app.buffer.cursor = target;
@@ -2638,9 +2677,17 @@ mod tests {
         assert_eq!(app.buffer.cursor, target);
 
         app.handle_key(key(KeyCode::Up));
-        assert_eq!(app.buffer.cursor, (21, 28));
+        assert_eq!(app.buffer.cursor.1, match_line);
+        assert_eq!(
+            crate::buffer::visual_row_of(
+                &app.buffer.lines[match_line],
+                app.buffer.cursor.0,
+                wrap_width
+            ),
+            match_vrow - 1
+        );
         app.handle_key(key(KeyCode::Up));
-        assert_eq!(app.buffer.cursor.1, 27);
+        assert_eq!(app.buffer.cursor.1, match_line - 1);
     }
 
     #[test]

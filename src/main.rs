@@ -45,6 +45,10 @@ fn main() -> io::Result<()> {
         print_usage();
         return Ok(());
     }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.len() > 1 {
         eprintln!("error: expected at most one path argument");
         print_usage();
@@ -354,9 +358,14 @@ fn print_usage() {
         "rat — a tiny terminal text editor\n\
          \n\
          usage: rat [path]\n\
+                rat -h | --help\n\
+                rat -V | --version\n\
          \n\
          Opens `path` if it is a file, or browses it if it is a directory.\n\
          With no argument, the current directory is shown in the sidebar.\n\
+         \n\
+         -h, --help     Show this help and exit\n\
+         -V, --version  Print the version and exit\n\
          \n\
          keys (Cmd works like Ctrl on macOS-capable terminals):\n\
          \x20 Ctrl+N   start a new untitled buffer\n\

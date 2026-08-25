@@ -57,6 +57,8 @@ Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`
 
 ```sh
 rat [path]
+rat -h | --help
+rat -V | --version
 ```
 
 | Argument | Behavior |
@@ -66,6 +68,8 @@ rat [path]
 | `image.png` | Preview the image in the editor pane (kitty graphics protocol, unicode half-blocks as fallback; contained and scaled to the pane) |
 | `dir/` | Browse the directory |
 | `new.txt` (doesn't exist) | Start an untitled buffer bound to that path (created on first save) |
+| `-h` / `--help` | Print usage and exit |
+| `-V` / `--version` | Print the version and exit |
 
 ### Keys
 
