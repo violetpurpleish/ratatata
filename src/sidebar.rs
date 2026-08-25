@@ -32,6 +32,9 @@ pub struct Sidebar {
     pub entries: Vec<Entry>,
     pub selected: usize,
     pub scroll: usize,
+    /// When true (the default), entries whose names start with `.` are
+    /// omitted from the listing. The parent entry (`..`) is never hidden.
+    pub hide_dotfiles: bool,
 }
 
 impl Sidebar {
@@ -41,6 +44,7 @@ impl Sidebar {
             entries: Vec::new(),
             selected: 0,
             scroll: 0,
+            hide_dotfiles: true,
         };
         s.reload()?;
         Ok(s)
@@ -62,6 +66,9 @@ impl Sidebar {
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
+            if self.hide_dotfiles && name.starts_with('.') {
+                continue;
+            }
             // follow symlinks so symlinked dirs show up as dirs
             let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
             if is_dir {
@@ -204,12 +211,34 @@ mod tests {
 
         let sb = Sidebar::new(dir).unwrap();
         let names: Vec<&str> = sb.entries.iter().map(|e| e.name.as_str()).collect();
-        // ".." first (temp dir has a parent), then dirs, then files;
-        // '.' (0x2E) sorts before letters, so the hidden file comes first
-        assert_eq!(
-            names,
-            vec!["..", "apple", "Zebra", ".hidden", "Alpha.txt", "beta.txt"]
-        );
+        // ".." first (temp dir has a parent), then dirs, then files.
+        // Dotfiles are hidden by default, including `.hidden`.
+        assert_eq!(names, vec!["..", "apple", "Zebra", "Alpha.txt", "beta.txt"]);
+    }
+
+    #[test]
+    fn hide_dotfiles_toggle_lists_or_omits_dotfiles_but_keeps_parent() {
+        let dir = scratch("dotfiles");
+        fs::write(dir.join("visible.txt"), "x").unwrap();
+        fs::write(dir.join(".env"), "SECRET=1").unwrap();
+        fs::create_dir(dir.join(".git")).unwrap();
+
+        let mut sb = Sidebar::new(dir).unwrap();
+        assert!(sb.hide_dotfiles);
+        let hidden: Vec<&str> = sb.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(hidden, vec!["..", "visible.txt"]);
+        assert!(hidden.iter().any(|n| *n == ".."));
+        assert!(!hidden.iter().any(|n| *n == ".env" || *n == ".git"));
+
+        sb.hide_dotfiles = false;
+        sb.reload().unwrap();
+        let shown: Vec<&str> = sb.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(shown, vec!["..", ".git", ".env", "visible.txt"]);
+
+        sb.hide_dotfiles = true;
+        sb.reload().unwrap();
+        let hidden_again: Vec<&str> = sb.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(hidden_again, vec!["..", "visible.txt"]);
     }
 
     #[test]
