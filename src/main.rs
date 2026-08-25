@@ -25,8 +25,8 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use ratatui::DefaultTerminal;
-use ratatui_image::picker::Picker;
 use ratatui_image::FontSize;
+use ratatui_image::picker::Picker;
 
 use app::App;
 
@@ -376,12 +376,15 @@ fn usage_text() -> String {
          keys (Cmd works like Ctrl on macOS-capable terminals):\n\
          \x20 Ctrl+N   start a new untitled buffer\n\
          \x20 Ctrl+O   switch between sidebar and editor\n\
+         \x20 Ctrl+B   show or hide the file sidebar\n\
          \x20 Ctrl+S   save the current file (asks for a name if untitled)\n\
          \x20 Ctrl+R   reload the current file from disk (refreshes the sidebar too)\n\
          \x20 Ctrl+Z   undo (Ctrl+Shift+Z redo)\n\
          \x20 Ctrl+C/X/V  copy / cut / paste\n\
          \x20 Ctrl+A   select all\n\
          \x20 Ctrl+F   search (type to filter, Enter/Shift+Enter next/prev, Esc closes)\n\
+         \x20 Ctrl+Shift+H  find and replace (Tab field, Enter replace, Shift+Enter all, Esc closes)\n\
+         \x20 Ctrl+G   go to line\n\
          \x20 Ctrl+W   toggle word wrapping of long lines\n\
          \x20 Ctrl+H   show or hide dotfiles in the sidebar\n\
          \x20 Ctrl+Q   quit\n\
@@ -448,6 +451,10 @@ mod tests {
         assert!(help.contains("-V, --version  Print the version and exit"));
         assert!(help.contains("Ctrl+W   toggle word wrapping of long lines"));
         assert!(help.contains("Ctrl+H   show or hide dotfiles in the sidebar"));
+        assert!(help.contains("Ctrl+B   show or hide the file sidebar"));
+        assert!(help.contains("Ctrl+G   go to line"));
+        assert!(help.contains("Ctrl+Shift+H  find and replace"));
+        assert!(help.contains("Ctrl+A   select all"));
         let images = help
             .lines()
             .find(|line| line.trim_start().starts_with("images:"))

@@ -429,13 +429,18 @@ impl Buffer {
             return;
         }
         // open the paste's undo step explicitly, then fold the internal
-        // insert_char/newline calls into it via force_merge
-        if self.has_selection() {
-            self.push_undo(EditKind::DeleteSelection);
-        } else {
-            self.push_undo(EditKind::InsertChar);
+        // insert_char/newline calls into it via force_merge. When already
+        // merging (a compound replace-all), don't start a nested undo step
+        // and don't clear the outer merge flag.
+        let already_merging = self.force_merge;
+        if !already_merging {
+            if self.has_selection() {
+                self.push_undo(EditKind::DeleteSelection);
+            } else {
+                self.push_undo(EditKind::InsertChar);
+            }
+            self.force_merge = true;
         }
-        self.force_merge = true;
         let mut parts = text.split('\n');
         if let Some(first) = parts.next() {
             self.insert_text(first);
@@ -444,8 +449,45 @@ impl Buffer {
                 self.insert_text(rest);
             }
         }
+        if !already_merging {
+            self.force_merge = false;
+            // whatever follows the paste starts a fresh undo step
+            self.last_edit = None;
+        }
+    }
+
+    /// Replace a single-line char range with `text` (which may contain
+    /// newlines). One undo step.
+    pub fn replace_line_range(&mut self, line: usize, start: usize, end: usize, text: &str) {
+        self.selection_anchor = Some((start, line));
+        self.cursor = (end, line);
+        self.selecting = false;
+        if text.is_empty() {
+            let _ = self.delete_selection();
+        } else {
+            self.insert_multiline(text);
+        }
+    }
+
+    /// Replace several single-line char ranges with the same `text`, last
+    /// to first so later indices stay valid. One undo step for the set.
+    pub fn replace_line_ranges(&mut self, ranges: &[(usize, usize, usize)], text: &str) {
+        if ranges.is_empty() {
+            return;
+        }
+        self.push_undo(EditKind::DeleteSelection);
+        self.force_merge = true;
+        for &(line, start, end) in ranges.iter().rev() {
+            self.selection_anchor = Some((start, line));
+            self.cursor = (end, line);
+            self.selecting = false;
+            if text.is_empty() {
+                let _ = self.delete_selection();
+            } else {
+                self.insert_multiline(text);
+            }
+        }
         self.force_merge = false;
-        // whatever follows the paste starts a fresh undo step
         self.last_edit = None;
     }
 
@@ -2131,6 +2173,36 @@ mod tests {
         // select all + type replaces everything
         b.insert_char('z');
         assert_eq!(b.lines, vec!["z"]);
+    }
+
+    #[test]
+    fn replace_line_range_swaps_a_span_and_undoes_as_one_step() {
+        let mut b = empty();
+        typed(&mut b, "foo bar foo");
+        b.replace_line_range(0, 0, 3, "baz");
+        assert_eq!(b.lines, vec!["baz bar foo"]);
+        assert_eq!(b.cursor, (3, 0));
+        b.replace_line_range(0, 8, 11, "qux");
+        assert_eq!(b.lines, vec!["baz bar qux"]);
+        assert!(b.undo());
+        assert_eq!(b.lines, vec!["baz bar foo"]);
+        assert!(b.undo());
+        assert_eq!(b.lines, vec!["foo bar foo"]);
+    }
+
+    #[test]
+    fn replace_line_ranges_replaces_all_and_undoes_as_one_step() {
+        let mut b = empty();
+        typed(&mut b, "foo bar foo");
+        b.newline();
+        typed(&mut b, "foo");
+        b.replace_line_ranges(&[(0, 0, 3), (0, 8, 11), (1, 0, 3)], "x");
+        assert_eq!(b.lines, vec!["x bar x", "x"]);
+        assert!(b.undo());
+        assert_eq!(b.lines, vec!["foo bar foo", "foo"]);
+        // empty replacement deletes each span
+        b.replace_line_ranges(&[(0, 0, 3), (0, 8, 11)], "");
+        assert_eq!(b.lines, vec![" bar ", "foo"]);
     }
 
     #[test]

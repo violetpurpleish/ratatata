@@ -47,6 +47,13 @@ pub fn find_matches(lines: &[String], query: &str) -> Vec<Match> {
     out
 }
 
+/// Which field of a find-and-replace prompt is being edited.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SearchField {
+    Query,
+    Replacement,
+}
+
 /// Live search state: the query, its matches in the current buffer, and
 /// which match is "current" (the one the cursor sits on).
 pub struct Search {
@@ -56,16 +63,54 @@ pub struct Search {
     matches: Vec<Match>,
     /// Index into `matches` of the current match.
     current: usize,
+    /// When `Some`, this is find-and-replace rather than find-only. An
+    /// empty string is a valid replacement (delete each match).
+    pub replacement: Option<String>,
+    /// Which prompt field is being edited. Ignored in find-only mode.
+    pub field: SearchField,
 }
 
 impl Search {
-    /// A new, empty search.
+    /// A new, empty find-only search.
     pub fn new() -> Self {
         Self {
             query: String::new(),
             matches: Vec::new(),
             current: 0,
+            replacement: None,
+            field: SearchField::Query,
         }
+    }
+
+    /// A new find-and-replace prompt, starting on the find field.
+    pub fn new_replace() -> Self {
+        let mut search = Self::new();
+        search.replacement = Some(String::new());
+        search
+    }
+
+    /// Turn a find-only search into find-and-replace, keeping the query.
+    /// If the query is already non-empty, editing moves to the replacement
+    /// field so a newcomer can type find, then type the replacement.
+    pub fn enable_replace(&mut self) {
+        if self.replacement.is_none() {
+            self.replacement = Some(String::new());
+        }
+        self.field = if self.query.is_empty() {
+            SearchField::Query
+        } else {
+            SearchField::Replacement
+        };
+    }
+
+    /// Whether this search is in find-and-replace mode.
+    pub fn is_replace(&self) -> bool {
+        self.replacement.is_some()
+    }
+
+    /// All current matches, in document order.
+    pub fn matches(&self) -> &[Match] {
+        &self.matches
     }
 
     /// How many matches the query currently has.
@@ -261,5 +306,22 @@ mod tests {
             s.matches_on_line(9).collect::<Vec<_>>(),
             Vec::<(usize, usize, bool)>::new()
         );
+    }
+
+    #[test]
+    fn enable_replace_keeps_the_query_and_moves_to_the_replacement_field() {
+        let mut s = Search::new();
+        s.query = "foo".to_string();
+        s.enable_replace();
+        assert!(s.is_replace());
+        assert_eq!(s.query, "foo");
+        assert_eq!(s.replacement.as_deref(), Some(""));
+        assert_eq!(s.field, SearchField::Replacement);
+
+        let mut empty = Search::new_replace();
+        assert!(empty.is_replace());
+        assert_eq!(empty.field, SearchField::Query);
+        empty.enable_replace();
+        assert_eq!(empty.field, SearchField::Query);
     }
 }
