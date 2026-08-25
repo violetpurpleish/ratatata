@@ -22,23 +22,23 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
-use ratatui::Frame;
 use ratatui_themes::{Theme, ThemeName, ThemePalette};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::buffer::{char_width, expand_tabs, visual_chunk, visual_row_of, Buffer};
+use crate::buffer::{Buffer, char_width, expand_tabs, visual_chunk, visual_row_of};
 use crate::clipboard::{Clipboard, SystemClipboard};
 use crate::highlight::Highlighter;
 use crate::image_view::{self, ImagePreview};
-use crate::search::Search;
+use crate::search::{Search, SearchField};
 use crate::sidebar::{Kind, Sidebar};
 use crate::theme::{self, ColorSupport};
-use ratatui_image::picker::Picker;
 use ratatui_image::FontSize;
+use ratatui_image::picker::Picker;
 
 /// How long transient status messages stay visible.
 const MESSAGE_TTL: Duration = Duration::from_secs(4);
@@ -98,6 +98,7 @@ pub enum Focus {
 enum Shortcut {
     Quit,
     SwitchFocus,
+    ToggleSidebar,
     Save,
     Reload,
     Copy,
@@ -105,6 +106,8 @@ enum Shortcut {
     Paste,
     SelectAll,
     Find,
+    Replace,
+    GoToLine,
     ToggleWrap,
     ToggleHidden,
     Undo,
@@ -119,6 +122,7 @@ impl Shortcut {
         match self {
             Shortcut::Quit => "Ctrl+Q",
             Shortcut::SwitchFocus => "Ctrl+O",
+            Shortcut::ToggleSidebar => "Ctrl+B",
             Shortcut::Save => "Ctrl+S",
             Shortcut::Reload => "Ctrl+R",
             Shortcut::Copy => "Ctrl+C",
@@ -127,6 +131,8 @@ impl Shortcut {
             Shortcut::Paste => "Ctrl+V",
             Shortcut::SelectAll => "Ctrl+A",
             Shortcut::Find => "Ctrl+F",
+            Shortcut::Replace => "Ctrl+Shift+H",
+            Shortcut::GoToLine => "Ctrl+G",
             Shortcut::ToggleWrap => "Ctrl+W",
             Shortcut::ToggleHidden => "Ctrl+H",
             Shortcut::Undo => "Ctrl+Z",
@@ -141,14 +147,17 @@ impl Shortcut {
         match self {
             Shortcut::Quit => "quit",
             Shortcut::SwitchFocus => "switch",
+            Shortcut::ToggleSidebar => "files",
             Shortcut::Save => "save",
             Shortcut::Reload => "reload",
             Shortcut::Copy => "copy",
 
             Shortcut::Cut => "cut",
             Shortcut::Paste => "paste",
-            Shortcut::SelectAll => "select all",
+            Shortcut::SelectAll => "all",
             Shortcut::Find => "search",
+            Shortcut::Replace => "replace",
+            Shortcut::GoToLine => "line",
             Shortcut::ToggleWrap => "wrap",
             Shortcut::ToggleHidden => "hidden",
             Shortcut::Undo => "undo",
@@ -164,6 +173,7 @@ impl Shortcut {
         match self {
             Shortcut::Quit => "quit — press again to confirm unsaved changes",
             Shortcut::SwitchFocus => "switch between sidebar and editor",
+            Shortcut::ToggleSidebar => "show or hide the file sidebar",
             Shortcut::Save => "save the current file (asks for a name if untitled)",
             Shortcut::Reload => {
                 "reload the current file from disk (refuses unsaved changes; sidebar refreshes too)"
@@ -174,6 +184,10 @@ impl Shortcut {
             Shortcut::Paste => "paste from the clipboard",
             Shortcut::SelectAll => "select the whole buffer",
             Shortcut::Find => "search — type to filter, Enter/Shift+Enter next/prev, Esc closes",
+            Shortcut::Replace => {
+                "find and replace — type find, Tab/Enter replacement, Enter one, Shift+Enter all, Esc closes"
+            }
+            Shortcut::GoToLine => "go to a line number (1-based)",
             Shortcut::ToggleWrap => "toggle word wrapping of long lines",
             Shortcut::ToggleHidden => "show or hide dotfiles in the sidebar (never hides ..)",
             Shortcut::Undo => "undo the last edit",
@@ -188,9 +202,12 @@ impl Shortcut {
         match self {
             Shortcut::Quit => PALETTE.error,
             Shortcut::SwitchFocus => PALETTE.info,
+            Shortcut::ToggleSidebar => PALETTE.info,
             Shortcut::Save => PALETTE.success,
             Shortcut::Reload => PALETTE.info,
             Shortcut::Find => PALETTE.warning,
+            Shortcut::Replace => PALETTE.warning,
+            Shortcut::GoToLine => PALETTE.secondary,
             Shortcut::ToggleWrap => PALETTE.secondary,
             Shortcut::ToggleHidden => PALETTE.info,
             Shortcut::NewFile => PALETTE.accent,
@@ -228,8 +245,14 @@ pub struct App {
     message: Option<(String, Instant)>,
     /// Active "save as" input text, when the buffer has no file name.
     save_as_input: Option<String>,
-    /// Active incremental search (Ctrl+F), `None` while not searching.
+    /// Active "go to line" input text, `None` while the prompt is closed.
+    goto_line_input: Option<String>,
+    /// Active incremental search (Ctrl+F) or find-and-replace
+    /// (Ctrl+Shift+H), `None` while not searching.
     search: Option<Search>,
+    /// Whether the file-tree sidebar is shown. Hidden state keeps the
+    /// sidebar's directory and selection so toggling it back restores them.
+    sidebar_visible: bool,
     /// Set when Ctrl+Q is pressed with unsaved changes; second press quits.
     quit_armed: bool,
     /// Viewport sizes from the last draw, used for paging and scrolling.
@@ -304,7 +327,9 @@ impl App {
             color_support: ColorSupport::TrueColor,
             message: None,
             save_as_input: None,
+            goto_line_input: None,
             search: None,
+            sidebar_visible: true,
             quit_armed: false,
             editor_text: (0, 0),
             last_drawn_cursor: None,
@@ -321,6 +346,11 @@ impl App {
 
     fn set_message(&mut self, msg: impl Into<String>) {
         self.message = Some((msg.into(), Instant::now() + MESSAGE_TTL));
+    }
+
+    /// Save-as and go-to-line steal typing from the editor.
+    fn text_prompt_active(&self) -> bool {
+        self.save_as_input.is_some() || self.goto_line_input.is_some()
     }
 
     /// Select the color path. Tests leave this at truecolor so Catppuccin
@@ -381,6 +411,7 @@ impl App {
             let action = match key.code {
                 KeyCode::Char('q') => Shortcut::Quit,
                 KeyCode::Char('o') => Shortcut::SwitchFocus,
+                KeyCode::Char('b') => Shortcut::ToggleSidebar,
                 KeyCode::Char('s') => Shortcut::Save,
                 KeyCode::Char('r') => Shortcut::Reload,
                 KeyCode::Char('c') => Shortcut::Copy,
@@ -389,8 +420,17 @@ impl App {
                 KeyCode::Char('v') => Shortcut::Paste,
                 KeyCode::Char('a') => Shortcut::SelectAll,
                 KeyCode::Char('f') => Shortcut::Find,
+                KeyCode::Char('g') => Shortcut::GoToLine,
                 KeyCode::Char('w') => Shortcut::ToggleWrap,
-                KeyCode::Char('h') => Shortcut::ToggleHidden,
+                // Ctrl+Shift+H is find-and-replace. Unshifted Ctrl+H stays
+                // hide-dotfiles; CapsLock Ctrl+H is still hide-dotfiles
+                // because only an explicit Shift modifier means replace.
+                KeyCode::Char('h') | KeyCode::Char('H')
+                    if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    Shortcut::Replace
+                }
+                KeyCode::Char('h') | KeyCode::Char('H') => Shortcut::ToggleHidden,
                 KeyCode::Char('n') => Shortcut::NewFile,
                 // Ctrl+Z undoes, Ctrl+Shift+Z redoes (CapsLock typos land
                 // on redo, a harmless no-op without history). The shifted
@@ -438,6 +478,19 @@ impl App {
             return;
         }
 
+        if let Some(input) = self.goto_line_input.as_mut() {
+            match key.code {
+                KeyCode::Esc => self.goto_line_input = None,
+                KeyCode::Enter => self.confirm_goto_line(),
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c) => input.push(printable_char(c, key.modifiers)),
+                _ => {}
+            }
+            return;
+        }
+
         // The search bar is modal like the save-as prompt: Esc closes it,
         // Enter/Shift+Enter step through the matches, and printable input
         // edits the query. Navigation keys dismiss the bar and continue to
@@ -464,7 +517,45 @@ impl App {
         {
             self.search = None;
         }
+        // Find-and-replace: Tab switches fields; Enter on the find field
+        // moves to the replacement; Enter on the replacement replaces the
+        // current match (Shift+Enter replaces all). These arms call back
+        // into App, so they must not hold a borrow of `search`.
+        if self.search.as_ref().is_some_and(|s| s.is_replace()) {
+            let field = self.search.as_ref().unwrap().field;
+            match key.code {
+                KeyCode::Tab => {
+                    if let Some(search) = self.search.as_mut() {
+                        search.field = match search.field {
+                            SearchField::Query => SearchField::Replacement,
+                            SearchField::Replacement => SearchField::Query,
+                        };
+                    }
+                    return;
+                }
+                KeyCode::Enter
+                    if field == SearchField::Query
+                        && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    if let Some(search) = self.search.as_mut() {
+                        search.field = SearchField::Replacement;
+                    }
+                    return;
+                }
+                KeyCode::Enter if field == SearchField::Replacement => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        self.replace_all_matches();
+                    } else {
+                        self.replace_current_match();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         if let Some(search) = self.search.as_mut() {
+            let replacing = search.is_replace();
+            let field = search.field;
             let mut query_changed = false;
             match key.code {
                 KeyCode::Enter => {
@@ -475,9 +566,23 @@ impl App {
                     };
                     search.step(dir);
                 }
+                KeyCode::Backspace if replacing && field == SearchField::Replacement => {
+                    if let Some(replacement) = search.replacement.as_mut() {
+                        replacement.pop();
+                    }
+                    return;
+                }
                 KeyCode::Backspace => {
                     search.query.pop();
                     query_changed = true;
+                }
+                KeyCode::Char(c)
+                    if replacing && field == SearchField::Replacement && !c.is_control() =>
+                {
+                    if let Some(replacement) = search.replacement.as_mut() {
+                        replacement.push(printable_char(c, key.modifiers));
+                    }
+                    return;
                 }
                 KeyCode::Char(c) if !c.is_control() => {
                     search.query.push(printable_char(c, key.modifiers));
@@ -514,14 +619,22 @@ impl App {
                 }
             }
             Shortcut::SwitchFocus => {
-                // not while the save-as prompt is modal
-                if self.save_as_input.is_none() {
-                    self.focus = match self.focus {
-                        Focus::Sidebar => Focus::Editor,
-                        Focus::Editor => Focus::Sidebar,
-                    };
+                // not while a text prompt is modal
+                if !self.text_prompt_active() {
+                    if !self.sidebar_visible {
+                        // Hidden sidebar: show it and focus it so Ctrl+O
+                        // never traps the user on a panel they cannot see.
+                        self.sidebar_visible = true;
+                        self.focus = Focus::Sidebar;
+                    } else {
+                        self.focus = match self.focus {
+                            Focus::Sidebar => Focus::Editor,
+                            Focus::Editor => Focus::Sidebar,
+                        };
+                    }
                 }
             }
+            Shortcut::ToggleSidebar => self.toggle_sidebar(),
             Shortcut::ClosePreview => {
                 if self.image.is_some() {
                     self.close_image_preview();
@@ -529,7 +642,7 @@ impl App {
             }
             Shortcut::NewFile => {
                 // not while the save-as prompt or the search bar is modal
-                if self.save_as_input.is_none() && self.search.is_none() {
+                if !self.text_prompt_active() && self.search.is_none() {
                     self.new_file();
                 }
             }
@@ -539,27 +652,29 @@ impl App {
             Shortcut::ToggleHidden => self.toggle_hidden_files(),
             // While an image preview is open the remaining shortcuts do
             // nothing: there is no text to edit, save or search. This arm
-            // comes after Quit/SwitchFocus/ClosePreview/NewFile (which
-            // still work) and before the rest.
+            // comes after Quit/SwitchFocus/ClosePreview/NewFile/ToggleSidebar
+            // (which still work) and before the rest.
             _ if self.image.is_some() => {}
             Shortcut::Save => self.save(),
             Shortcut::Copy => {
-                if self.save_as_input.is_none() && self.search.is_none() {
+                if !self.text_prompt_active() && self.search.is_none() {
                     self.copy_selection();
                 }
             }
             Shortcut::Cut => {
-                if self.save_as_input.is_none() && self.search.is_none() {
+                if !self.text_prompt_active() && self.search.is_none() {
                     self.cut_selection();
                 }
             }
             Shortcut::Paste => self.paste_clipboard(),
             Shortcut::SelectAll => {
-                if self.save_as_input.is_none() && self.search.is_none() {
+                if !self.text_prompt_active() && self.search.is_none() {
                     self.buffer.select_all();
                 }
             }
             Shortcut::Find => self.open_search(),
+            Shortcut::Replace => self.open_replace(),
+            Shortcut::GoToLine => self.open_goto_line(),
             Shortcut::ToggleWrap => {
                 let (w, _) = self.editor_text;
                 let wrap = self.buffer.toggle_wrap(w as usize);
@@ -571,12 +686,12 @@ impl App {
                 self.ensure_cursor_visible();
             }
             Shortcut::Undo => {
-                if self.save_as_input.is_none() && self.search.is_none() {
+                if !self.text_prompt_active() && self.search.is_none() {
                     self.undo();
                 }
             }
             Shortcut::Redo => {
-                if self.save_as_input.is_none() && self.search.is_none() {
+                if !self.text_prompt_active() && self.search.is_none() {
                     self.redo();
                 }
             }
@@ -729,11 +844,12 @@ impl App {
             input.push_str(&text);
             return;
         }
-        if let Some(search) = self.search.as_mut() {
-            search
-                .query
-                .extend(text.chars().filter(|c| !c.is_control()));
-            self.recompute_search();
+        if let Some(input) = self.goto_line_input.as_mut() {
+            input.push_str(&text);
+            return;
+        }
+        if self.search.is_some() {
+            self.append_to_search(&text);
             return;
         }
         self.paste_text(text);
@@ -746,12 +862,18 @@ impl App {
         if self.image.is_some() {
             return;
         }
-        // bracketed paste while searching fills in the query instead
-        if let Some(search) = self.search.as_mut() {
-            search
-                .query
-                .extend(text.chars().filter(|c| !c.is_control()));
-            self.recompute_search();
+        // bracketed paste while a text prompt is open fills the prompt
+        if let Some(input) = self.save_as_input.as_mut() {
+            input.extend(text.chars().filter(|c| !c.is_control()));
+            return;
+        }
+        if let Some(input) = self.goto_line_input.as_mut() {
+            input.extend(text.chars().filter(|c| !c.is_control()));
+            return;
+        }
+        // bracketed paste while searching fills in the active field
+        if self.search.is_some() {
+            self.append_to_search(&text);
             return;
         }
         self.focus = Focus::Editor;
@@ -808,11 +930,7 @@ impl App {
                     // stuck selecting the line)
                     let count = match self.last_editor_click {
                         Some((t, p, c)) if t.elapsed() < EDITOR_CLICK_TTL && p == click => {
-                            if c >= 3 {
-                                1
-                            } else {
-                                c + 1
-                            }
+                            if c >= 3 { 1 } else { c + 1 }
                         }
                         _ => 1,
                     };
@@ -1217,10 +1335,131 @@ impl App {
         if self.save_as_input.is_some() {
             return;
         }
+        self.goto_line_input = None;
         if self.search.is_some() {
             self.search_step(1);
         } else {
             self.search = Some(Search::new());
+        }
+    }
+
+    /// Open find-and-replace. Reuses an existing Ctrl+F search when one is
+    /// already open (keeping the query) so a newcomer can type find, then
+    /// type the replacement.
+    fn open_replace(&mut self) {
+        if self.save_as_input.is_some() {
+            return;
+        }
+        self.goto_line_input = None;
+        match &mut self.search {
+            Some(search) => search.enable_replace(),
+            None => self.search = Some(Search::new_replace()),
+        }
+    }
+
+    /// Append pasted text to whichever search field is being edited.
+    fn append_to_search(&mut self, text: &str) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        let filtered = text.chars().filter(|c| !c.is_control());
+        if search.is_replace() && search.field == SearchField::Replacement {
+            if let Some(replacement) = search.replacement.as_mut() {
+                replacement.extend(filtered);
+            }
+            return;
+        }
+        search.query.extend(filtered);
+        self.recompute_search();
+    }
+
+    /// Replace the current match with the replacement string and jump to
+    /// the next remaining match. No-ops with a status message when there
+    /// is nothing to replace.
+    fn replace_current_match(&mut self) {
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        let Some(replacement) = search.replacement.clone() else {
+            return;
+        };
+        let Some(m) = search.current_match() else {
+            self.set_message("no matches");
+            return;
+        };
+        self.buffer
+            .replace_line_range(m.line, m.start, m.end, &replacement);
+        if let Some(line) = self.buffer.last_edit_line.take() {
+            self.highlighter.invalidate_from(line);
+        }
+        self.quit_armed = false;
+        self.recompute_search();
+    }
+
+    /// Replace every current match. One undo step. If the replacement
+    /// contains the query, only the original matches are replaced (last
+    /// to first) so this cannot loop.
+    fn replace_all_matches(&mut self) {
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        let Some(replacement) = search.replacement.clone() else {
+            return;
+        };
+        let ranges: Vec<(usize, usize, usize)> = search
+            .matches()
+            .iter()
+            .map(|m| (m.line, m.start, m.end))
+            .collect();
+        if ranges.is_empty() {
+            self.set_message("no matches");
+            return;
+        }
+        let n = ranges.len();
+        self.buffer.replace_line_ranges(&ranges, &replacement);
+        if let Some(line) = self.buffer.last_edit_line.take() {
+            self.highlighter.invalidate_from(line);
+        }
+        self.quit_armed = false;
+        self.recompute_search();
+        self.set_message(format!(
+            "replaced {n} {}",
+            if n == 1 { "match" } else { "matches" }
+        ));
+    }
+
+    /// Open the go-to-line prompt. Invalid numbers are reported in the
+    /// status bar rather than panicking.
+    fn open_goto_line(&mut self) {
+        if self.save_as_input.is_some() {
+            return;
+        }
+        self.search = None;
+        if self.goto_line_input.is_none() {
+            self.goto_line_input = Some(String::new());
+        }
+    }
+
+    fn confirm_goto_line(&mut self) {
+        let Some(input) = self.goto_line_input.take() else {
+            return;
+        };
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            self.set_message("invalid line number");
+            return;
+        }
+        let last = self.buffer.lines.len();
+        match trimmed.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= last => {
+                let y = n - 1;
+                self.buffer.clear_selection();
+                self.buffer.cursor = (0, y);
+                self.focus = Focus::Editor;
+                self.ensure_cursor_visible();
+            }
+            Ok(_) => self.set_message(format!("line {trimmed} is out of range (1–{last})")),
+            Err(_) => self.set_message("invalid line number"),
         }
     }
 
@@ -1354,6 +1593,20 @@ impl App {
         });
     }
 
+    /// Hide or show the file tree. Directory and selection survive so the
+    /// editor can take the width and toggling back restores the tree.
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+        if !self.sidebar_visible && self.focus == Focus::Sidebar {
+            self.focus = Focus::Editor;
+        }
+        self.set_message(if self.sidebar_visible {
+            "sidebar shown"
+        } else {
+            "sidebar hidden"
+        });
+    }
+
     // ---- drawing -----------------------------------------------------------
 
     pub fn draw(&mut self, frame: &mut Frame) {
@@ -1372,14 +1625,22 @@ impl App {
             Constraint::Length(STATUS_HEIGHT),
         ])
         .areas(frame.area());
-        let [side_area, edit_area] =
-            Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)]).areas(main);
+        let (side_area, edit_area) = if self.sidebar_visible {
+            let [side, edit] =
+                Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
+                    .areas(main);
+            (side, edit)
+        } else {
+            (Rect::new(0, 0, 0, 0), main)
+        };
         self.topbar_area = top_area;
         self.sidebar_area = side_area;
         self.editor_area = edit_area;
 
         self.draw_topbar(frame, top_area, &pills);
-        self.draw_sidebar(frame, side_area);
+        if self.sidebar_visible {
+            self.draw_sidebar(frame, side_area);
+        }
         self.draw_editor(frame, edit_area);
         self.draw_status(frame, status_area);
     }
@@ -1398,6 +1659,7 @@ impl App {
         } else {
             vec![
                 Shortcut::SwitchFocus,
+                Shortcut::ToggleSidebar,
                 Shortcut::NewFile,
                 Shortcut::Save,
                 Shortcut::Reload,
@@ -1406,7 +1668,10 @@ impl App {
                 Shortcut::Copy,
                 Shortcut::Cut,
                 Shortcut::Paste,
+                Shortcut::SelectAll,
                 Shortcut::Find,
+                Shortcut::Replace,
+                Shortcut::GoToLine,
                 Shortcut::ToggleWrap,
                 Shortcut::ToggleHidden,
                 Shortcut::Quit,
@@ -1593,6 +1858,7 @@ impl App {
                 // the chunk the cursor sits on within this line
                 let cursor_chunk = if self.focus == Focus::Editor
                     && self.save_as_input.is_none()
+                    && self.goto_line_input.is_none()
                     && self.buffer.cursor.1 == y
                 {
                     Some(visual_row_of(line, self.buffer.cursor.0, width))
@@ -1657,7 +1923,7 @@ impl App {
             let paragraph = Paragraph::new(rows);
             frame.render_widget(paragraph, inner);
 
-            if self.focus == Focus::Editor && self.save_as_input.is_none() {
+            if self.focus == Focus::Editor && !self.text_prompt_active() {
                 let caret_vrow = self.buffer.cursor_vrow();
                 if caret_vrow >= self.buffer.scroll.1 && caret_vrow < self.buffer.scroll.1 + text_h
                 {
@@ -1706,6 +1972,7 @@ impl App {
             let line = &self.buffer.lines[y];
             if self.focus == Focus::Editor
                 && self.save_as_input.is_none()
+                && self.goto_line_input.is_none()
                 && self.buffer.cursor.1 == y
                 && self.buffer.cursor.0 >= self.buffer.scroll.0
                 && self.buffer.cursor.0 < self.buffer.scroll.0 + text_w
@@ -1751,7 +2018,7 @@ impl App {
         let paragraph = Paragraph::new(rows);
         frame.render_widget(paragraph, inner);
 
-        if self.focus == Focus::Editor && self.save_as_input.is_none() {
+        if self.focus == Focus::Editor && !self.text_prompt_active() {
             // Ratatui can position the terminal cursor, but cannot give it a
             // color. Render a block caret ourselves so it remains distinct
             // from the themed selection style (and leave the native cursor
@@ -1848,15 +2115,39 @@ impl App {
             return;
         }
 
-        // the search prompt replaces the status bar content while active
-        if let Some(search) = &self.search {
-            let prompt = "search: ";
+        // "go to line" prompt replaces the status bar content
+        if let Some(input) = &self.goto_line_input {
+            let prompt = "go to line: ";
             let prompt_w = prompt.width() as u16;
-            let input_w = search
-                .query
-                .chars()
-                .map(|c| c.width().unwrap_or(0))
-                .sum::<usize>() as u16;
+            let input_w = input.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() as u16;
+            let paragraph = Paragraph::new(Line::from(vec![
+                Span::styled(
+                    prompt,
+                    Style::default()
+                        .fg(self.pal().warning)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(input.clone(), Style::default().fg(self.pal().fg)),
+            ]))
+            .style(Style::default().bg(self.pal().bg));
+            frame.render_widget(paragraph, area);
+            frame.set_cursor_position(Position::new(area.x + prompt_w + input_w, area.y));
+            return;
+        }
+
+        // the search / replace prompt replaces the status bar content while active
+        if let Some(search) = &self.search {
+            let editing_replacement =
+                search.is_replace() && search.field == SearchField::Replacement;
+            let (prompt, value) = if editing_replacement {
+                ("replace: ", search.replacement.clone().unwrap_or_default())
+            } else if search.is_replace() {
+                ("find: ", search.query.clone())
+            } else {
+                ("search: ", search.query.clone())
+            };
+            let prompt_w = prompt.width() as u16;
+            let input_w = value.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() as u16;
             let base = Style::default().bg(self.pal().bg);
             let counter: Vec<Span> = if search.query.is_empty() {
                 Vec::new()
@@ -1884,7 +2175,7 @@ impl App {
                             .fg(self.pal().warning)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(search.query.clone(), Style::default().fg(self.pal().fg)),
+                    Span::styled(value, Style::default().fg(self.pal().fg)),
                 ]))
                 .style(base),
                 left_area,
@@ -2907,6 +3198,297 @@ mod tests {
         assert!(app.search.is_some());
     }
 
+    // ---- find and replace (Ctrl+Shift+H) ----------------------------------
+
+    #[test]
+    fn ctrl_shift_h_opens_replace_and_replaces_current_then_all() {
+        let dir = scratch("replace1");
+        let file = dir.join("a.txt");
+        fs::write(&file, "foo bar foo\nfoo\n").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+
+        app.handle_key(ctrl_shift('h'));
+        assert!(app.search.as_ref().is_some_and(|s| s.is_replace()));
+        assert_eq!(
+            app.search.as_ref().unwrap().field,
+            crate::search::SearchField::Query
+        );
+        for c in "foo".chars() {
+            app.handle_key(char_key(c));
+        }
+        assert_eq!(app.search.as_ref().unwrap().match_count(), 3);
+
+        // Enter on the find field moves to the replacement
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.search.as_ref().unwrap().field,
+            crate::search::SearchField::Replacement
+        );
+        for c in "qux".chars() {
+            app.handle_key(char_key(c));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.buffer.lines, vec!["qux bar foo", "foo", ""]);
+        assert_eq!(app.search.as_ref().unwrap().match_count(), 2);
+
+        // Shift+Enter replaces the rest
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.buffer.lines, vec!["qux bar qux", "qux", ""]);
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("replaced 2"))
+        );
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn replace_reuses_an_open_search_query() {
+        let dir = scratch("replace2");
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello hello\n").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        open_search_typed(&mut app, "hello");
+        app.handle_key(ctrl_shift('h'));
+        let search = app.search.as_ref().unwrap();
+        assert!(search.is_replace());
+        assert_eq!(search.query, "hello");
+        assert_eq!(search.field, crate::search::SearchField::Replacement);
+
+        for c in "hi".chars() {
+            app.handle_key(char_key(c));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.buffer.lines[0], "hi hello");
+    }
+
+    #[test]
+    fn replace_with_no_matches_is_a_status_message() {
+        let dir = scratch("replace3");
+        let file = dir.join("a.txt");
+        fs::write(&file, "alpha\n").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        app.handle_key(ctrl_shift('h'));
+        for c in "zzz".chars() {
+            app.handle_key(char_key(c));
+        }
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(char_key('x'));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.buffer.lines, vec!["alpha", ""]);
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("no matches"))
+        );
+    }
+
+    #[test]
+    fn replace_undoes_one_replacement_and_replace_all_as_one_step() {
+        let dir = scratch("replace4");
+        let file = dir.join("a.txt");
+        fs::write(&file, "aa aa aa").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        app.handle_key(ctrl_shift('h'));
+        app.handle_key(char_key('a'));
+        app.handle_key(char_key('a'));
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(char_key('b'));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.buffer.lines, vec!["b aa aa"]);
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(ctrl('z'));
+        assert_eq!(app.buffer.lines, vec!["aa aa aa"]);
+
+        app.handle_key(ctrl_shift('h'));
+        app.handle_key(char_key('a'));
+        app.handle_key(char_key('a'));
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(char_key('b'));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.buffer.lines, vec!["b b b"]);
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(ctrl('z'));
+        assert_eq!(app.buffer.lines, vec!["aa aa aa"]);
+    }
+
+    #[test]
+    fn ctrl_h_during_replace_still_toggles_dotfiles() {
+        let dir = scratch("replace5");
+        fs::write(dir.join(".env"), "SECRET=1").unwrap();
+        fs::write(dir.join("a.txt"), "foo").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        app.handle_key(ctrl_shift('h'));
+        assert!(app.sidebar.hide_dotfiles);
+        app.handle_key(ctrl('h'));
+        assert!(!app.sidebar.hide_dotfiles);
+        assert!(app.search.as_ref().is_some_and(|s| s.is_replace()));
+    }
+
+    #[test]
+    fn cmd_shift_h_opens_replace_like_ctrl_shift_h() {
+        let dir = scratch("replace6");
+        fs::write(dir.join("a.txt"), "foo").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        app.handle_key(cmd_shift('h'));
+        assert!(app.search.as_ref().is_some_and(|s| s.is_replace()));
+    }
+
+    // ---- go to line (Ctrl+G) ----------------------------------------------
+
+    #[test]
+    fn ctrl_g_jumps_to_a_1_based_line_and_keeps_it_visible() {
+        let dir = scratch("goto1");
+        let file = dir.join("a.txt");
+        let contents: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        fs::write(&file, &contents).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        render_sized(&mut app, 80, 12);
+
+        app.handle_key(ctrl('g'));
+        assert_eq!(app.goto_line_input.as_deref(), Some(""));
+        let rows = render(&mut app);
+        assert!(row_contains(&rows, "go to line:"));
+
+        app.handle_key(char_key('3'));
+        app.handle_key(char_key('5'));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.goto_line_input.is_none());
+        assert_eq!(app.buffer.cursor, (0, 34));
+        assert_eq!(app.focus, Focus::Editor);
+        // the jumped-to line must be inside the viewport
+        let (_w, h) = app.editor_text;
+        assert!(app.buffer.cursor.1 >= app.buffer.scroll.1);
+        assert!(app.buffer.cursor.1 < app.buffer.scroll.1 + h as usize);
+    }
+
+    #[test]
+    fn ctrl_g_invalid_input_is_a_status_message() {
+        let dir = scratch("goto2");
+        let file = dir.join("a.txt");
+        fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        let cursor = app.buffer.cursor;
+
+        app.handle_key(ctrl('g'));
+        for c in "nope".chars() {
+            app.handle_key(char_key(c));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.buffer.cursor, cursor);
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("invalid line number"))
+        );
+
+        app.handle_key(ctrl('g'));
+        app.handle_key(char_key('0'));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.buffer.cursor, cursor);
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("out of range") || msg.contains("invalid"))
+        );
+
+        app.handle_key(ctrl('g'));
+        for c in "99".chars() {
+            app.handle_key(char_key(c));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.buffer.cursor, cursor);
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("out of range"))
+        );
+
+        app.handle_key(ctrl('g'));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.goto_line_input.is_none());
+    }
+
+    // ---- toggle sidebar (Ctrl+B) ------------------------------------------
+
+    #[test]
+    fn ctrl_b_hides_the_sidebar_and_preserves_selection() {
+        let dir = scratch("sidebar-toggle1");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        fs::write(dir.join("b.txt"), "beta").unwrap();
+        let mut app = new_app(dir.clone(), None).unwrap();
+        app.sidebar.select_name("b.txt");
+        let selected = app.sidebar.selected;
+        let listed = app.sidebar.dir.clone();
+
+        app.handle_key(ctrl('b'));
+        assert!(!app.sidebar_visible);
+        assert_eq!(app.focus, Focus::Editor); // was sidebar; don't trap
+        assert_eq!(app.sidebar.selected, selected);
+        assert_eq!(app.sidebar.dir, listed);
+
+        render_buffer(&mut app);
+        let rows = render(&mut app);
+        assert!(!row_contains(&rows, "b.txt"));
+        assert!(app.editor_area.x < 28);
+
+        app.handle_key(ctrl('b'));
+        assert!(app.sidebar_visible);
+        assert_eq!(app.sidebar.selected, selected);
+        render_buffer(&mut app);
+        let rows = render(&mut app);
+        assert!(row_contains(&rows, "b.txt"));
+    }
+
+    #[test]
+    fn ctrl_o_while_sidebar_hidden_shows_and_focuses_it() {
+        let dir = scratch("sidebar-toggle2");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        assert_eq!(app.focus, Focus::Editor);
+        app.handle_key(ctrl('b'));
+        assert!(!app.sidebar_visible);
+        assert_eq!(app.focus, Focus::Editor);
+
+        app.handle_key(ctrl('o'));
+        assert!(app.sidebar_visible);
+        assert_eq!(app.focus, Focus::Sidebar);
+
+        app.handle_key(ctrl('o'));
+        assert!(app.sidebar_visible);
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
+    fn editing_topbar_has_seventeen_shortcuts_with_quit_last() {
+        let dir = scratch("topbar17");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        render_buffer(&mut app);
+        let actions: Vec<Shortcut> = app.topbar_buttons.iter().map(|(a, _)| *a).collect();
+        assert_eq!(actions.len(), 17);
+        assert_eq!(*actions.last().unwrap(), Shortcut::Quit);
+        for action in [
+            Shortcut::SelectAll,
+            Shortcut::ToggleSidebar,
+            Shortcut::GoToLine,
+            Shortcut::Replace,
+            Shortcut::ToggleHidden,
+        ] {
+            assert!(actions.contains(&action), "missing {action:?}");
+        }
+        let rows = render(&mut app);
+        assert!(row_contains(&rows, "Ctrl+A all"));
+        assert!(row_contains(&rows, "Ctrl+B files"));
+        assert!(row_contains(&rows, "Ctrl+G line"));
+        assert!(row_contains(&rows, "Ctrl+Shift+H replace"));
+        assert!(row_contains(&rows, "Ctrl+Q quit"));
+        // 150 columns is enough for the full 17-button set on two rows
+        assert_eq!(app.topbar_buttons.len(), 17);
+    }
+
     #[test]
     fn clip_ops_styles_search_matches() {
         let line = "hello world";
@@ -3329,8 +3911,8 @@ mod tests {
 
     // ---- headless rendering via ratatui's TestBackend --------------------
 
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn uses_catppuccin_mocha_theme() {
@@ -3883,7 +4465,7 @@ mod tests {
         render_buffer(&mut app);
 
         let click = |kind| mouse(kind, 37, 2); // char 6 = 'b' of "brave"
-                                               // the user clicks once to place the cursor...
+        // the user clicks once to place the cursor...
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)));
         app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)));
         // ...hesitates longer than the editor click window...
@@ -4198,6 +4780,74 @@ mod tests {
     }
 
     #[test]
+    fn clicking_select_all_button_selects_the_buffer() {
+        let dir = scratch("mbtnall");
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello\nworld").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+        assert!(!app.buffer.has_selection());
+        click_button(&mut app, Shortcut::SelectAll);
+        assert_eq!(app.buffer.selected_text().as_deref(), Some("hello\nworld"));
+    }
+
+    #[test]
+    fn clicking_files_button_toggles_the_sidebar() {
+        let dir = scratch("mbtnfiles");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        render_buffer(&mut app);
+        let shown_width = app.editor_area.width;
+        assert!(app.sidebar_visible);
+        assert!(app.sidebar_area.width > 0);
+
+        click_button(&mut app, Shortcut::ToggleSidebar);
+        assert!(!app.sidebar_visible);
+        render_buffer(&mut app);
+        assert_eq!(app.sidebar_area.width, 0);
+        assert!(app.editor_area.width > shown_width);
+        assert_eq!(app.focus, Focus::Editor);
+
+        click_button(&mut app, Shortcut::ToggleSidebar);
+        assert!(app.sidebar_visible);
+        render_buffer(&mut app);
+        assert_eq!(app.editor_area.width, shown_width);
+    }
+
+    #[test]
+    fn clicking_line_button_opens_the_goto_prompt() {
+        let dir = scratch("mbtnline");
+        fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        render_buffer(&mut app);
+        click_button(&mut app, Shortcut::GoToLine);
+        assert_eq!(app.goto_line_input.as_deref(), Some(""));
+        app.handle_key(char_key('3'));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.goto_line_input.is_none());
+        assert_eq!(app.buffer.cursor, (0, 2));
+    }
+
+    #[test]
+    fn clicking_replace_button_opens_find_and_replace() {
+        let dir = scratch("mbtnreplace");
+        fs::write(dir.join("a.txt"), "foo bar foo\n").unwrap();
+        let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        render_buffer(&mut app);
+        click_button(&mut app, Shortcut::Replace);
+        assert!(app.search.as_ref().is_some_and(|s| s.is_replace()));
+        for c in "foo".chars() {
+            app.handle_key(char_key(c));
+        }
+        app.handle_key(key(KeyCode::Tab));
+        for c in "qux".chars() {
+            app.handle_key(char_key(c));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.buffer.lines[0], "qux bar foo");
+    }
+
+    #[test]
     fn clicking_top_bar_gap_does_nothing() {
         let dir = scratch("mbtngap");
         fs::write(dir.join("a.txt"), "alpha").unwrap();
@@ -4254,7 +4904,7 @@ mod tests {
             .find(|(a, _)| *a == Shortcut::Save)
             .copied()
             .unwrap();
-        assert_eq!(rect.x, 30); // guard against layout drift
+        assert_eq!(rect.x, 45); // guard against layout drift
 
         // the bar starts one cell in from the window edge: cell (0,0) is
         // plain margin, not part of the first button
@@ -4325,19 +4975,20 @@ mod tests {
             .map(|row| row.iter().map(|c| c.symbol()).collect())
             .collect();
         assert!(rows[0].contains("Ctrl+O switch"));
+        assert!(rows[0].contains("Ctrl+B files"));
         assert!(rows[0].contains("Ctrl+N new"));
         assert!(rows[1].contains("Ctrl+C copy"));
-        assert!(rows[1].contains("Ctrl+F search"));
-        // the overflow buttons (Ctrl+W, Ctrl+Q) are dropped with an
-        // ellipsis marker
+        assert!(rows[1].contains("Ctrl+V paste"));
+        // the overflow buttons (select-all through quit) are dropped with
+        // an ellipsis marker
         assert!(rows[1].contains("…"));
         assert!(!rows[1].contains("Ctrl+Q"));
+        assert!(!rows[1].contains("Ctrl+F"));
         assert!(!rows[1].contains("Ctrl+W"));
         assert_eq!(app.topbar_area.height, 2);
 
         // clicking a button on the second row still works
-        click_button(&mut app, Shortcut::Find);
-        assert!(app.search.is_some());
+        click_button(&mut app, Shortcut::Copy);
     }
 
     #[test]
@@ -4366,8 +5017,13 @@ mod tests {
         // a second draw shows the full editing button set again
         render_buffer(&mut app);
         let actions: Vec<Shortcut> = app.topbar_buttons.iter().map(|(a, _)| *a).collect();
-        assert_eq!(actions.len(), 13);
+        assert_eq!(actions.len(), 17);
         assert_eq!(actions[0], Shortcut::SwitchFocus);
+        assert_eq!(actions[1], Shortcut::ToggleSidebar);
+        assert_eq!(*actions.last().unwrap(), Shortcut::Quit);
+        assert!(actions.contains(&Shortcut::SelectAll));
+        assert!(actions.contains(&Shortcut::Replace));
+        assert!(actions.contains(&Shortcut::GoToLine));
         assert!(actions.contains(&Shortcut::ToggleHidden));
     }
 
@@ -5073,15 +5729,20 @@ mod tests {
                 "shown.txt".to_string()
             ]
         );
-        assert!(app
-            .message
-            .as_ref()
-            .is_some_and(|(msg, _)| msg.contains("dotfiles shown")));
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("dotfiles shown"))
+        );
         app.handle_key(ctrl('h'));
         assert!(app.sidebar.hide_dotfiles);
         assert_eq!(names(&app), vec!["..".to_string(), "shown.txt".to_string()]);
         let rows = render(&mut app);
         assert!(row_contains(&rows, "Ctrl+H hidden"));
+        // CapsLock Ctrl+H (reported as 'H' without SHIFT) is still hide-dotfiles
+        app.handle_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::CONTROL));
+        assert!(!app.sidebar.hide_dotfiles);
+        assert!(app.search.is_none());
     }
 
     #[test]

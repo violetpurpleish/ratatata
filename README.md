@@ -46,6 +46,9 @@ Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`
 - **Full mouse support** — click to place the cursor, drag or Shift+click to select, double-click to select a word, triple-click to select a line, Ctrl/Cmd+click a web link to open it in the default browser, scroll wheel to move through text without moving the editor cursor (with a scrollbar) and directories
 - **macOS-friendly keys** — on terminals supporting the kitty keyboard protocol, Cmd+key works like Ctrl (unsupported terminals just ignore the request)
 - **Incremental search** — Ctrl+F opens a search bar: matches are highlighted as you type, Enter / Shift+Enter step to the next / previous match, Esc closes
+- **Find and replace** — Ctrl+Shift+H (or the **replace** shortcut button) extends search: type the find text, Tab or Enter to type the replacement, Enter replaces the current match and steps to the next, Shift+Enter replaces all, Esc closes. Ctrl+H is still hide-dotfiles.
+- **Go to line** — Ctrl+G (or the **line** shortcut button) prompts for a 1-based line number and jumps there, keeping the cursor visible. Invalid input is a status message.
+- **Toggle sidebar** — Ctrl+B (or the **files** shortcut button) hides or shows the file tree so the editor can use the full width. Directory and selection survive. Ctrl+O while the sidebar is hidden shows it and focuses it.
 - **Word wrap** — Ctrl+W wraps long lines at word boundaries (a single unbreakable word still hard-breaks) instead of scrolling horizontally; navigation (arrows, Home/End, PgUp/PgDn, mouse) follows the visual rows, and wrapping re-flows automatically on resize
 - **Image previews** — opening an image file (png, jpg, gif, webp, bmp, …) renders it in the editor pane via the terminal's graphics protocol: kitty graphics where supported (kitty, Ghostty, WezTerm, iTerm2, …), unicode half-blocks elsewhere. Images are contained within the pane without clipping; small images remain at native size, while larger images are scaled using logical cell dimensions. Esc closes the preview and restores the previously open text buffer (including word wrap); closing a preview that was the first thing opened lands on empty untitled
 - **Hide dotfiles** — the sidebar hides names starting with `.` by default (`..` is always listed). Ctrl+H (or the **hidden** shortcut button) toggles them. Hidden entries are dimmed when shown.
@@ -77,12 +80,15 @@ rat -V | --version
 | Keys | Action |
 | --- | --- |
 | `Ctrl+N` | Start a new untitled buffer |
-| `Ctrl+O` | Switch between sidebar and editor |
+| `Ctrl+O` | Switch between sidebar and editor (shows the sidebar first if it was hidden) |
+| `Ctrl+B` | Show or hide the file sidebar |
 | `Ctrl+S` | Save (asks for a name if untitled) |
 | `Ctrl+R` | Reload the current file from disk (and refresh the sidebar) |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste |
 | `Ctrl+A` | Select all |
 | `Ctrl+F` | Search (type to filter, `Enter` / `Shift+Enter` next / previous match, `Esc` closes) |
+| `Ctrl+Shift+H` | Find and replace (`Tab` / `Enter` to the replacement field, `Enter` replace current, `Shift+Enter` replace all, `Esc` closes). Does not steal `Ctrl+H`. |
+| `Ctrl+G` | Go to line (1-based; invalid input is a status message) |
 | `Ctrl+W` | Toggle word wrapping of long lines (visual rows instead of horizontal scrolling) |
 | `Ctrl+H` | Show or hide dotfiles in the sidebar (`..` is never hidden; hidden by default) |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
@@ -101,7 +107,7 @@ rat -V | --version
 cargo test
 ```
 
-The test suite covers buffer editing, undo/redo coalescing, save/save-as flows, dirty-buffer guards, sidebar navigation, mouse interactions, image-preview opening/closing/restoring, unwrapped-line clipping, truecolor vs ANSI-16 palettes, hide-dotfiles listing, and headless rendering (including syntax-highlight colors) via ratatui's `TestBackend`.
+The test suite covers buffer editing, undo/redo coalescing, save/save-as flows, dirty-buffer guards, sidebar navigation and hide/show, mouse interactions, image-preview opening/closing/restoring, unwrapped-line clipping, truecolor vs ANSI-16 palettes, hide-dotfiles listing, find and replace, go-to-line, and headless rendering (including syntax-highlight colors) via ratatui's `TestBackend`.
 
 ## How it works
 
