@@ -293,10 +293,12 @@ impl App {
     ) -> io::Result<Self> {
         let mut highlighter = Highlighter::new();
         highlighter.set_path(file.as_deref());
-        // An image file starts an image preview instead of a text buffer;
-        // decoding failures are errors like read failures for text files.
+        // Existing image files start a preview (decode failures are errors,
+        // like read failures for text files). A path that does not exist yet
+        // opens an empty buffer bound to that path; the file is created on
+        // the first save.
         let (buffer, image) = match &file {
-            Some(path) if image_view::is_image_path(path) => (
+            Some(path) if path.exists() && image_view::is_image_path(path) => (
                 Buffer::empty(),
                 Some(ImagePreview::open_with_cell_size(
                     path.clone(),
@@ -304,7 +306,8 @@ impl App {
                     logical_cell_size,
                 )?),
             ),
-            Some(path) => (Buffer::from_path(path.clone())?, None),
+            Some(path) if path.exists() => (Buffer::from_path(path.clone())?, None),
+            Some(path) => (Buffer::empty_at(path.clone()), None),
             None => (Buffer::empty(), None),
         };
         let focus = if file.is_some() {
@@ -2821,6 +2824,43 @@ mod tests {
         assert_eq!(app.focus, Focus::Editor);
         assert_eq!(app.buffer.lines, vec!["hello", "world", ""]);
         assert!(!app.buffer.dirty);
+    }
+
+    #[test]
+    fn missing_file_arg_opens_an_empty_buffer_bound_to_that_path() {
+        let dir = scratch("missingarg");
+        let file = dir.join("somefile.md");
+        assert!(!file.exists());
+        let mut app = new_app(dir, Some(file.clone())).unwrap();
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.buffer.lines, vec![""]);
+        assert_eq!(app.buffer.path.as_ref(), Some(&file));
+        assert!(!app.buffer.dirty);
+        assert!(app.image.is_none());
+        assert!(!file.exists(), "the file must not be created until save");
+
+        let rows = render(&mut app);
+        assert!(row_contains(&rows, "somefile.md"));
+        assert!(!row_contains(&rows, "untitled"));
+
+        // Ctrl+S writes the bound path without a save-as prompt
+        app.handle_key(char_key('x'));
+        assert!(app.buffer.dirty);
+        app.handle_key(ctrl('s'));
+        assert!(app.save_as_input.is_none());
+        assert!(!app.buffer.dirty);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "x");
+    }
+
+    #[test]
+    fn missing_image_extension_arg_opens_a_text_buffer_not_a_preview() {
+        let dir = scratch("missingimg");
+        let file = dir.join("new.png");
+        let app = new_app(dir, Some(file.clone())).unwrap();
+        assert!(app.image.is_none());
+        assert_eq!(app.buffer.path.as_ref(), Some(&file));
+        assert_eq!(app.buffer.lines, vec![""]);
+        assert!(!file.exists());
     }
 
     #[test]

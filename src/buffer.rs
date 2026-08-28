@@ -354,6 +354,14 @@ impl Buffer {
         }
     }
 
+    /// An empty buffer bound to `path`. The file is not created until the
+    /// first save, so `rat new.txt` can open a path that does not exist yet.
+    pub fn empty_at(path: PathBuf) -> Self {
+        let mut buf = Self::empty();
+        buf.path = Some(path);
+        buf
+    }
+
     /// Load a file into a new buffer. Splitting on `'\n'` and joining with
     /// `'\n'` on save round-trips files byte-for-byte, with or without a
     /// trailing newline (a trailing `'\n'` yields a final empty line).
@@ -2006,6 +2014,22 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let loaded = Buffer::from_path(path).unwrap();
         assert_eq!(loaded.lines, vec![""]);
+    }
+
+    #[test]
+    fn empty_at_does_not_create_the_file_until_save() {
+        let path = tmp_path("new-on-save.txt");
+        let _ = std::fs::remove_file(&path);
+        let mut b = Buffer::empty_at(path.clone());
+        assert_eq!(b.lines, vec![""]);
+        assert_eq!(b.path.as_ref(), Some(&path));
+        assert!(!b.dirty);
+        assert!(!path.exists());
+
+        b.insert_text("hi");
+        b.save().unwrap();
+        assert!(!b.dirty);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi");
     }
 
     // ---- selection ---------------------------------------------------------

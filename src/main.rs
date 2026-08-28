@@ -368,6 +368,8 @@ fn usage_text() -> String {
          \x20      rat -V | --version\n\
          \n\
          Opens `path` if it is a file, or browses it if it is a directory.\n\
+         A path that does not exist yet opens an empty buffer; the file is\n\
+         created on the first save.\n\
          With no argument, the current directory is shown in the sidebar.\n\
          \n\
          \x20 -h, --help     Show this help and exit\n\
@@ -445,10 +447,28 @@ mod tests {
     }
 
     #[test]
+    fn resolve_start_missing_file_binds_the_path_without_creating_it() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-tmp")
+            .join("ratatata-resolve-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("somefile.md");
+        assert!(!file.exists());
+
+        let (resolved_dir, resolved_file) = resolve_start(Some(file.clone())).unwrap();
+        let canon = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(resolved_dir, canon);
+        assert_eq!(resolved_file, Some(canon.join("somefile.md")));
+        assert!(!file.exists());
+    }
+
+    #[test]
     fn help_text_keeps_images_block_aligned_with_other_sections() {
         let help = usage_text();
         assert!(help.contains("rat -V | --version"));
         assert!(help.contains("-V, --version  Print the version and exit"));
+        assert!(help.contains("A path that does not exist yet opens an empty buffer"));
         assert!(help.contains("Ctrl+W   toggle word wrapping of long lines"));
         assert!(help.contains("Ctrl+H   show or hide dotfiles in the sidebar"));
         assert!(help.contains("Ctrl+B   show or hide the file sidebar"));
