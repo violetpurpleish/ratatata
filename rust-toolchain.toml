@@ -1,0 +1,8 @@
+[toolchain]
+# ratatata targets "Rust 1.90 or later" (edition 2024 + a dependency tree that
+# needs a recent compiler). Pinning the channel here makes every `cargo`/`rustc`
+# invocation inside the repo select a suitable toolchain via rustup, regardless
+# of the machine's global default toolchain. rustup auto-installs it on demand.
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
