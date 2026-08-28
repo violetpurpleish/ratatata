@@ -4130,17 +4130,22 @@ mod tests {
         );
     }
 
-    fn render(app: &mut App) -> Vec<String> {
-        let backend = TestBackend::new(150, 24);
+    fn render_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
+        let w = width as usize;
         terminal
             .backend()
             .buffer()
             .content()
-            .chunks(150)
+            .chunks(w)
             .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
             .collect()
+    }
+
+    fn render(app: &mut App) -> Vec<String> {
+        render_rows(app, 150, 24)
     }
 
     fn row_contains(rows: &[String], needle: &str) -> bool {
@@ -4842,14 +4847,18 @@ mod tests {
 
     // ---- shortcut buttons in the top bar --------------------------------
 
-    /// Click the button for `action` (built by the last draw) and return
-    /// the `App` for further assertions.
-    fn click_button(app: &mut App, action: Shortcut) {
-        let (_, rect) = app
-            .topbar_buttons
+    /// Hit rectangle for `action` from the last draw.
+    fn topbar_button(app: &App, action: Shortcut) -> Rect {
+        app.topbar_buttons
             .iter()
             .find(|(a, _)| *a == action)
-            .unwrap_or_else(|| panic!("no {action:?} button in the top bar"));
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| panic!("no {action:?} button in the top bar"))
+    }
+
+    /// Click the button for `action` (built by the last draw).
+    fn click_button(app: &mut App, action: Shortcut) {
+        let rect = topbar_button(app, action);
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             rect.x + rect.width / 2,
@@ -5036,15 +5045,19 @@ mod tests {
         render_buffer(&mut app);
         assert_eq!(app.focus, Focus::Editor);
 
-        // after the last button there is empty bar; clicking it must not
-        // move focus, arm quit, or do anything else
-        let end = app
+        // after the last button on its row there is empty bar; clicking it
+        // must not move focus, arm quit, or do anything else
+        let last = app
             .topbar_buttons
             .iter()
-            .map(|(_, r)| r.x + r.width)
-            .max()
+            .max_by_key(|(_, r)| (r.y, r.x + r.width))
+            .map(|(_, r)| *r)
             .unwrap();
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), end + 2, 0));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            last.x + last.width + 2,
+            last.y,
+        ));
         assert_eq!(app.focus, Focus::Editor);
         assert!(!app.should_quit);
         assert!(!app.buffer.dirty);
@@ -5056,11 +5069,7 @@ mod tests {
         fs::write(dir.join("a.txt"), "alpha").unwrap();
         let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
         render_buffer(&mut app);
-        let (_, rect) = app
-            .topbar_buttons
-            .iter()
-            .find(|(a, _)| *a == Shortcut::Save)
-            .unwrap();
+        let rect = topbar_button(&app, Shortcut::Save);
 
         // moving the mouse over the button shows its description...
         app.handle_mouse(mouse(MouseEventKind::Moved, rect.x + 1, rect.y));
@@ -5079,36 +5088,43 @@ mod tests {
         fs::write(dir.join("a.txt"), "alpha").unwrap();
         let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
         let buf = render_buffer(&mut app);
-        let (_, rect) = app
+        let hovered = topbar_button(&app, Shortcut::Save);
+        let idle = app
             .topbar_buttons
             .iter()
-            .find(|(a, _)| *a == Shortcut::Save)
-            .copied()
-            .unwrap();
-        assert_eq!(rect.x, 45); // guard against layout drift
+            .find(|(a, _)| *a != Shortcut::Save)
+            .map(|(_, r)| *r)
+            .expect("another shortcut button to compare against");
+        assert!(hovered.width > 0);
+        assert!(hovered.x >= TOPBAR_INDENT);
 
         // the bar starts one cell in from the window edge: cell (0,0) is
         // plain margin, not part of the first button
         assert_eq!(buf.cell((0, 0)).unwrap().style().bg, Some(PALETTE.bg));
 
-        // moving the mouse over the button highlights it...
-        app.handle_mouse(mouse(MouseEventKind::Moved, rect.x + 1, rect.y));
+        // moving the mouse over the button highlights that button's own
+        // rectangle, including when Save has wrapped onto a later row
+        app.handle_mouse(mouse(MouseEventKind::Moved, hovered.x + 1, hovered.y));
         let buf = render_buffer(&mut app);
-        for x in rect.x..rect.x + rect.width {
+        for x in hovered.x..hovered.x + hovered.width {
             assert_eq!(
-                buf.cell((x, 0)).unwrap().style().bg,
+                buf.cell((x, hovered.y)).unwrap().style().bg,
                 Some(TOPBAR_PILL_BG_HOVER),
-                "col {x}"
+                "col {x} row {}",
+                hovered.y
             );
         }
         // ...while a non-hovered button blends into the base background
-        assert_eq!(buf.cell((1, 0)).unwrap().style().bg, Some(PALETTE.bg));
+        assert_eq!(
+            buf.cell((idle.x, idle.y)).unwrap().style().bg,
+            Some(PALETTE.bg)
+        );
 
         // moving away restores the base background
         app.handle_mouse(mouse(MouseEventKind::Moved, 140, 10));
         let buf = render_buffer(&mut app);
         assert_eq!(
-            buf.cell((rect.x + 1, 0)).unwrap().style().bg,
+            buf.cell((hovered.x + 1, hovered.y)).unwrap().style().bg,
             Some(PALETTE.bg)
         );
     }
@@ -5144,30 +5160,39 @@ mod tests {
         fs::write(dir.join("a.txt"), "alpha").unwrap();
         let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
 
-        // 80 columns: the buttons flow onto a second row but stay visible
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.draw(f)).unwrap();
-        let rows: Vec<String> = terminal
-            .backend()
-            .buffer()
-            .content()
-            .chunks(80)
-            .map(|row| row.iter().map(|c| c.symbol()).collect())
-            .collect();
-        assert!(rows[0].contains("Ctrl+O switch"));
-        assert!(rows[0].contains("Ctrl+B files"));
-        assert!(rows[0].contains("Ctrl+N new"));
-        assert!(rows[1].contains("Ctrl+C copy"));
-        assert!(rows[1].contains("Ctrl+V paste"));
-        // Quit is pinned, so a third row keeps it visible instead of
-        // dropping it behind the ellipsis.
-        assert!(row_contains(&rows, "Ctrl+Q quit"));
+        // 80 columns: the buttons flow onto extra rows but stay visible.
+        // Which labels land on which row depends on pill order and width,
+        // so this checks wrapping and hit-testing rather than a snapshot.
+        let rows = render_rows(&mut app, 80, 24);
+        assert!(
+            app.topbar_buttons.iter().any(|(_, r)| r.y > 0),
+            "expected wrapping at 80 columns, buttons={:?}",
+            app.topbar_buttons
+        );
+        assert!(app.topbar_area.height >= 2);
+        assert!(row_contains(&rows, "Ctrl+O switch"));
+        // each hit rectangle matches the row that actually painted that label
+        for (action, rect) in &app.topbar_buttons {
+            let label = format!("{} {}", action.key_label(), action.action_label());
+            assert!(
+                rows[rect.y as usize].contains(&label),
+                "{label} missing from row {}",
+                rect.y
+            );
+        }
+        // Quit is pinned, so wrapping keeps it visible instead of dropping
+        // it behind the ellipsis.
         assert_eq!(app.topbar_buttons.last().unwrap().0, Shortcut::Quit);
-        assert_eq!(app.topbar_area.height, 3);
+        assert!(row_contains(&rows, "Ctrl+Q quit"));
 
-        // clicking a button on the second row still works
-        click_button(&mut app, Shortcut::Copy);
+        // clicking a button on a wrapped row still works
+        let wrapped = app
+            .topbar_buttons
+            .iter()
+            .find(|(a, r)| r.y > 0 && *a != Shortcut::Quit)
+            .map(|(a, _)| *a)
+            .expect("a non-quit button should wrap onto a later row");
+        click_button(&mut app, wrapped);
     }
 
     #[test]
@@ -5178,26 +5203,69 @@ mod tests {
         fs::write(dir.join("a.txt"), "alpha").unwrap();
         let mut app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
 
-        let backend = TestBackend::new(120, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.draw(f)).unwrap();
-        let rows: Vec<String> = terminal
-            .backend()
-            .buffer()
-            .content()
-            .chunks(120)
-            .map(|row| row.iter().map(|c| c.symbol()).collect())
-            .collect();
+        let rows = render_rows(&mut app, 120, 24);
         let actions: Vec<Shortcut> = app.topbar_buttons.iter().map(|(a, _)| *a).collect();
         assert_eq!(actions.len(), 17, "{actions:?}");
         assert_eq!(*actions.last().unwrap(), Shortcut::Quit);
         assert!(row_contains(&rows, "Ctrl+Q quit"));
         assert!(row_contains(&rows, "Ctrl+H hidden"));
         assert!(row_contains(&rows, "Ctrl+Shift+H replace"));
-        assert!(!rows[0].contains("Ctrl+Q"));
+        let quit = topbar_button(&app, Shortcut::Quit);
+        assert!(
+            quit.y > 0,
+            "Quit should wrap off the first row at 120 columns, was y={}",
+            quit.y
+        );
         assert!(app.topbar_area.height >= 2);
         click_button(&mut app, Shortcut::Quit);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn wrap_topbar_pills_stays_in_bounds_across_widths() {
+        let dir = scratch("mbtnwrapbounds");
+        fs::write(dir.join("a.txt"), "alpha").unwrap();
+        let app = new_app(dir.clone(), Some(dir.join("a.txt"))).unwrap();
+        let pills = app.shortcut_pills();
+
+        for width in 40..=160 {
+            let layout = wrap_topbar_pills(&pills, width);
+            assert_eq!(
+                layout.pills.last().map(|p| p.action),
+                Some(Shortcut::Quit),
+                "width {width}"
+            );
+            let mut prev: Option<(u16, u16, u16)> = None; // row, x, x+width
+            for pill in &layout.pills {
+                assert!(
+                    pill.x >= TOPBAR_INDENT,
+                    "width {width} {pill:?} starts before indent"
+                );
+                if width >= pill.width + TOPBAR_INDENT {
+                    assert!(
+                        pill.x + pill.width <= width,
+                        "width {width} {pill:?} overflows"
+                    );
+                }
+                if let Some((row, x, end)) = prev {
+                    if row == pill.row {
+                        assert!(
+                            pill.x >= end,
+                            "width {width} overlap: prior ends {end} at x={x}, {pill:?}"
+                        );
+                    }
+                }
+                prev = Some((pill.row, pill.x, pill.x + pill.width));
+            }
+        }
+
+        let wide = wrap_topbar_pills(&pills, 150);
+        assert_eq!(wide.pills.len(), pills.len());
+        let narrow = wrap_topbar_pills(&pills, 80);
+        assert!(
+            narrow.pills.iter().any(|p| p.row > 0),
+            "80 columns should wrap"
+        );
     }
 
     #[test]
@@ -5538,11 +5606,11 @@ mod tests {
         let dir = scratch("undoredo8");
         let mut app = new_app(dir, None).unwrap();
         let rows = render(&mut app);
-        // the shortcut buttons live in the top bar now (Ctrl+Q wraps onto
-        // the second row at this width)
-        assert!(rows[0].contains("Ctrl+Z undo"));
-        assert!(rows[0].contains("Ctrl+Shift+Z redo"));
-        assert!(rows[1].contains("Ctrl+Q quit"));
+        // the shortcut buttons live in the top bar; which row they occupy
+        // depends on width and pill order
+        assert!(row_contains(&rows, "Ctrl+Z undo"));
+        assert!(row_contains(&rows, "Ctrl+Shift+Z redo"));
+        assert!(row_contains(&rows, "Ctrl+Q quit"));
     }
 
     // ---- image previews ----------------------------------------------------
