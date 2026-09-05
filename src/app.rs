@@ -6119,8 +6119,10 @@ mod tests {
         fs::write(&file, "(foo\nbar").unwrap();
         let mut app = new_app(dir, Some(file)).unwrap();
         let before = app.buffer.lines.clone();
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.buffer.cursor.1, 1);
+        assert_eq!(app.buffer.lines, before);
         for code in [
-            KeyCode::Down,
             KeyCode::Right,
             KeyCode::End,
             KeyCode::Home,
@@ -6151,18 +6153,43 @@ mod tests {
         let mut app = new_app(dir, Some(file)).unwrap();
         render_buffer(&mut app);
         let before = app.buffer.lines.clone();
+        let inner_x = app.editor_area.x as usize + 1;
+        let inner_y = app.editor_area.y as usize + 1;
+        let gutter_w = app.buffer.lines.len().to_string().len() + 1;
+        let text_x = (inner_x + gutter_w + 1) as u16;
+        let line0_y = inner_y as u16;
+        let line1_y = (inner_y + 1) as u16;
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 31, 2));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            text_x,
+            line0_y,
+        ));
         assert_eq!(app.focus, Focus::Editor);
         assert_eq!(app.buffer.cursor.1, 0);
+        assert!(app.buffer.cursor.0 > 0, "click should land in the text");
         assert_eq!(app.buffer.lines, before);
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 31, 3));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            text_x,
+            line1_y,
+        ));
         assert_eq!(app.buffer.cursor.1, 1);
         assert_eq!(app.buffer.lines, before);
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 35, 3));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            text_x + 2,
+            line1_y,
+        ));
         assert_eq!(app.buffer.cursor.1, 1);
         assert_eq!(app.buffer.lines, before);
-        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 35, 3));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            text_x + 2,
+            line1_y,
+        ));
         assert_eq!(app.buffer.lines, before);
         assert!(!app.buffer.dirty);
         app.handle_key(ctrl('z'));
