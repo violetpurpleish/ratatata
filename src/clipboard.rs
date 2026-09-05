@@ -3,13 +3,13 @@
 //! The [`Clipboard`] trait is used so tests can substitute an in-memory
 //! fake; the real implementation talks to the system clipboard via
 //! `arboard`. If the clipboard is unavailable (headless session, sandbox),
-//! all operations become silent no-ops instead of crashing.
+//! reads return None and writes report an error instead of crashing.
 
 pub trait Clipboard {
     /// Current clipboard contents, if any.
     fn get_text(&mut self) -> Option<String>;
     /// Replace the clipboard contents.
-    fn set_text(&mut self, text: &str);
+    fn set_text(&mut self, text: &str) -> Result<(), String>;
 }
 
 /// System clipboard backed by `arboard`.
@@ -36,9 +36,11 @@ impl Clipboard for SystemClipboard {
         self.inner.as_mut().and_then(|c| c.get_text().ok())
     }
 
-    fn set_text(&mut self, text: &str) {
-        if let Some(clipboard) = &mut self.inner {
-            let _ = clipboard.set_text(text);
-        }
+    fn set_text(&mut self, text: &str) -> Result<(), String> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| "clipboard unavailable".to_string())?
+            .set_text(text)
+            .map_err(|e| e.to_string())
     }
 }

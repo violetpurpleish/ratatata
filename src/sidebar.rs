@@ -70,7 +70,9 @@ impl Sidebar {
                 continue;
             }
             // follow symlinks so symlinked dirs show up as dirs
-            let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
+            let is_dir = fs::metadata(entry.path())
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
             if is_dir {
                 dirs.push(name);
             } else {
@@ -227,7 +229,7 @@ mod tests {
         assert!(sb.hide_dotfiles);
         let hidden: Vec<&str> = sb.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(hidden, vec!["..", "visible.txt"]);
-        assert!(hidden.iter().any(|n| *n == ".."));
+        assert!(hidden.contains(&".."));
         assert!(!hidden.iter().any(|n| *n == ".env" || *n == ".git"));
 
         sb.hide_dotfiles = false;

@@ -18,6 +18,7 @@ fn printable_char(c: char, modifiers: KeyModifiers) -> char {
 use std::io;
 use std::ops::Range;
 use std::path::PathBuf;
+#[cfg(not(target_os = "windows"))]
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -248,6 +249,8 @@ pub struct App {
     message: Option<(String, Instant)>,
     /// Active "save as" input text, when the buffer has no file name.
     save_as_input: Option<String>,
+    save_as_overwrite: Option<PathBuf>,
+    save_as_error: Option<String>,
     /// Active "go to line" input text, `None` while the prompt is closed.
     goto_line_input: Option<String>,
     /// Active incremental search (Ctrl+F) or find-and-replace
@@ -333,6 +336,8 @@ impl App {
             color_support: ColorSupport::TrueColor,
             message: None,
             save_as_input: None,
+            save_as_overwrite: None,
+            save_as_error: None,
             goto_line_input: None,
             search: None,
             sidebar_visible: true,
@@ -471,6 +476,10 @@ impl App {
         }
 
         if let Some(input) = self.save_as_input.as_mut() {
+            if key.code != KeyCode::Enter {
+                self.save_as_overwrite = None;
+                self.save_as_error = None;
+            }
             match key.code {
                 KeyCode::Esc => self.save_as_input = None,
                 KeyCode::Enter => self.confirm_save_as(),
@@ -837,7 +846,10 @@ impl App {
         let Some(text) = self.buffer.selected_text() else {
             return;
         };
-        self.clipboard.set_text(&text);
+        if let Err(error) = self.clipboard.set_text(&text) {
+            self.set_message(format!("clipboard failed: {error}"));
+            return;
+        }
         self.set_message("copied");
     }
 
@@ -846,7 +858,10 @@ impl App {
             return;
         }
         let text = self.buffer.selected_text().unwrap_or_default();
-        self.clipboard.set_text(&text);
+        if let Err(error) = self.clipboard.set_text(&text) {
+            self.set_message(format!("clipboard failed: {error}"));
+            return;
+        }
         self.buffer.delete_selection();
         self.buffer.apply_parinfer();
         if let Some(line) = self.buffer.last_edit_line.take() {
@@ -864,6 +879,8 @@ impl App {
             return;
         }
         if let Some(input) = self.save_as_input.as_mut() {
+            self.save_as_overwrite = None;
+            self.save_as_error = None;
             input.push_str(&text);
             return;
         }
@@ -887,6 +904,8 @@ impl App {
         }
         // bracketed paste while a text prompt is open fills the prompt
         if let Some(input) = self.save_as_input.as_mut() {
+            self.save_as_overwrite = None;
+            self.save_as_error = None;
             input.extend(text.chars().filter(|c| !c.is_control()));
             return;
         }
@@ -1251,29 +1270,30 @@ impl App {
         } else {
             // no file name yet: ask for one
             self.save_as_input = Some(String::new());
+            self.save_as_overwrite = None;
+            self.save_as_error = None;
         }
     }
 
     fn confirm_save_as(&mut self) {
-        let Some(input) = self.save_as_input.take() else {
+        let Some(input) = self.save_as_input.as_ref() else {
             return;
         };
         let input = input.trim().to_string();
         if input.is_empty() {
+            self.save_as_input = None;
             return;
         }
         let path = PathBuf::from(&input);
-        if path.is_dir() {
-            self.set_message(format!("{input} is a directory"));
-            return;
-        }
-        self.buffer.path = Some(path.clone());
-        self.buffer.sync_parinfer_prev();
-        self.highlighter.set_path(Some(&path));
-        match self.buffer.save() {
+        let overwrite = self.save_as_overwrite.as_ref() == Some(&path);
+        match self.buffer.save_to(path.clone(), overwrite) {
             Ok(()) => {
+                self.save_as_input = None;
+                self.save_as_overwrite = None;
+                self.save_as_error = None;
+                self.buffer.sync_parinfer_prev();
+                self.highlighter.set_path(Some(&path));
                 self.quit_armed = false;
-                // refresh the sidebar so the new file shows up
                 if let Err(e) = self.sidebar.reload() {
                     self.set_message(format!(
                         "saved {}, but sidebar refresh failed: {e}",
@@ -1283,7 +1303,14 @@ impl App {
                 }
                 self.set_message(format!("saved {}", path.display()));
             }
-            Err(e) => self.set_message(format!("save failed: {e}")),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && !path.is_dir() => {
+                self.save_as_overwrite = Some(path);
+                self.save_as_error = None;
+            }
+            Err(e) => {
+                self.save_as_overwrite = None;
+                self.save_as_error = Some(format!("save failed: {e}; edit path: "));
+            }
         }
     }
 
@@ -2125,7 +2152,11 @@ impl App {
     fn draw_status(&mut self, frame: &mut Frame, area: Rect) {
         // "save as" prompt replaces the status bar content
         if let Some(input) = &self.save_as_input {
-            let prompt = "save as: ";
+            let prompt = if self.save_as_overwrite.as_ref() == Some(&PathBuf::from(input.trim())) {
+                "exists — Enter overwrites, Esc cancels: "
+            } else {
+                self.save_as_error.as_deref().unwrap_or("save as: ")
+            };
             let prompt_w = prompt.width() as u16;
             let input_w = input.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() as u16;
             let paragraph = Paragraph::new(Line::from(vec![
@@ -2139,7 +2170,13 @@ impl App {
             ]))
             .style(Style::default().bg(self.pal().bg));
             frame.render_widget(paragraph, area);
-            frame.set_cursor_position(Position::new(area.x + prompt_w + input_w, area.y));
+            frame.set_cursor_position(Position::new(
+                area.x
+                    .saturating_add(prompt_w)
+                    .saturating_add(input_w)
+                    .min(area.right().saturating_sub(1)),
+                area.y,
+            ));
             return;
         }
 
@@ -2159,7 +2196,13 @@ impl App {
             ]))
             .style(Style::default().bg(self.pal().bg));
             frame.render_widget(paragraph, area);
-            frame.set_cursor_position(Position::new(area.x + prompt_w + input_w, area.y));
+            frame.set_cursor_position(Position::new(
+                area.x
+                    .saturating_add(prompt_w)
+                    .saturating_add(input_w)
+                    .min(area.right().saturating_sub(1)),
+                area.y,
+            ));
             return;
         }
 
@@ -2434,12 +2477,38 @@ fn open_in_browser(url: &str) -> io::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        // `start` is a shell built-in; the empty title keeps a URL beginning
-        // with a quote from being interpreted as the window title.
-        Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn()
-            .map(|_| ())
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        if url.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "URL contains NUL",
+            ));
+        }
+        let url: Vec<u16> = std::ffi::OsStr::new(url)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // ShellExecuteW opens the URL as data; no command interpreter parses it.
+        // SAFETY: url is NUL-terminated and lives throughout the call; optional
+        // arguments and the owner window are null as permitted by this API.
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                url.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        } as isize;
+        if result <= 32 {
+            Err(io::Error::other(format!(
+                "cannot open URL (ShellExecuteW error {result})"
+            )))
+        } else {
+            Ok(())
+        }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -2756,8 +2825,9 @@ mod tests {
             Some(self.text.clone())
         }
 
-        fn set_text(&mut self, text: &str) {
+        fn set_text(&mut self, text: &str) -> Result<(), String> {
             self.text = text.to_string();
+            Ok(())
         }
     }
 
@@ -3328,7 +3398,7 @@ mod tests {
         let file = dir.join("a.txt");
         fs::write(&file, "alpha\n").unwrap();
         let mut app = with_fake_clipboard(new_app(dir, Some(file)).unwrap());
-        app.clipboard.set_text("alp");
+        app.clipboard.set_text("alp").unwrap();
         app.handle_key(ctrl('f'));
         app.handle_key(ctrl('v'));
         assert_eq!(app.search.as_ref().unwrap().query, "alp");
@@ -5273,13 +5343,13 @@ mod tests {
                         "width {width} {pill:?} overflows"
                     );
                 }
-                if let Some((row, x, end)) = prev {
-                    if row == pill.row {
-                        assert!(
-                            pill.x >= end,
-                            "width {width} overlap: prior ends {end} at x={x}, {pill:?}"
-                        );
-                    }
+                if let Some((row, x, end)) = prev
+                    && row == pill.row
+                {
+                    assert!(
+                        pill.x >= end,
+                        "width {width} overlap: prior ends {end} at x={x}, {pill:?}"
+                    );
                 }
                 prev = Some((pill.row, pill.x, pill.x + pill.width));
             }
@@ -5425,7 +5495,7 @@ mod tests {
         for _ in 0..3 {
             app.handle_key(shift_key(KeyCode::Right));
         }
-        app.clipboard.set_text("XYZ");
+        app.clipboard.set_text("XYZ").unwrap();
         app.handle_key(ctrl('v'));
         assert_eq!(app.buffer.lines, vec!["XYZdef"]);
     }
@@ -6283,5 +6353,85 @@ mod tests {
             app.buffer.lines, before,
             "mouse placement must not create undo"
         );
+    }
+
+    #[test]
+    fn save_as_requires_confirmation_and_cancel_preserves_original() {
+        let dir = scratch("release-overwrite");
+        let path = dir.join("existing.txt");
+        fs::write(&path, "original").unwrap();
+        let mut app = new_app(dir, None).unwrap();
+        app.buffer.insert_text("replacement");
+        app.save_as_input = Some(path.to_str().unwrap().into());
+        app.confirm_save_as();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        assert!(app.buffer.path.is_none());
+        let rendered = render_buffer(&mut app);
+        assert!(format!("{rendered:?}").contains("exists"));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.save_as_input.is_none());
+        app.save();
+        app.save_as_input = Some(path.to_str().unwrap().into());
+        app.confirm_save_as();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        app.confirm_save_as();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+        assert!(!app.buffer.dirty);
+    }
+
+    #[test]
+    fn failed_save_as_can_be_corrected_without_losing_edits() {
+        let dir = scratch("release-retry");
+        let mut app = new_app(dir.clone(), None).unwrap();
+        app.buffer.insert_text("work");
+        app.save_as_input = Some(dir.join("missing/out.txt").to_str().unwrap().into());
+        app.confirm_save_as();
+        assert!(app.buffer.path.is_none());
+        assert!(app.save_as_input.is_some());
+        assert!(app.save_as_error.is_some());
+        assert!(app.buffer.dirty);
+        let corrected = dir.join("out.txt");
+        app.save_as_input = Some(corrected.to_str().unwrap().into());
+        app.confirm_save_as();
+        assert_eq!(fs::read_to_string(corrected).unwrap(), "work");
+        assert!(app.save_as_input.is_none());
+    }
+
+    struct FailingClipboard;
+    impl Clipboard for FailingClipboard {
+        fn get_text(&mut self) -> Option<String> {
+            None
+        }
+        fn set_text(&mut self, _: &str) -> Result<(), String> {
+            Err("unavailable".into())
+        }
+    }
+
+    #[test]
+    fn clipboard_failure_preserves_cut_selection_and_reports_copy_failure() {
+        let mut app = new_app(scratch("release-clipboard"), None).unwrap();
+        app.clipboard = Box::new(FailingClipboard);
+        app.buffer.insert_text("important");
+        app.buffer.select_all();
+        app.cut_selection();
+        assert_eq!(app.buffer.content(), "important");
+        assert!(app.buffer.has_selection());
+        assert!(app.message.as_ref().unwrap().0.contains("clipboard failed"));
+        app.copy_selection();
+        assert!(app.message.as_ref().unwrap().0.contains("clipboard failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidebar_opens_directory_symlink() {
+        let dir = scratch("release-dirlink");
+        fs::create_dir(dir.join("real")).unwrap();
+        fs::write(dir.join("real/inside.txt"), "text").unwrap();
+        std::os::unix::fs::symlink("real", dir.join("link")).unwrap();
+        let mut app = new_app(dir, None).unwrap();
+        app.sidebar.select_name("link");
+        assert!(app.sidebar.selected_is_dir());
+        app.open_selected();
+        assert!(app.sidebar.entries.iter().any(|e| e.name == "inside.txt"));
     }
 }

@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use unicode_width::UnicodeWidthChar;
@@ -341,6 +341,8 @@ pub struct Buffer {
     /// Used to recompute `dirty` after undo/redo, which snapshot-based
     /// dirty flags cannot capture across a save.
     clean_lines: Vec<String>,
+    line_ending: &'static str,
+    clean_disk_content: String,
     /// First line changed by the most recent edit operation (used to
     /// invalidate the syntax-highlight cache). Cleared by the app after
     /// use.
@@ -371,6 +373,67 @@ pub struct Buffer {
     parinfer_prev_cursor: (usize, usize),
 }
 
+/// Stage writes beside the destination so publication is an atomic operation.
+/// Resolve existing symlinks to retain the link itself when saving its target.
+fn atomic_save(
+    path: &std::path::Path,
+    overwrite: bool,
+    write: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    let target = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() && overwrite => fs::canonicalize(path)?,
+        Ok(_) | Err(_) => path.to_path_buf(),
+    };
+    let metadata = match fs::metadata(&target) {
+        Ok(meta) => Some(meta),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    if let Some(meta) = &metadata {
+        if !overwrite {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "file already exists",
+            ));
+        }
+        if !meta.is_file() || meta.permissions().readonly() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "destination is not a writable regular file",
+            ));
+        }
+    }
+    if metadata.is_some() {
+        // Check file write access too; directory access alone must not grant
+        // permission to replace a file the user could not otherwise edit.
+        fs::OpenOptions::new().write(true).open(&target)?;
+    }
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    write(temp.as_file_mut())?;
+    if let Some(meta) = metadata {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let staged = temp.as_file().metadata()?;
+            if staged.uid() != meta.uid() || staged.gid() != meta.gid() {
+                std::os::unix::fs::chown(temp.path(), Some(meta.uid()), Some(meta.gid()))?;
+            }
+        }
+        temp.as_file().set_permissions(meta.permissions())?;
+    }
+    temp.as_file().sync_all()?;
+    if overwrite {
+        temp.persist(&target).map_err(|e| e.error)?;
+    } else {
+        temp.persist_noclobber(&target).map_err(|e| e.error)?;
+    }
+    Ok(())
+}
+
 impl Buffer {
     /// A fresh, empty buffer not bound to any file.
     pub fn empty() -> Self {
@@ -383,6 +446,8 @@ impl Buffer {
             path: None,
             dirty: false,
             clean_lines: vec![String::new()],
+            line_ending: "\n",
+            clean_disk_content: String::new(),
             last_edit_line: None,
             selection_anchor: None,
             selecting: false,
@@ -403,30 +468,51 @@ impl Buffer {
         buf
     }
 
-    /// Load a file into a new buffer. Splitting on `'\n'` and joining with
-    /// `'\n'` on save round-trips files byte-for-byte, with or without a
-    /// trailing newline (a trailing `'\n'` yields a final empty line).
+    /// Load a file, keeping CRLF separators outside the editable text.
+    /// Unedited files round-trip exactly; edited mixed-ending files use CRLF.
+    /// A trailing newline yields a final empty line.
     pub fn from_path(path: PathBuf) -> io::Result<Self> {
         let content = fs::read_to_string(&path)?;
         let mut buf = Self::empty();
-        buf.lines = content.split('\n').map(str::to_string).collect();
+        buf.line_ending = if content.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        buf.lines = content
+            .replace("\r\n", "\n")
+            .split('\n')
+            .map(str::to_string)
+            .collect();
         buf.clean_lines = buf.lines.clone();
+        buf.clean_disk_content = content;
         buf.path = Some(path);
         buf.sync_parinfer_prev();
         Ok(buf)
     }
 
-    /// Write the buffer back to its file.
+    /// Save to the bound path, replacing the destination only after a complete write.
     pub fn save(&mut self) -> io::Result<()> {
         let path = self
             .path
-            .as_ref()
+            .clone()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "buffer has no file name"))?;
-        let content = self.lines.join("\n");
-        fs::write(path, content)?;
+        self.save_to(path, true)
+    }
+
+    /// Bind a new path only after saving succeeds. Without overwrite consent,
+    /// publishing the temporary file fails if a destination already exists.
+    pub fn save_to(&mut self, path: PathBuf, overwrite: bool) -> io::Result<()> {
+        let content = if self.lines == self.clean_lines {
+            self.clean_disk_content.clone()
+        } else {
+            self.lines.join(self.line_ending)
+        };
+        atomic_save(&path, overwrite, |file| file.write_all(content.as_bytes()))?;
+        self.clean_disk_content = content;
+        self.path = Some(path);
         self.clean_lines = self.lines.clone();
         self.dirty = false;
-        // typing right after a save starts a fresh undo step
         self.last_edit = None;
         Ok(())
     }
@@ -603,7 +689,8 @@ impl Buffer {
             }
             self.force_merge = true;
         }
-        let mut parts = text.split('\n');
+        let normalized = text.replace("\r\n", "\n");
+        let mut parts = normalized.split('\n');
         if let Some(first) = parts.next() {
             self.insert_text(first);
             for rest in parts {
@@ -2522,7 +2609,7 @@ mod tests {
         let path = tmp_path("crlf.txt");
         std::fs::write(&path, "a\r\nb\r\n").unwrap();
         let loaded = Buffer::from_path(path.clone()).unwrap();
-        assert_eq!(loaded.lines, vec!["a\r", "b\r", ""]);
+        assert_eq!(loaded.lines, vec!["a", "b", ""]);
         let mut loaded = loaded;
         loaded.save().unwrap();
         let disk = std::fs::read_to_string(&path).unwrap();
@@ -2827,12 +2914,12 @@ mod tests {
         let path = tmp_path("parinfer-crlf.clj");
         std::fs::write(&path, "(foo)\r\nbar").unwrap();
         let mut b = Buffer::from_path(path).unwrap();
-        assert_eq!(b.lines, vec!["(foo)\r", "bar"]);
+        assert_eq!(b.lines, vec!["(foo)", "bar"]);
         b.cursor = (0, 1);
         b.sync_parinfer_prev();
         b.indent();
         b.apply_parinfer();
-        assert_eq!(b.lines, vec!["(foo\r", "    bar)"]);
+        assert_eq!(b.lines, vec!["(foo", "    bar)"]);
         assert_eq!(b.cursor, (4, 1));
     }
 
@@ -3029,5 +3116,111 @@ mod tests {
             assert_eq!(b.cursor, (4, 1), "{prefix:?}");
             assert_cursor_in_range(&b);
         }
+    }
+
+    #[test]
+    fn atomic_save_failure_retains_original_and_cleans_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, "original").unwrap();
+        let result = atomic_save(&path, true, |file| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("injected disk failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_save_never_clobbers_a_destination_created_during_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        let result = atomic_save(&path, false, |file| {
+            file.write_all(b"new")?;
+            fs::write(&path, "other writer")
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "other writer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_preserves_symlink_and_target_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        fs::write(&target, "old").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink("target", &link).unwrap();
+        let mut buffer = Buffer::from_path(link.clone()).unwrap();
+        buffer.insert_text("new");
+        buffer.save().unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "newold");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn crlf_edit_newline_paste_undo_and_save_keep_separators_out_of_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("windows.txt");
+        fs::write(&path, "abc\r\ndef\r\n").unwrap();
+        let mut buffer = Buffer::from_path(path.clone()).unwrap();
+        buffer.save().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "abc\r\ndef\r\n");
+        buffer.end();
+        buffer.insert_char('X');
+        buffer.save().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "abcX\r\ndef\r\n");
+        buffer.newline();
+        buffer.insert_multiline("p\r\nq");
+        assert!(buffer.lines.iter().all(|line| !line.contains('\r')));
+        buffer.undo();
+        buffer.undo();
+        buffer.save().unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "abcX\r\ndef\r\n");
+    }
+
+    #[test]
+    fn readonly_destination_is_unchanged_and_buffer_stays_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly.txt");
+        fs::write(&path, "original").unwrap();
+        let writable = fs::metadata(&path).unwrap().permissions();
+        let mut readonly = writable.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&path, readonly).unwrap();
+        let mut buffer = Buffer::from_path(path.clone()).unwrap();
+        buffer.insert_char('X');
+        let result = buffer.save();
+        // Restore permissions before assertions so cleanup also works on Windows.
+        fs::set_permissions(&path, writable).unwrap();
+        assert!(result.is_err());
+        assert!(buffer.dirty);
+        assert_eq!(fs::read_to_string(path).unwrap(), "original");
+    }
+
+    #[test]
+    fn unedited_mixed_endings_round_trip_and_edits_use_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.txt");
+        fs::write(&path, "a\r\nb\nc").unwrap();
+        let mut buffer = Buffer::from_path(path.clone()).unwrap();
+        buffer.save().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\r\nb\nc");
+        buffer.end();
+        buffer.insert_char('X');
+        buffer.save().unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "aX\r\nb\r\nc");
     }
 }

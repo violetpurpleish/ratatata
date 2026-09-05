@@ -362,7 +362,7 @@ fn print_usage() {
 }
 
 fn usage_text() -> String {
-    format!(
+    String::from(
         "rat — a tiny terminal text editor\n\
          \n\
          usage: rat [path]\n\
@@ -401,7 +401,7 @@ fn usage_text() -> String {
          \n\
          images:  opening an image file (png/jpg/gif/webp/…) previews it in the\n\
          \x20            editor pane via the terminal's graphics protocol (kitty,\n\
-         \x20            sixel, iTerm2, or unicode half-blocks as a last resort); Esc closes\n"
+         \x20            sixel, iTerm2, or unicode half-blocks as a last resort); Esc closes\n",
     )
 }
 
