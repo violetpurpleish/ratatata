@@ -8,6 +8,8 @@ mod buffer;
 mod clipboard;
 mod highlight;
 mod image_view;
+mod parinfer;
+mod parinfer_engine;
 mod search;
 mod sidebar;
 mod theme;

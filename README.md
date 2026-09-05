@@ -42,6 +42,7 @@ Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`
 - **Clickable shortcut bar** — the keyboard shortcuts are shown as buttons in a bar at the top; click one to run it, hover it for a longer description in the status bar. The keys and the buttons are the same actions, so they always behave identically
 - **Catppuccin Mocha UI theme** — semantic application colors supplied by [ratatui-themes](https://crates.io/crates/ratatui-themes), including themed panels, selections, search matches, caret, status bar and shortcut buttons. Truecolor terminals (Ghostty, `COLORTERM=truecolor`, or a `*-direct` terminfo) keep the RGB theme unchanged. Terminals that do not advertise truecolor (for example xfce4-terminal) map the same semantic palette onto ANSI 16; if a colored focus border would be invisible, the focused pane title is reverse/bold instead. There is no theme toggle, and `NO_COLOR` / `FORCE_COLOR` are ignored so a sandbox cannot grayscale Ghostty.
 - **Syntax highlighting** — Sublime Text grammars via [syntect](https://github.com/trishume/syntect), detected by extension and first-line heuristics; re-highlights incrementally as you type, only re-parsing lines from the edit point onward
+- **Parinfer Smart Mode** — for `.clj`, `.cljs`, `.cljc`, and `.edn` files, indentation and parentheses stay in sync as you type (a user edit and the automatic adjustment undo together). Other file types are unchanged; incomplete forms (for example an unclosed string) are left as typed.
 - **Clipboard integration** — copy/cut/paste through the system clipboard ([arboard](https://github.com/1Password/arboard)), with bracketed-paste support for terminals that send it
 - **Full mouse support** — click to place the cursor, drag or Shift+click to select, double-click to select a word, triple-click to select a line, Ctrl/Cmd+click a web link to open it in the default browser, scroll wheel to move through text without moving the editor cursor (with a scrollbar) and directories
 - **macOS-friendly keys** — on terminals supporting the kitty keyboard protocol, Cmd+key works like Ctrl (unsupported terminals just ignore the request)
@@ -107,7 +108,7 @@ rat -V | --version
 cargo test
 ```
 
-The test suite covers buffer editing, undo/redo coalescing, save/save-as flows, dirty-buffer guards, sidebar navigation and hide/show, mouse interactions, image-preview opening/closing/restoring, unwrapped-line clipping, truecolor vs ANSI-16 palettes, hide-dotfiles listing, find and replace, go-to-line, and headless rendering (including syntax-highlight colors) via ratatui's `TestBackend`.
+The test suite covers buffer editing, undo/redo coalescing, save/save-as flows, dirty-buffer guards, sidebar navigation and hide/show, mouse interactions, image-preview opening/closing/restoring, unwrapped-line clipping, truecolor vs ANSI-16 palettes, hide-dotfiles listing, find and replace, go-to-line, Parinfer Smart Mode on Clojure-family files, and headless rendering (including syntax-highlight colors) via ratatui's `TestBackend`.
 
 ## How it works
 
@@ -128,6 +129,9 @@ src/
 │                 via ratatui-image
 ├── highlight.rs  incremental syntect highlighting with per-line cached
 │                 parse states and scope stacks
+├── parinfer.rs   Parinfer Smart Mode for Clojure-family files (path
+│                 detection, cursor mapping, fail-safe apply)
+├── parinfer_engine/  vendored parinfer-rust algorithm (ISC)
 ├── search.rs     case-insensitive incremental search (matches, navigation)
 └── clipboard.rs  system clipboard behind a small trait (tests use a fake)
 ```

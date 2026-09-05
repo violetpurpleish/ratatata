@@ -273,6 +273,9 @@ enum EditKind {
     DeleteSelection,
     Indent,
     Dedent,
+    /// Automatic Parinfer adjustment that was not part of a user edit
+    /// (for example, fixing parens after the cursor left a line).
+    Parinfer,
 }
 
 /// Index of the first line where `a` and `b` differ, or `None` when the
@@ -282,6 +285,36 @@ fn first_diff_line(a: &[String], b: &[String]) -> Option<usize> {
     (0..n)
         .find(|&i| a[i] != b[i])
         .or_else(|| (a.len() != b.len()).then_some(n))
+}
+
+/// Map a `(char, line)` position from `old` lines onto `new` after a
+/// Parinfer rewrite. Prefers an identity mapping when the line is
+/// unchanged, then indent-only shifts, then clamping.
+fn map_pos_across_lines(old: &[String], new: &[String], (x, y): (usize, usize)) -> (usize, usize) {
+    if new.is_empty() {
+        return (0, 0);
+    }
+    if y >= new.len() {
+        let last = new.len() - 1;
+        return (char_count(&new[last]), last);
+    }
+    let new_len = char_count(&new[y]);
+    let Some(old_line) = old.get(y) else {
+        return (x.min(new_len), y);
+    };
+    let new_line = &new[y];
+    if old_line == new_line {
+        return (x.min(new_len), y);
+    }
+    let old_indent = leading_whitespace(old_line).chars().count();
+    let new_indent = leading_whitespace(new_line).chars().count();
+    let old_rest = &old_line[leading_whitespace(old_line).len()..];
+    let new_rest = &new_line[leading_whitespace(new_line).len()..];
+    if old_rest == new_rest {
+        let rel = x.saturating_sub(old_indent);
+        return ((new_indent + rel).min(new_len), y);
+    }
+    (x.min(new_len), y)
 }
 
 pub struct Buffer {
@@ -330,6 +363,11 @@ pub struct Buffer {
     /// must be a single step even though it internally splits into
     /// several `insert_char`/`newline` calls).
     force_merge: bool,
+    /// Buffer text last seen by Parinfer Smart Mode. Used as `prevText` so
+    /// the engine can classify the user's change instead of guessing.
+    parinfer_prev_text: String,
+    /// Cursor last seen by Parinfer, as `(char_index, line)`.
+    parinfer_prev_cursor: (usize, usize),
 }
 
 impl Buffer {
@@ -351,6 +389,8 @@ impl Buffer {
             redo_stack: Vec::new(),
             last_edit: None,
             force_merge: false,
+            parinfer_prev_text: String::new(),
+            parinfer_prev_cursor: (0, 0),
         }
     }
 
@@ -371,6 +411,7 @@ impl Buffer {
         buf.lines = content.split('\n').map(str::to_string).collect();
         buf.clean_lines = buf.lines.clone();
         buf.path = Some(path);
+        buf.sync_parinfer_prev();
         Ok(buf)
     }
 
@@ -405,6 +446,95 @@ impl Buffer {
     /// the current operation (multi-line edits like paste touch several).
     fn mark_edited(&mut self, y: usize) {
         self.last_edit_line = Some(self.last_edit_line.map_or(y, |l| l.min(y)));
+    }
+
+    /// Buffer contents as a single string (`'\n'`-joined), matching how
+    /// files are saved.
+    pub(crate) fn content(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    /// Remember the current text and cursor as Parinfer's previous state.
+    /// Called after load, undo/redo, and path changes so the next Smart
+    /// Mode request does not invent a fake change.
+    pub(crate) fn sync_parinfer_prev(&mut self) {
+        self.parinfer_prev_text = self.content();
+        self.parinfer_prev_cursor = self.cursor;
+    }
+
+    /// Run Parinfer Smart Mode for Clojure-family files. No-ops for other
+    /// paths. On engine failure the user text is kept. A successful
+    /// adjustment that follows a user edit is merged into that edit's
+    /// undo step.
+    pub(crate) fn apply_parinfer(&mut self) {
+        if !crate::parinfer::applies_to_path(self.path.as_deref()) {
+            return;
+        }
+        let text_edited =
+            self.last_edit_line.is_some() || self.last_edit.is_some() || self.force_merge;
+        if !text_edited && (self.selecting || self.has_selection()) {
+            self.parinfer_prev_cursor = self.cursor;
+            return;
+        }
+        let text = self.content();
+        let input = crate::parinfer::Input {
+            text: &text,
+            cursor: self.cursor,
+            prev_text: &self.parinfer_prev_text,
+            prev_cursor: self.parinfer_prev_cursor,
+            selection_start_line: self.selection_range().map(|((_, ay), _)| ay),
+        };
+        let Some(output) = crate::parinfer::smart_edit(&input) else {
+            self.parinfer_prev_text = text;
+            self.parinfer_prev_cursor = self.cursor;
+            return;
+        };
+        self.apply_parinfer_output(output, text_edited);
+    }
+
+    fn apply_parinfer_output(&mut self, output: crate::parinfer::Output, merge_undo: bool) {
+        let new_lines: Vec<String> = output.text.split('\n').map(str::to_string).collect();
+        let text_changed = new_lines != self.lines;
+        if !text_changed {
+            self.cursor = output.cursor;
+            self.clamp_x();
+            if self.cursor.1 >= self.lines.len() {
+                self.cursor.1 = self.lines.len() - 1;
+                self.clamp_x();
+            }
+            self.parinfer_prev_text = output.text;
+            self.parinfer_prev_cursor = self.cursor;
+            return;
+        }
+
+        let last_kind = self.last_edit.map(|(kind, _)| kind);
+        if !merge_undo {
+            self.push_undo(EditKind::Parinfer);
+        }
+
+        let old_lines = std::mem::replace(&mut self.lines, new_lines);
+        if let Some(anchor) = self.selection_anchor {
+            self.selection_anchor = Some(map_pos_across_lines(&old_lines, &self.lines, anchor));
+        }
+        let first_diff = first_diff_line(&old_lines, &self.lines);
+        self.cursor = output.cursor;
+        if self.cursor.1 >= self.lines.len() {
+            self.cursor.1 = self.lines.len() - 1;
+        }
+        self.clamp_x();
+        self.dirty = true;
+        if let Some(y) = first_diff {
+            self.mark_edited(y);
+        }
+        if merge_undo {
+            if let Some(kind) = last_kind {
+                self.last_edit = Some((kind, self.cursor));
+            }
+        } else {
+            self.last_edit = None;
+        }
+        self.parinfer_prev_text = self.content();
+        self.parinfer_prev_cursor = self.cursor;
     }
 
     // ---- editing -----------------------------------------------------------
@@ -961,6 +1091,7 @@ impl Buffer {
         self.selection_anchor = snap.selection_anchor;
         self.selecting = snap.selecting;
         self.dirty = snap.dirty;
+        self.sync_parinfer_prev();
     }
 
     /// Undo the last edit. Returns `true` when something was undone and
@@ -2609,5 +2740,131 @@ mod tests {
         assert_eq!(b.last_edit_line, Some(1));
         b.redo();
         assert_eq!(b.last_edit_line, Some(1));
+    }
+
+    // ---- parinfer ---------------------------------------------------------
+
+    fn clj_buf() -> Buffer {
+        Buffer::empty_at(PathBuf::from("test.clj"))
+    }
+
+    fn type_clj(b: &mut Buffer, text: &str) {
+        for c in text.chars() {
+            if c == '\n' {
+                b.newline();
+            } else {
+                b.insert_char(c);
+            }
+            b.apply_parinfer();
+        }
+    }
+
+    #[test]
+    fn parinfer_typing_open_paren_inserts_close_and_keeps_cursor() {
+        let mut b = clj_buf();
+        type_clj(&mut b, "(");
+        assert_eq!(b.lines, vec!["()"]);
+        assert_eq!(b.cursor, (1, 0));
+    }
+
+    #[test]
+    fn parinfer_does_not_run_on_plain_text_buffers() {
+        let mut b = Buffer::empty_at(PathBuf::from("notes.txt"));
+        b.insert_char('(');
+        b.apply_parinfer();
+        assert_eq!(b.lines, vec!["("]);
+        assert_eq!(b.cursor, (1, 0));
+    }
+
+    #[test]
+    fn parinfer_does_not_run_on_untitled_buffers() {
+        let mut b = empty();
+        b.insert_char('(');
+        b.apply_parinfer();
+        assert_eq!(b.lines, vec!["("]);
+    }
+
+    #[test]
+    fn parinfer_indent_change_moves_closing_paren() {
+        let mut b = clj_buf();
+        b.lines = vec!["(foo)".to_string(), "bar".to_string()];
+        b.cursor = (0, 1);
+        b.sync_parinfer_prev();
+        b.indent();
+        b.apply_parinfer();
+        assert_eq!(b.lines, vec!["(foo", "    bar)"]);
+        assert_eq!(b.cursor, (4, 1));
+    }
+
+    #[test]
+    fn parinfer_newline_inside_form_preserves_cursor_line() {
+        let mut b = clj_buf();
+        type_clj(&mut b, "(foo");
+        assert_eq!(b.lines, vec!["(foo)"]);
+        assert_eq!(b.cursor, (4, 0));
+        let scroll = b.scroll;
+        b.newline();
+        b.apply_parinfer();
+        assert_eq!(b.cursor.1, 1);
+        assert_eq!(b.lines.len(), 2);
+        assert!(b.lines[0].starts_with("(foo"));
+        assert_eq!(b.scroll, scroll, "parinfer must not reset the viewport");
+    }
+
+    #[test]
+    fn parinfer_incomplete_string_does_not_drop_input() {
+        let mut b = clj_buf();
+        type_clj(&mut b, "\"hello");
+        assert_eq!(b.lines, vec!["\"hello"]);
+        assert_eq!(b.cursor, (6, 0));
+    }
+
+    #[test]
+    fn parinfer_user_edit_and_adjustment_undo_as_one_step() {
+        let mut b = clj_buf();
+        type_clj(&mut b, "(");
+        assert_eq!(b.lines, vec!["()"]);
+        assert!(b.undo());
+        assert_eq!(b.lines, vec![""]);
+        assert_eq!(b.cursor, (0, 0));
+        assert!(b.redo());
+        assert_eq!(b.lines, vec!["()"]);
+        assert_eq!(b.cursor, (1, 0));
+    }
+
+    #[test]
+    fn parinfer_continuous_typing_stays_one_undo_step() {
+        let mut b = clj_buf();
+        type_clj(&mut b, "(def");
+        assert_eq!(b.lines, vec!["(def)"]);
+        b.undo();
+        assert_eq!(b.lines, vec![""]);
+        b.redo();
+        assert_eq!(b.lines, vec!["(def)"]);
+    }
+
+    #[test]
+    fn parinfer_edn_files_are_enabled() {
+        let mut b = Buffer::empty_at(PathBuf::from("data.edn"));
+        type_clj(&mut b, "[");
+        assert_eq!(b.lines, vec!["[]"]);
+        assert_eq!(b.cursor, (1, 0));
+    }
+
+    #[test]
+    fn parinfer_preserves_selection_when_line_is_unchanged() {
+        let mut b = clj_buf();
+        type_clj(&mut b, "(foo bar)");
+        b.home();
+        b.move_right();
+        b.begin_selection();
+        b.move_right();
+        b.move_right();
+        b.move_right(); // "foo"
+        assert_eq!(b.selected_text().as_deref(), Some("foo"));
+        let scroll = b.scroll;
+        b.apply_parinfer();
+        assert_eq!(b.selected_text().as_deref(), Some("foo"));
+        assert_eq!(b.scroll, scroll);
     }
 }

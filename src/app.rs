@@ -786,6 +786,19 @@ impl App {
             _ => {}
         }
         self.quit_armed = false;
+        let maybe_changed = is_move
+            || matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Enter
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+            );
+        if maybe_changed {
+            self.buffer.apply_parinfer();
+        }
         // invalidate the highlight cache at the first changed line
         if let Some(line) = self.buffer.last_edit_line.take() {
             self.highlighter.invalidate_from(line);
@@ -835,6 +848,7 @@ impl App {
         let text = self.buffer.selected_text().unwrap_or_default();
         self.clipboard.set_text(&text);
         self.buffer.delete_selection();
+        self.buffer.apply_parinfer();
         if let Some(line) = self.buffer.last_edit_line.take() {
             self.highlighter.invalidate_from(line);
         }
@@ -887,6 +901,7 @@ impl App {
         }
         self.focus = Focus::Editor;
         self.buffer.insert_multiline(&text);
+        self.buffer.apply_parinfer();
         if let Some(line) = self.buffer.last_edit_line.take() {
             self.highlighter.invalidate_from(line);
         }
@@ -967,6 +982,10 @@ impl App {
                                 self.buffer.cursor = (col, line);
                             }
                         }
+                    }
+                    self.buffer.apply_parinfer();
+                    if let Some(line) = self.buffer.last_edit_line.take() {
+                        self.highlighter.invalidate_from(line);
                     }
                     self.ensure_cursor_visible();
                 }
@@ -1250,6 +1269,7 @@ impl App {
             return;
         }
         self.buffer.path = Some(path.clone());
+        self.buffer.sync_parinfer_prev();
         self.highlighter.set_path(Some(&path));
         match self.buffer.save() {
             Ok(()) => {
@@ -1307,6 +1327,7 @@ impl App {
                         buffer.wrap = true;
                         buffer.wrap_width = wrap_width;
                     }
+                    buffer.sync_parinfer_prev();
                     self.buffer = buffer;
                     self.highlighter.set_path(Some(&path));
                     self.quit_armed = false;
@@ -1398,6 +1419,7 @@ impl App {
         };
         self.buffer
             .replace_line_range(m.line, m.start, m.end, &replacement);
+        self.buffer.apply_parinfer();
         if let Some(line) = self.buffer.last_edit_line.take() {
             self.highlighter.invalidate_from(line);
         }
@@ -1426,6 +1448,7 @@ impl App {
         }
         let n = ranges.len();
         self.buffer.replace_line_ranges(&ranges, &replacement);
+        self.buffer.apply_parinfer();
         if let Some(line) = self.buffer.last_edit_line.take() {
             self.highlighter.invalidate_from(line);
         }
@@ -6042,5 +6065,51 @@ mod tests {
             .unwrap();
         assert_eq!(border.style().fg, Some(FOCUS_COLOR));
         assert_eq!(buf.cell((0, 0)).unwrap().style().bg, Some(PALETTE.bg));
+    }
+
+    #[test]
+    fn parinfer_runs_for_clojure_files_through_the_editor() {
+        let dir = scratch("parinfer-app-clj");
+        let file = dir.join("core.clj");
+        fs::write(&file, "").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        app.handle_key(char_key('('));
+        assert_eq!(app.buffer.lines, vec!["()"]);
+        assert_eq!(app.buffer.cursor, (1, 0));
+        app.handle_key(char_key('a'));
+        assert_eq!(app.buffer.lines, vec!["(a)"]);
+        assert_eq!(app.buffer.cursor, (2, 0));
+        // one logical undo for the typing run plus the automatic parens
+        app.handle_key(ctrl('z'));
+        assert_eq!(app.buffer.lines, vec![""]);
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(app.buffer.lines, vec!["(a)"]);
+    }
+
+    #[test]
+    fn parinfer_leaves_non_clojure_files_alone() {
+        let dir = scratch("parinfer-app-txt");
+        let file = dir.join("notes.txt");
+        fs::write(&file, "").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        app.handle_key(char_key('('));
+        assert_eq!(app.buffer.lines, vec!["("]);
+        assert_eq!(app.buffer.cursor, (1, 0));
+    }
+
+    #[test]
+    fn parinfer_incomplete_string_keeps_typed_text() {
+        let dir = scratch("parinfer-app-str");
+        let file = dir.join("core.cljs");
+        fs::write(&file, "").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        app.handle_key(char_key('"'));
+        app.handle_key(char_key('h'));
+        app.handle_key(char_key('i'));
+        assert_eq!(app.buffer.lines, vec!["\"hi"]);
+        assert_eq!(app.buffer.cursor, (3, 0));
     }
 }

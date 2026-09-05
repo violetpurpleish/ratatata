@@ -1892,6 +1892,7 @@ dependencies = [
  "ratatui-themes",
  "syntect",
  "two-face",
+ "unicode-segmentation",
  "unicode-width",
 ]
 
