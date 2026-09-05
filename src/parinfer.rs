@@ -1,14 +1,22 @@
 //! Parinfer Smart Mode for Clojure-family buffers.
 //!
-//! Ratatata runs the vendored parinfer-rust engine after each user edit
-//! (and after cursor movement) when the open file is `.clj`, `.cljs`,
-//! `.cljc`, or `.edn`. Other file types are untouched. The engine is
-//! fail-safe: a parse error (for example an unclosed string while typing)
-//! leaves the user's text as they typed it.
+//! Ratatata runs the vendored parinfer-rust engine after each *text* edit
+//! when the open file is `.clj`, `.cljs`, `.cljc`, or `.edn`. Cursor-only
+//! movement just updates the remembered previous cursor. Other file types
+//! are untouched. The engine is fail-safe: a parse error (for example an
+//! unclosed string while typing) leaves the user's text as they typed it.
+//!
+//! Parinfer's `x` coordinates are display columns over Unicode grapheme
+//! clusters (`UnicodeSegmentation` + `UnicodeWidthStr`). Ratatata stores
+//! cursor X as a Rust `char` index. [`char_index_to_column`] /
+//! [`column_to_char_index`] convert between those systems and snap to
+//! grapheme boundaries so a returned column never lands in the middle of
+//! a cluster.
 
 use std::path::Path;
 
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::parinfer_engine::parinfer;
 use crate::parinfer_engine::types::{Options, Request};
@@ -83,28 +91,50 @@ fn nth_line(text: &str, y: usize) -> &str {
     text.split('\n').nth(y).unwrap_or("")
 }
 
-/// Parinfer `x` coordinates are unicode display columns, not char indices.
-fn char_index_to_column(line: &str, char_idx: usize) -> usize {
-    line.chars()
-        .take(char_idx)
-        .map(|c| c.width().unwrap_or(0))
-        .sum()
+/// Display column of the grapheme that contains `char_idx` (the start of
+/// that cluster). Matches the engine's `UnicodeWidthStr` over graphemes,
+/// not the sum of per-scalar `UnicodeWidthChar` values.
+pub(crate) fn char_index_to_column(line: &str, char_idx: usize) -> usize {
+    let mut col = 0;
+    let mut chars_seen = 0;
+    for g in line.graphemes(true) {
+        let g_chars = g.chars().count();
+        if char_idx < chars_seen + g_chars {
+            return col;
+        }
+        chars_seen += g_chars;
+        col += UnicodeWidthStr::width(g);
+    }
+    col
 }
 
-fn column_to_char_index(line: &str, column: usize) -> usize {
+/// Char index of the grapheme that occupies `column`. If `column` sits
+/// inside a wide cluster, this snaps to that cluster's first char rather
+/// than landing on a trailing scalar (combining mark, ZWJ, …).
+pub(crate) fn column_to_char_index(line: &str, column: usize) -> usize {
     let mut col = 0;
-    for (i, c) in line.chars().enumerate() {
-        if col >= column {
-            return i;
+    let mut chars_seen = 0;
+    for g in line.graphemes(true) {
+        let w = UnicodeWidthStr::width(g);
+        if column <= col {
+            return chars_seen;
         }
-        col += c.width().unwrap_or(0);
+        if w > 0 && column < col + w {
+            return chars_seen;
+        }
+        chars_seen += g.chars().count();
+        col += w;
     }
-    line.chars().count()
+    chars_seen
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CJK: &str = "界";
+    const COMBINING: &str = "e\u{0301}";
+    const ZWJ: &str = "👩\u{200D}💻";
 
     fn edit(text: &str, cursor: (usize, usize), prev: &str, prev_cursor: (usize, usize)) -> Output {
         smart_edit(&Input {
@@ -167,5 +197,78 @@ mod tests {
     fn column_conversion_round_trips_ascii() {
         assert_eq!(char_index_to_column("abc", 2), 2);
         assert_eq!(column_to_char_index("abc", 2), 2);
+    }
+
+    #[test]
+    fn column_conversion_uses_cjk_display_width() {
+        assert_eq!(CJK.chars().count(), 1);
+        assert_eq!(char_index_to_column(CJK, 0), 0);
+        assert_eq!(char_index_to_column(CJK, 1), 2);
+        let line = format!("{CJK}()");
+        assert_eq!(column_to_char_index(&line, 0), 0);
+        assert_eq!(column_to_char_index(&line, 2), 1);
+        assert_eq!(column_to_char_index(&line, 3), 2);
+    }
+
+    #[test]
+    fn column_conversion_does_not_split_combining_graphemes() {
+        assert_eq!(COMBINING.chars().count(), 2);
+        assert_eq!(char_index_to_column(COMBINING, 0), 0);
+        assert_eq!(char_index_to_column(COMBINING, 1), 0);
+        assert_eq!(char_index_to_column(COMBINING, 2), 1);
+        // column 1 is *after* the cluster, not the combining mark
+        assert_eq!(column_to_char_index(COMBINING, 1), 2);
+        let line = format!("{COMBINING}()");
+        assert_eq!(column_to_char_index(&line, 1), 2);
+    }
+
+    #[test]
+    fn column_conversion_treats_zwj_emoji_as_one_cluster() {
+        assert_eq!(ZWJ.chars().count(), 3);
+        assert_eq!(char_index_to_column(ZWJ, 0), 0);
+        assert_eq!(char_index_to_column(ZWJ, 1), 0);
+        assert_eq!(char_index_to_column(ZWJ, 2), 0);
+        assert_eq!(char_index_to_column(ZWJ, 3), 2);
+        let line = format!("{ZWJ}()");
+        assert_eq!(column_to_char_index(&line, 2), 3);
+        assert_eq!(column_to_char_index(&line, 3), 4);
+    }
+
+    #[test]
+    fn smart_mode_after_cjk_inserts_matching_paren() {
+        let text = format!("{CJK}(");
+        let out = edit(&text, (2, 0), CJK, (1, 0));
+        assert_eq!(out.text, format!("{CJK}()"));
+        assert_eq!(out.cursor, (2, 0));
+    }
+
+    #[test]
+    fn smart_mode_after_combining_inserts_matching_paren() {
+        let n = COMBINING.chars().count();
+        let text = format!("{COMBINING}(");
+        let out = edit(&text, (n + 1, 0), COMBINING, (n, 0));
+        assert_eq!(out.text, format!("{COMBINING}()"));
+        assert_eq!(out.cursor, (n + 1, 0));
+        assert_ne!(out.cursor.0, 1, "cursor must not sit on the combining mark");
+    }
+
+    #[test]
+    fn smart_mode_after_zwj_emoji_inserts_matching_paren() {
+        let n = ZWJ.chars().count();
+        let text = format!("{ZWJ}(");
+        let out = edit(&text, (n + 1, 0), ZWJ, (n, 0));
+        assert_eq!(out.text, format!("{ZWJ}()"));
+        assert_eq!(out.cursor, (n + 1, 0));
+    }
+
+    #[test]
+    fn smart_mode_indent_after_unicode_prefixes() {
+        for prefix in [CJK, COMBINING, ZWJ] {
+            let prev = format!("{prefix}(foo)\nbar");
+            let text = format!("{prefix}(foo)\n    bar");
+            let out = edit(&text, (4, 1), &prev, (0, 1));
+            assert_eq!(out.text, format!("{prefix}(foo\n    bar)"));
+            assert_eq!(out.cursor, (4, 1));
+        }
     }
 }

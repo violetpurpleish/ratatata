@@ -1,5 +1,6 @@
 //! Vendored from [parinfer-rust](https://github.com/eraserhd/parinfer-rust) (Jason Felice).
 //! ISC License: Copyright (c) 2018, Jason Felice and Contributors.
+//! Upstream commit: `0d334950099cd30a8e1ca520026f8da9ea1382fa`
 
 use std::fmt;
 
