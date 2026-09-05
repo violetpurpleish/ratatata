@@ -786,17 +786,17 @@ impl App {
             _ => {}
         }
         self.quit_armed = false;
-        let maybe_changed = is_move
-            || matches!(
-                key.code,
-                KeyCode::Char(_)
-                    | KeyCode::Enter
-                    | KeyCode::Tab
-                    | KeyCode::BackTab
-                    | KeyCode::Backspace
-                    | KeyCode::Delete
-            );
-        if maybe_changed {
+        if is_move {
+            self.buffer.sync_parinfer_cursor();
+        } else if matches!(
+            key.code,
+            KeyCode::Char(_)
+                | KeyCode::Enter
+                | KeyCode::Tab
+                | KeyCode::BackTab
+                | KeyCode::Backspace
+                | KeyCode::Delete
+        ) {
             self.buffer.apply_parinfer();
         }
         // invalidate the highlight cache at the first changed line
@@ -983,10 +983,7 @@ impl App {
                             }
                         }
                     }
-                    self.buffer.apply_parinfer();
-                    if let Some(line) = self.buffer.last_edit_line.take() {
-                        self.highlighter.invalidate_from(line);
-                    }
+                    self.buffer.sync_parinfer_cursor();
                     self.ensure_cursor_visible();
                 }
             }
@@ -1023,6 +1020,7 @@ impl App {
                             } else {
                                 self.buffer.extend_selection_line_at((col, line));
                             }
+                            self.buffer.sync_parinfer_cursor();
                             self.ensure_cursor_visible();
                         }
                     } else {
@@ -1031,6 +1029,7 @@ impl App {
                         }
                         if let Some((line, col)) = self.editor_cursor_at(pos) {
                             self.buffer.cursor = (col, line);
+                            self.buffer.sync_parinfer_cursor();
                             self.ensure_cursor_visible();
                         }
                     }
@@ -6111,5 +6110,65 @@ mod tests {
         app.handle_key(char_key('i'));
         assert_eq!(app.buffer.lines, vec!["\"hi"]);
         assert_eq!(app.buffer.cursor, (3, 0));
+    }
+
+    #[test]
+    fn parinfer_keyboard_navigation_does_not_rewrite_buffer() {
+        let dir = scratch("parinfer-app-nav");
+        let file = dir.join("core.clj");
+        fs::write(&file, "(foo\nbar").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        let before = app.buffer.lines.clone();
+        for code in [
+            KeyCode::Down,
+            KeyCode::Right,
+            KeyCode::End,
+            KeyCode::Home,
+            KeyCode::Up,
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+            KeyCode::Left,
+        ] {
+            app.handle_key(key(code));
+            assert_eq!(app.buffer.lines, before, "{code:?}");
+        }
+        assert!(!app.buffer.dirty);
+        app.handle_key(ctrl('z'));
+        assert_eq!(app.buffer.lines, before, "navigation must not create undo");
+
+        // Typing after navigation still runs Smart Mode.
+        app.handle_key(key(KeyCode::End));
+        app.handle_key(char_key('x'));
+        assert!(app.buffer.lines.join("\n").contains('x'));
+        assert!(app.buffer.dirty);
+    }
+
+    #[test]
+    fn parinfer_mouse_cursor_placement_does_not_rewrite_buffer() {
+        let dir = scratch("parinfer-app-mouse");
+        let file = dir.join("core.clj");
+        fs::write(&file, "(foo\nbar").unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        render_buffer(&mut app);
+        let before = app.buffer.lines.clone();
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 31, 2));
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.buffer.cursor.1, 0);
+        assert_eq!(app.buffer.lines, before);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 31, 3));
+        assert_eq!(app.buffer.cursor.1, 1);
+        assert_eq!(app.buffer.lines, before);
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 35, 3));
+        assert_eq!(app.buffer.cursor.1, 1);
+        assert_eq!(app.buffer.lines, before);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 35, 3));
+        assert_eq!(app.buffer.lines, before);
+        assert!(!app.buffer.dirty);
+        app.handle_key(ctrl('z'));
+        assert_eq!(
+            app.buffer.lines, before,
+            "mouse placement must not create undo"
+        );
     }
 }

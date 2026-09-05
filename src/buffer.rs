@@ -273,8 +273,9 @@ enum EditKind {
     DeleteSelection,
     Indent,
     Dedent,
-    /// Automatic Parinfer adjustment that was not part of a user edit
-    /// (for example, fixing parens after the cursor left a line).
+    /// Fallback if a Parinfer rewrite happens without a preceding user-edit
+    /// snapshot. Cursor-only navigation never runs the engine and never
+    /// produces this kind.
     Parinfer,
 }
 
@@ -462,21 +463,38 @@ impl Buffer {
         self.parinfer_prev_cursor = self.cursor;
     }
 
-    /// Run Parinfer Smart Mode for Clojure-family files. No-ops for other
-    /// paths. On engine failure the user text is kept. A successful
-    /// adjustment that follows a user edit is merged into that edit's
-    /// undo step.
+    /// Remember the current cursor for the next Smart Mode request without
+    /// running the engine. Used after pure navigation (arrows, Home/End,
+    /// PageUp/PageDown, mouse placement) so cursor-only movement cannot
+    /// mutate the buffer. Matches upstream parinfer-rust's Vim plugin,
+    /// which only reprocesses when `changedtick` shows a text change.
+    pub(crate) fn sync_parinfer_cursor(&mut self) {
+        if !crate::parinfer::applies_to_path(self.path.as_deref()) {
+            return;
+        }
+        self.parinfer_prev_cursor = self.cursor;
+    }
+
+    /// Run Parinfer Smart Mode after a text edit in a Clojure-family file.
+    /// No-ops for other paths. If the buffer text has not changed since the
+    /// last request, only the remembered cursor is updated — a plain cursor
+    /// move must not rewrite the file. On engine failure the user text is
+    /// kept. A successful adjustment that follows a user edit is merged
+    /// into that edit's undo step.
+    ///
+    /// Do not call this after cursor-only navigation; use
+    /// [`Self::sync_parinfer_cursor`] instead.
     pub(crate) fn apply_parinfer(&mut self) {
         if !crate::parinfer::applies_to_path(self.path.as_deref()) {
             return;
         }
-        let text_edited =
-            self.last_edit_line.is_some() || self.last_edit.is_some() || self.force_merge;
-        if !text_edited && (self.selecting || self.has_selection()) {
+        let text = self.content();
+        if text == self.parinfer_prev_text {
             self.parinfer_prev_cursor = self.cursor;
             return;
         }
-        let text = self.content();
+        let text_edited =
+            self.last_edit_line.is_some() || self.last_edit.is_some() || self.force_merge;
         let input = crate::parinfer::Input {
             text: &text,
             cursor: self.cursor,
@@ -2863,8 +2881,118 @@ mod tests {
         b.move_right(); // "foo"
         assert_eq!(b.selected_text().as_deref(), Some("foo"));
         let scroll = b.scroll;
-        b.apply_parinfer();
+        b.sync_parinfer_cursor();
         assert_eq!(b.selected_text().as_deref(), Some("foo"));
         assert_eq!(b.scroll, scroll);
+    }
+
+    #[test]
+    fn parinfer_cursor_only_navigation_does_not_rewrite_or_create_undo() {
+        let mut b = clj_buf();
+        // Smart Mode would close this if it ran on cursor movement.
+        b.lines = vec!["(foo".to_string(), "bar".to_string()];
+        b.cursor = (4, 0);
+        b.sync_parinfer_prev();
+        let before = b.lines.clone();
+
+        b.move_down();
+        b.sync_parinfer_cursor();
+        b.move_right();
+        b.sync_parinfer_cursor();
+        b.home();
+        b.sync_parinfer_cursor();
+        b.end();
+        b.sync_parinfer_cursor();
+        b.move_up();
+        b.sync_parinfer_cursor();
+        b.page_down(10);
+        b.sync_parinfer_cursor();
+        b.page_up(10);
+        b.sync_parinfer_cursor();
+
+        assert_eq!(b.lines, before);
+        assert!(!b.dirty);
+        assert!(!b.undo(), "cursor movement must not create an undo entry");
+
+        // A mistaken engine call after navigation must still not rewrite.
+        b.apply_parinfer();
+        assert_eq!(b.lines, before);
+        assert!(!b.dirty);
+    }
+
+    const CJK: &str = "界";
+    const COMBINING: &str = "e\u{0301}";
+    const ZWJ: &str = "👩\u{200D}💻";
+
+    fn assert_cursor_in_range(b: &Buffer) {
+        assert!(b.cursor.1 < b.lines.len());
+        assert!(b.cursor.0 <= b.lines[b.cursor.1].chars().count());
+    }
+
+    #[test]
+    fn parinfer_insert_and_delete_after_unicode_clusters() {
+        for prefix in [CJK, COMBINING, ZWJ] {
+            let mut b = clj_buf();
+            // Insert the whole cluster at once so ZWJ sequences are not
+            // split across Smart Mode requests.
+            b.insert_text(prefix);
+            b.apply_parinfer();
+            let n = prefix.chars().count();
+            assert_eq!(b.lines, vec![prefix.to_string()], "{prefix:?}");
+            assert_eq!(b.cursor, (n, 0), "{prefix:?}");
+            assert_cursor_in_range(&b);
+
+            b.insert_char('(');
+            b.apply_parinfer();
+            assert_eq!(b.lines, vec![format!("{prefix}()")], "{prefix:?}");
+            assert_eq!(b.cursor, (n + 1, 0), "{prefix:?}");
+            assert_cursor_in_range(&b);
+            if prefix == COMBINING {
+                assert_ne!(b.cursor.0, 1, "cursor must not sit on the combining mark");
+            }
+
+            b.backspace();
+            b.apply_parinfer();
+            assert!(b.lines[0].starts_with(prefix), "{prefix:?} {}", b.lines[0]);
+            assert_cursor_in_range(&b);
+            if prefix == COMBINING {
+                assert_ne!(b.cursor.0, 1, "cursor must not sit on the combining mark");
+            }
+
+            let mut b = clj_buf();
+            b.insert_text(&format!("{prefix}x"));
+            b.apply_parinfer();
+            assert_eq!(b.cursor, (n + 1, 0), "{prefix:?}");
+            b.backspace();
+            b.apply_parinfer();
+            assert_eq!(b.lines, vec![prefix.to_string()], "{prefix:?}");
+            assert_eq!(b.cursor, (n, 0), "{prefix:?}");
+            assert_cursor_in_range(&b);
+
+            b.home();
+            b.sync_parinfer_cursor();
+            b.delete();
+            b.apply_parinfer();
+            assert_cursor_in_range(&b);
+        }
+    }
+
+    #[test]
+    fn parinfer_indent_after_unicode_prefixes_moves_closing_paren() {
+        for prefix in [CJK, COMBINING, ZWJ] {
+            let mut b = clj_buf();
+            b.lines = vec![format!("{prefix}(foo)"), "bar".to_string()];
+            b.cursor = (0, 1);
+            b.sync_parinfer_prev();
+            b.indent();
+            b.apply_parinfer();
+            assert_eq!(
+                b.lines,
+                vec![format!("{prefix}(foo"), "    bar)".to_string()],
+                "{prefix:?}"
+            );
+            assert_eq!(b.cursor, (4, 1), "{prefix:?}");
+            assert_cursor_in_range(&b);
+        }
     }
 }
