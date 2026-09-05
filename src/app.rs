@@ -1486,6 +1486,7 @@ impl App {
                 let y = n - 1;
                 self.buffer.clear_selection();
                 self.buffer.cursor = (0, y);
+                self.buffer.sync_parinfer_cursor();
                 self.focus = Focus::Editor;
                 self.ensure_cursor_visible();
             }
@@ -1526,6 +1527,7 @@ impl App {
         };
         self.buffer.cursor = (m.start, m.line);
         self.buffer.clear_selection();
+        self.buffer.sync_parinfer_cursor();
         self.ensure_cursor_visible();
     }
 
@@ -6110,6 +6112,61 @@ mod tests {
         app.handle_key(char_key('i'));
         assert_eq!(app.buffer.lines, vec!["\"hi"]);
         assert_eq!(app.buffer.cursor, (3, 0));
+    }
+
+    fn parinfer_two_forms_app(name: &str) -> App {
+        let dir = scratch(name);
+        let file = dir.join("core.clj");
+        fs::write(&file, "(foo)\n(bar)").unwrap();
+        new_app(dir, Some(file)).unwrap()
+    }
+
+    #[test]
+    fn parinfer_goto_line_then_edit_uses_moved_cursor() {
+        let mut app = parinfer_two_forms_app("parinfer-app-goto");
+        assert_eq!(app.buffer.cursor, (0, 0));
+        assert_eq!(app.buffer.parinfer_prev_cursor(), (0, 0));
+
+        app.handle_key(ctrl('g'));
+        app.handle_key(char_key('2'));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.buffer.cursor, (0, 1));
+        assert_eq!(app.buffer.parinfer_prev_cursor(), (0, 1));
+        assert_eq!(app.buffer.lines, vec!["(foo)", "(bar)"]);
+
+        app.handle_key(char_key('x'));
+        assert_eq!(app.buffer.lines, vec!["(foo)", "x(bar)"]);
+        assert_eq!(app.buffer.cursor, (1, 1));
+        assert_eq!(app.buffer.parinfer_prev_cursor(), (1, 1));
+    }
+
+    #[test]
+    fn parinfer_search_jump_then_edit_uses_moved_cursor() {
+        let mut app = parinfer_two_forms_app("parinfer-app-search");
+        open_search_typed(&mut app, "bar");
+        assert_eq!(app.buffer.cursor, (1, 1));
+        assert_eq!(app.buffer.parinfer_prev_cursor(), (1, 1));
+        assert_eq!(app.buffer.lines, vec!["(foo)", "(bar)"]);
+
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(char_key('x'));
+        assert_eq!(app.buffer.lines, vec!["(foo)", "(xbar)"]);
+        assert_eq!(app.buffer.cursor, (2, 1));
+        assert_eq!(app.buffer.parinfer_prev_cursor(), (2, 1));
+    }
+
+    #[test]
+    fn parinfer_select_all_then_edit_uses_moved_cursor() {
+        let mut app = parinfer_two_forms_app("parinfer-app-selectall");
+        app.handle_key(ctrl('a'));
+        assert_eq!(app.buffer.cursor, (5, 1));
+        assert_eq!(app.buffer.parinfer_prev_cursor(), (5, 1));
+        assert_eq!(app.buffer.lines, vec!["(foo)", "(bar)"]);
+
+        app.handle_key(char_key('x'));
+        assert_eq!(app.buffer.lines, vec!["x"]);
+        assert_eq!(app.buffer.cursor, (1, 0));
+        assert_eq!(app.buffer.parinfer_prev_cursor(), (1, 0));
     }
 
     #[test]

@@ -465,14 +465,20 @@ impl Buffer {
 
     /// Remember the current cursor for the next Smart Mode request without
     /// running the engine. Used after pure navigation (arrows, Home/End,
-    /// PageUp/PageDown, mouse placement) so cursor-only movement cannot
-    /// mutate the buffer. Matches upstream parinfer-rust's Vim plugin,
-    /// which only reprocesses when `changedtick` shows a text change.
+    /// PageUp/PageDown, mouse placement, go-to-line, search jumps, and
+    /// select-all) so cursor-only movement cannot mutate the buffer.
+    /// Matches upstream parinfer-rust's Vim plugin, which only reprocesses
+    /// when `changedtick` shows a text change.
     pub(crate) fn sync_parinfer_cursor(&mut self) {
         if !crate::parinfer::applies_to_path(self.path.as_deref()) {
             return;
         }
         self.parinfer_prev_cursor = self.cursor;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parinfer_prev_cursor(&self) -> (usize, usize) {
+        self.parinfer_prev_cursor
     }
 
     /// Run Parinfer Smart Mode after a text edit in a Clojure-family file.
@@ -871,6 +877,7 @@ impl Buffer {
         self.selection_anchor = Some((0, 0));
         self.cursor = (self.line_len(last), last);
         self.selecting = false;
+        self.sync_parinfer_cursor();
     }
 
     /// The char range of the "word" at `(x, y)` (`x` is a char index), or
@@ -2884,6 +2891,19 @@ mod tests {
         b.sync_parinfer_cursor();
         assert_eq!(b.selected_text().as_deref(), Some("foo"));
         assert_eq!(b.scroll, scroll);
+    }
+
+    #[test]
+    fn parinfer_select_all_syncs_prev_cursor_without_rewriting() {
+        let mut b = clj_buf();
+        b.lines = vec!["(foo)".to_string(), "(bar)".to_string()];
+        b.cursor = (0, 0);
+        b.sync_parinfer_prev();
+        b.select_all();
+        assert_eq!(b.cursor, (5, 1));
+        assert_eq!(b.parinfer_prev_cursor(), (5, 1));
+        assert_eq!(b.lines, vec!["(foo)", "(bar)"]);
+        assert!(!b.dirty);
     }
 
     #[test]
