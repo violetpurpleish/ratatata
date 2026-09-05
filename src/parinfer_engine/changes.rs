@@ -3,10 +3,16 @@
 //!
 //! Upstream commit: `0d334950099cd30a8e1ca520026f8da9ea1382fa`
 //!
-//! `compute_text_changes` differs from that commit in one place: the change
-//! coordinate `x` is a *display column* (grapheme `UnicodeWidthStr` width,
-//! matching the rest of the engine) rather than `+1` per Rust `char`. The
-//! common-prefix / common-suffix byte ranges are unchanged.
+//! `compute_text_changes` differs from that commit in two places:
+//!
+//! 1. The change coordinate `x` is a *display column* (grapheme
+//!    `UnicodeWidthStr` width, matching the rest of the engine) rather than
+//!    `+1` per Rust `char`. The common-prefix / common-suffix byte ranges
+//!    are unchanged.
+//! 2. `line_no` is counted from `'\n'` bytes, not grapheme clusters, so a
+//!    CRLF (`"\r\n"`) line ending still advances the line. Unicode
+//!    grapheme segmentation treats `"\r\n"` as one cluster, which would
+//!    otherwise leave an edit on line 2 reported as line 1.
 
 use super::types::*;
 use unicode_segmentation::UnicodeSegmentation;
@@ -31,17 +37,16 @@ pub fn compute_text_changes<'a>(prev_text: &'a str, text: &'a str) -> Vec<Change
     }
 
     if different {
-        // Display column of the first difference. Upstream counted +1 per
-        // scalar; a wide grapheme before the edit would then disagree with
-        // the engine's grapheme-column `x`.
-        for g in prev_text[..start_prev].graphemes(true) {
-            if g == "\n" {
-                x = 0;
-                line_no += 1;
-            } else {
-                x += UnicodeWidthStr::width(g);
-            }
-        }
+        // Line number from '\n' bytes so CRLF is not swallowed as one
+        // grapheme. Display column `x` is the grapheme width of the current
+        // logical line only.
+        let prefix = &prev_text[..start_prev];
+        line_no = prefix.bytes().filter(|&b| b == b'\n').count();
+        let line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        x = prev_text[line_start..start_prev]
+            .graphemes(true)
+            .map(UnicodeWidthStr::width)
+            .sum();
     }
 
     for ((i, pc), (j, c)) in prev_text
@@ -136,6 +141,38 @@ fn compute_text_changes_x_is_display_column_after_wide_graphemes() {
         vec![Change {
             x: 2,
             line_no: 0,
+            old_text: String::from("x"),
+            new_text: String::from("y"),
+        }]
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn compute_text_changes_crlf_counts_lines_from_newlines() {
+    assert_eq!(
+        compute_text_changes("(foo)\r\nbar", "(foo)\r\nxar"),
+        vec![Change {
+            x: 0,
+            line_no: 1,
+            old_text: String::from("b"),
+            new_text: String::from("x"),
+        }]
+    );
+    assert_eq!(
+        compute_text_changes("(foo)\r\nbar", "(foo)\r\n    bar"),
+        vec![Change {
+            x: 0,
+            line_no: 1,
+            old_text: String::from(""),
+            new_text: String::from("    "),
+        }]
+    );
+    assert_eq!(
+        compute_text_changes("(foo)\r\n界x", "(foo)\r\n界y"),
+        vec![Change {
+            x: 2,
+            line_no: 1,
             old_text: String::from("x"),
             new_text: String::from("y"),
         }]

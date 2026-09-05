@@ -7,7 +7,9 @@
 //! Commit: `0d334950099cd30a8e1ca520026f8da9ea1382fa`
 //!
 //! Local delta: [`changes::compute_text_changes`] reports display-column `x`
-//! (grapheme width) instead of `+1` per Rust `char`. See that module.
+//! (grapheme width) instead of `+1` per Rust `char`, and counts `line_no`
+//! from `'\n'` bytes so CRLF is not treated as a single grapheme. See that
+//! module.
 
 #![allow(dead_code)]
 #![allow(clippy::all)]

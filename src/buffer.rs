@@ -1443,12 +1443,13 @@ impl Buffer {
         let view_h = view_h.max(1);
         let view_w = view_w.max(1);
         self.clamp_scroll(view_h);
-        // guard against an out-of-range cursor (shouldn't happen through
-        // normal movement, which clamps)
-        self.clamp_x();
+        // Guard against an out-of-range cursor (reload of a shorter file,
+        // not normal movement). Clamp the line first so `clamp_x` uses the
+        // final line's length.
         if self.cursor.1 >= self.lines.len() {
             self.cursor.1 = self.lines.len() - 1;
         }
+        self.clamp_x();
         if self.wrap {
             let cv = self.cursor_vrow();
             if cv < self.scroll.1 {
@@ -2818,6 +2819,20 @@ mod tests {
         b.indent();
         b.apply_parinfer();
         assert_eq!(b.lines, vec!["(foo", "    bar)"]);
+        assert_eq!(b.cursor, (4, 1));
+    }
+
+    #[test]
+    fn parinfer_indent_on_crlf_file_moves_closing_paren() {
+        let path = tmp_path("parinfer-crlf.clj");
+        std::fs::write(&path, "(foo)\r\nbar").unwrap();
+        let mut b = Buffer::from_path(path).unwrap();
+        assert_eq!(b.lines, vec!["(foo)\r", "bar"]);
+        b.cursor = (0, 1);
+        b.sync_parinfer_prev();
+        b.indent();
+        b.apply_parinfer();
+        assert_eq!(b.lines, vec!["(foo\r", "    bar)"]);
         assert_eq!(b.cursor, (4, 1));
     }
 

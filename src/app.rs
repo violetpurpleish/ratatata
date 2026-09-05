@@ -1326,7 +1326,6 @@ impl App {
                         buffer.wrap = true;
                         buffer.wrap_width = wrap_width;
                     }
-                    buffer.sync_parinfer_prev();
                     self.buffer = buffer;
                     self.highlighter.set_path(Some(&path));
                     self.quit_armed = false;
@@ -1336,6 +1335,9 @@ impl App {
                     }
                     let (w, h) = self.editor_text;
                     self.buffer.ensure_visible(h as usize, w as usize);
+                    // Cursor may have been out of range if the file shrank.
+                    // Remember Parinfer state only after the final clamp.
+                    self.buffer.sync_parinfer_prev();
                     message = Some(format!("reloaded {}", path.display()));
                 }
                 Err(e) => message = Some(format!("cannot reload {}: {e}", path.display())),
@@ -6167,6 +6169,33 @@ mod tests {
         assert_eq!(app.buffer.lines, vec!["x"]);
         assert_eq!(app.buffer.cursor, (1, 0));
         assert_eq!(app.buffer.parinfer_prev_cursor(), (1, 0));
+    }
+
+    #[test]
+    fn parinfer_reload_clamps_prev_cursor_before_next_edit() {
+        let dir = scratch("parinfer-app-reload");
+        let file = dir.join("core.clj");
+        fs::write(&file, "(foo)\n(bar)\n(baz)\n(quux)").unwrap();
+        let mut app = new_app(dir, Some(file.clone())).unwrap();
+        render_buffer(&mut app);
+        app.handle_key(key(KeyCode::End));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.buffer.cursor, (6, 3));
+        assert_eq!(app.buffer.parinfer_prev_cursor(), (6, 3));
+
+        fs::write(&file, "(a)").unwrap();
+        app.handle_key(ctrl('r'));
+        assert_eq!(app.buffer.lines, vec!["(a)"]);
+        assert_eq!(app.buffer.cursor, (3, 0));
+        assert_eq!(app.buffer.parinfer_prev_cursor(), (3, 0));
+
+        app.handle_key(char_key('x'));
+        assert_eq!(app.buffer.lines, vec!["(a)x"]);
+        assert_eq!(app.buffer.cursor, (4, 0));
+        assert_eq!(app.buffer.parinfer_prev_cursor(), (4, 0));
     }
 
     #[test]

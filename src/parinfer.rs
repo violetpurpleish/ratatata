@@ -271,4 +271,11 @@ mod tests {
             assert_eq!(out.cursor, (4, 1));
         }
     }
+
+    #[test]
+    fn smart_mode_indent_after_crlf_uses_second_line() {
+        let out = edit("(foo)\r\n    bar", (4, 1), "(foo)\r\nbar", (0, 1));
+        assert_eq!(out.text, "(foo\r\n    bar)");
+        assert_eq!(out.cursor, (4, 1));
+    }
 }
