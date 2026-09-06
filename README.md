@@ -119,10 +119,16 @@ src/
 ├── main.rs       entry point: arg resolution, terminal setup (mouse,
 │                 bracketed paste, kitty keyboard protocol, image-protocol
 │                 detection), event loop
-├── app.rs        application state, key/mouse handling, rendering,
-│                 save-as flow, status bar
-├── buffer.rs     line-based text buffer with char-indexed cursor,
-│                 selection, scrolling, undo/redo, load/save
+├── app.rs        shared application state and initialization
+├── app/          input and mouse handling, file/search actions, links,
+│                 shortcut layout, editor/status rendering and text clipping
+│   └── tests/    existing app regressions grouped by behavior;
+│                 shared fixtures live in app/tests.rs
+├── buffer.rs     buffer state and common text helpers
+├── buffer/       editing, selection, history, navigation, wrapping,
+│                 viewport calculations, atomic storage and Parinfer integration
+│   └── tests/    existing buffer regressions grouped by behavior;
+│                 shared fixtures live in buffer/tests.rs
 ├── sidebar.rs    scrollable directory listing (dirs first, ".." entry,
 │                 optional hide-dotfiles)
 ├── theme.rs      truecolor detection and ANSI 16 fallback for the UI palette
