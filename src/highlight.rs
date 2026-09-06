@@ -10,6 +10,8 @@
 //! sidesteps the lifetime problem of `syntect::highlighting::Highlighter`,
 //! which borrows its `Theme`.
 
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -66,8 +68,11 @@ impl Highlighter {
         &self.syntax.name
     }
 
-    /// Re-detect the syntax for `path` (by extension, then first-line
-    /// heuristics such as shebangs) and drop the highlight cache.
+    /// Re-detect the syntax for `path` and drop the highlight cache.
+    ///
+    /// Precedence: exact filename / real Syntect extension, then the
+    /// Clojure-family alias for `.cljs`/`.cljc`/`.edn`, then first-line
+    /// heuristics such as shebangs.
     pub fn set_path(&mut self, path: Option<&Path>) {
         let syntax = match path {
             Some(path) => self
@@ -79,24 +84,36 @@ impl Highlighter {
         self.invalidate_from(0);
     }
 
-    /// Syntect's bundled Clojure grammar lists `.clj` (and sometimes
-    /// `.cljc`). ClojureScript and EDN share that syntax, so fall back to
-    /// it when the dump has no grammar of its own for the extension.
+    /// Syntect's `find_syntax_for_file` tries extension then shebang. That
+    /// would let a Node shebang on an existing `.cljs` file win as
+    /// JavaScript before the Clojure-family alias ran. Keep a native
+    /// Syntect `.cljs` mapping (if a later dump adds one) above the alias,
+    /// but put the alias above first-line heuristics.
     fn syntax_for_path(&self, path: &Path) -> Option<&SyntaxReference> {
-        // by extension + first-line heuristics (reads the file)
-        let by_file = self.syntax_set.find_syntax_for_file(path).ok().flatten();
-        // fallback for files that don't exist yet: extension only
+        let file_name = path.file_name().and_then(|name| name.to_str());
         let ext = path.extension().and_then(|ext| ext.to_str());
-        let by_ext = ext.and_then(|ext| self.syntax_set.find_syntax_by_extension(ext));
-        by_file.or(by_ext).or_else(|| {
-            if ext.is_some_and(is_clojure_family_alias) {
-                self.syntax_set
-                    .find_syntax_by_extension("clj")
-                    .or_else(|| self.syntax_set.find_syntax_by_name("Clojure"))
-            } else {
-                None
-            }
-        })
+        file_name
+            .and_then(|name| self.syntax_set.find_syntax_by_extension(name))
+            .or_else(|| ext.and_then(|ext| self.syntax_set.find_syntax_by_extension(ext)))
+            .or_else(|| self.clojure_family_alias(ext))
+            .or_else(|| self.syntax_from_first_line(path))
+    }
+
+    fn clojure_family_alias(&self, ext: Option<&str>) -> Option<&SyntaxReference> {
+        if ext.is_some_and(is_clojure_family_alias) {
+            self.syntax_set
+                .find_syntax_by_extension("clj")
+                .or_else(|| self.syntax_set.find_syntax_by_name("Clojure"))
+        } else {
+            None
+        }
+    }
+
+    fn syntax_from_first_line(&self, path: &Path) -> Option<&SyntaxReference> {
+        let file = File::open(path).ok()?;
+        let mut line = String::new();
+        BufReader::new(file).read_line(&mut line).ok()?;
+        self.syntax_set.find_syntax_by_first_line(&line)
     }
 
     /// Drop cached state from `line` onward (call after editing `line`).
@@ -255,8 +272,9 @@ mod tests {
             assert_eq!(h.syntax_name(), "Clojure", "{name} should use Clojure");
         }
 
-        // existing files go through find_syntax_for_file first; the alias
-        // must still apply when the bundled grammar does not list the ext
+        // existing files used to go through find_syntax_for_file; the
+        // alias must still apply when the bundled grammar does not list
+        // the ext, including when a shebang would match another language
         let dir = scratch("clj-family");
         for (name, body) in [
             ("ui.cljs", "(defn hello [] \"hi\")\n"),
@@ -295,6 +313,25 @@ mod tests {
         let mut h = Highlighter::new();
         h.set_path(Some(&file));
         assert_eq!(h.syntax_name(), "Python");
+    }
+
+    #[test]
+    fn cljs_with_foreign_shebang_still_uses_clojure() {
+        let dir = scratch("cljs-shebang");
+        let shebang = "#!/usr/bin/env node\n(ns foo)\n";
+
+        let cljs = dir.join("tool.cljs");
+        std::fs::write(&cljs, shebang).unwrap();
+        let mut h = Highlighter::new();
+        h.set_path(Some(&cljs));
+        assert_eq!(h.syntax_name(), "Clojure");
+
+        // the same first line without a Clojure-family extension is JS,
+        // so this is actually exercising alias-over-shebang precedence
+        let tool = dir.join("tool");
+        std::fs::write(&tool, shebang).unwrap();
+        h.set_path(Some(&tool));
+        assert_eq!(h.syntax_name(), "JavaScript");
     }
 
     #[test]
