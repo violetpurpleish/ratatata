@@ -335,6 +335,18 @@ fn status_bar_shows_detected_syntax() {
     let mut app = new_app(dir, Some(file)).unwrap();
     let rows = render(&mut app);
     assert!(!row_contains(&rows, "[Plain Text]"));
+
+    for (name, body) in [("ui.cljs", "(defn hi [] 1)\n"), ("config.edn", "{:a 1}\n")] {
+        let dir = scratch(&format!("hlsyntax-{name}"));
+        let file = dir.join(name);
+        fs::write(&file, body).unwrap();
+        let mut app = new_app(dir, Some(file)).unwrap();
+        let rows = render(&mut app);
+        assert!(
+            row_contains(&rows, "[Clojure] ○ saved"),
+            "{name} should show Clojure in the status bar"
+        );
+    }
 }
 
 #[test]
