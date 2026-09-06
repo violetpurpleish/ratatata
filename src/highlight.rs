@@ -157,14 +157,26 @@ impl Highlighter {
             )
         };
 
+        // `load_defaults_newlines()` grammars expect the trailing `\n` that
+        // Buffer does not store. Without it, line-scoped contexts such as
+        // shebang comments stay open and paint the rest of the file.
+        let mut line_with_newline = String::with_capacity(line.len() + 1);
+        line_with_newline.push_str(line);
+        line_with_newline.push('\n');
+
         let ops = parse_state
-            .parse_line(line, self.syntax_set)
+            .parse_line(&line_with_newline, self.syntax_set)
             .unwrap_or_default();
         let mut highlight_state = HighlightState::new(&self.highlighter, initial_stack);
-        let iter =
-            RangedHighlightIterator::new(&mut highlight_state, &ops, line, &self.highlighter);
+        let iter = RangedHighlightIterator::new(
+            &mut highlight_state,
+            &ops,
+            &line_with_newline,
+            &self.highlighter,
+        );
         let mut out: Vec<(Option<TuiStyle>, Range<usize>)> = iter
             .map(|(style, _text, range)| (self.map_style(style), range))
+            .filter_map(|(style, range)| clip_range_to_line(range, line.len()).map(|r| (style, r)))
             .collect();
 
         // the iterator covers the whole line, but guard against a partial
@@ -211,6 +223,13 @@ impl Default for Highlighter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Drop the synthetic trailing newline from a syntect highlight range.
+fn clip_range_to_line(range: Range<usize>, line_len: usize) -> Option<Range<usize>> {
+    let start = range.start.min(line_len);
+    let end = range.end.min(line_len);
+    (start < end).then_some(start..end)
 }
 
 /// Extensions that should reuse Clojure highlighting when syntect has no
@@ -305,6 +324,25 @@ mod tests {
         }
     }
 
+    fn highlighter_for_file(name: &str, body: &str) -> (Highlighter, Vec<String>) {
+        let dir = scratch(name);
+        let file = dir.join("tool");
+        std::fs::write(&file, body).unwrap();
+        let mut h = Highlighter::new();
+        h.set_path(Some(&file));
+        (h, lines_of(body))
+    }
+
+    fn assert_ranges_stay_on_line(ops: &[(Option<TuiStyle>, Range<usize>)], line: &str) {
+        for (_, range) in ops {
+            assert!(
+                range.end <= line.len(),
+                "synthetic newline leaked into ranges"
+            );
+            assert!(!line[range.start..range.end].contains('\n'));
+        }
+    }
+
     #[test]
     fn detects_python_by_shebang() {
         let dir = scratch("shebang");
@@ -313,6 +351,48 @@ mod tests {
         let mut h = Highlighter::new();
         h.set_path(Some(&file));
         assert_eq!(h.syntax_name(), "Python");
+    }
+
+    #[test]
+    fn python_shebang_does_not_comment_the_rest_of_the_file() {
+        let body = "#!/usr/bin/env python3\nprint(\"hi\")\n";
+        let (mut h, lines) = highlighter_for_file("shebang-hl-py", body);
+        assert_eq!(h.syntax_name(), "Python");
+
+        let shebang_ops = styled_ranges(&mut h, &lines, 0).to_vec();
+        assert_ranges_stay_on_line(&shebang_ops, &lines[0]);
+
+        let after_shebang = styled_ranges(&mut h, &lines, 1).to_vec();
+        assert_ranges_stay_on_line(&after_shebang, &lines[1]);
+
+        let mut py = highlighter("tool.py");
+        let expected = styled_ranges(&mut py, &lines_of("print(\"hi\")\n"), 0).to_vec();
+        assert!(
+            expected.iter().any(|(s, _)| s.is_some()),
+            "Python print line must actually highlight"
+        );
+        assert_eq!(after_shebang, expected);
+    }
+
+    #[test]
+    fn node_shebang_does_not_comment_the_rest_of_the_file() {
+        let body = "#!/usr/bin/env node\nconsole.log(\"hi\")\n";
+        let (mut h, lines) = highlighter_for_file("shebang-hl-js", body);
+        assert_eq!(h.syntax_name(), "JavaScript");
+
+        let shebang_ops = styled_ranges(&mut h, &lines, 0).to_vec();
+        assert_ranges_stay_on_line(&shebang_ops, &lines[0]);
+
+        let after_shebang = styled_ranges(&mut h, &lines, 1).to_vec();
+        assert_ranges_stay_on_line(&after_shebang, &lines[1]);
+
+        let mut js = highlighter("tool.js");
+        let expected = styled_ranges(&mut js, &lines_of("console.log(\"hi\")\n"), 0).to_vec();
+        assert!(
+            expected.iter().any(|(s, _)| s.is_some()),
+            "JavaScript console.log line must actually highlight"
+        );
+        assert_eq!(after_shebang, expected);
     }
 
     #[test]
