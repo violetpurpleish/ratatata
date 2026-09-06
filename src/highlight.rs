@@ -70,22 +70,33 @@ impl Highlighter {
     /// heuristics such as shebangs) and drop the highlight cache.
     pub fn set_path(&mut self, path: Option<&Path>) {
         let syntax = match path {
-            Some(path) => {
-                // by extension + first-line heuristics (reads the file)
-                let by_file = self.syntax_set.find_syntax_for_file(path).ok().flatten();
-                // fallback for files that don't exist yet: extension only
-                let by_ext = path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .and_then(|ext| self.syntax_set.find_syntax_by_extension(ext));
-                by_file
-                    .or(by_ext)
-                    .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
-            }
+            Some(path) => self
+                .syntax_for_path(path)
+                .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text()),
             None => self.syntax_set.find_syntax_plain_text(),
         };
         self.syntax = syntax.clone();
         self.invalidate_from(0);
+    }
+
+    /// Syntect's bundled Clojure grammar lists `.clj` (and sometimes
+    /// `.cljc`). ClojureScript and EDN share that syntax, so fall back to
+    /// it when the dump has no grammar of its own for the extension.
+    fn syntax_for_path(&self, path: &Path) -> Option<&SyntaxReference> {
+        // by extension + first-line heuristics (reads the file)
+        let by_file = self.syntax_set.find_syntax_for_file(path).ok().flatten();
+        // fallback for files that don't exist yet: extension only
+        let ext = path.extension().and_then(|ext| ext.to_str());
+        let by_ext = ext.and_then(|ext| self.syntax_set.find_syntax_by_extension(ext));
+        by_file.or(by_ext).or_else(|| {
+            if ext.is_some_and(is_clojure_family_alias) {
+                self.syntax_set
+                    .find_syntax_by_extension("clj")
+                    .or_else(|| self.syntax_set.find_syntax_by_name("Clojure"))
+            } else {
+                None
+            }
+        })
     }
 
     /// Drop cached state from `line` onward (call after editing `line`).
@@ -185,6 +196,15 @@ impl Default for Highlighter {
     }
 }
 
+/// Extensions that should reuse Clojure highlighting when syntect has no
+/// dedicated grammar. `.clj` is omitted because the bundled dump already
+/// maps it.
+fn is_clojure_family_alias(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("cljs")
+        || ext.eq_ignore_ascii_case("cljc")
+        || ext.eq_ignore_ascii_case("edn")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +239,52 @@ mod tests {
     fn detects_rust_by_extension() {
         let h = highlighter("src/main.rs");
         assert_eq!(h.syntax_name(), "Rust");
+    }
+
+    #[test]
+    fn clojure_family_extensions_use_clojure_syntax() {
+        for name in [
+            "core.clj",
+            "core.cljs",
+            "core.cljc",
+            "data.edn",
+            "CORE.CLJS",
+            "Data.EDN",
+        ] {
+            let h = highlighter(name);
+            assert_eq!(h.syntax_name(), "Clojure", "{name} should use Clojure");
+        }
+
+        // existing files go through find_syntax_for_file first; the alias
+        // must still apply when the bundled grammar does not list the ext
+        let dir = scratch("clj-family");
+        for (name, body) in [
+            ("ui.cljs", "(defn hello [] \"hi\")\n"),
+            ("config.edn", "{:port 8080}\n"),
+            ("shared.cljc", "(def n 1)\n"),
+        ] {
+            let file = dir.join(name);
+            std::fs::write(&file, body).unwrap();
+            let mut h = Highlighter::new();
+            h.set_path(Some(&file));
+            assert_eq!(h.syntax_name(), "Clojure", "{name} should use Clojure");
+        }
+    }
+
+    #[test]
+    fn cljs_and_edn_highlight_like_clojure() {
+        let sample = lines_of("(def foo \"hi\")\n");
+        let mut clj = highlighter("core.clj");
+        let expected = styled_ranges(&mut clj, &sample, 0).to_vec();
+        assert!(
+            expected.iter().any(|(s, _)| s.is_some()),
+            "Clojure sample must actually highlight"
+        );
+
+        for name in ["core.cljs", "data.edn"] {
+            let mut h = highlighter(name);
+            assert_eq!(styled_ranges(&mut h, &sample, 0), expected.as_slice());
+        }
     }
 
     #[test]
