@@ -31,8 +31,8 @@ pub fn detect_color_support() -> ColorSupport {
     )
 }
 
-/// Truecolor is advertised by `COLORTERM=truecolor` / `24bit`, or by a
-/// terminfo family whose name ends in `-direct` (the 24-bit convention).
+/// Truecolor is advertised by `COLORTERM=truecolor` / `24bit`, a known
+/// truecolor terminal name, or a name ending in `-direct`.
 pub fn detect_color_support_from_env(colorterm: Option<&str>, term: Option<&str>) -> ColorSupport {
     if truecolor_advertised(colorterm, term) {
         ColorSupport::TrueColor
@@ -52,7 +52,15 @@ pub fn truecolor_advertised(colorterm: Option<&str>, term: Option<&str>) -> bool
     }
     if let Some(term) = term {
         let term = term.trim();
-        if term.ends_with("-direct") {
+        // SSH normally preserves TERM, but may omit COLORTERM. Only match
+        // dedicated names of known truecolor terminals; generic xterm,
+        // screen and tmux names alone do not promise RGB support.
+        if term.ends_with("-direct")
+            || matches!(
+                term,
+                "xterm-ghostty" | "xterm-kitty" | "alacritty" | "foot" | "foot-extra" | "wezterm"
+            )
+        {
             return true;
         }
     }
@@ -349,6 +357,27 @@ mod tests {
     }
 
     #[test]
+    fn dedicated_terminal_names_are_truecolor_without_colorterm() {
+        // SSH can forward TERM without forwarding COLORTERM.
+        for term in [
+            "xterm-ghostty",
+            "xterm-kitty",
+            "alacritty",
+            "foot",
+            "foot-extra",
+            "wezterm",
+        ] {
+            for colorterm in [None, Some("")] {
+                assert_eq!(
+                    detect_color_support_from_env(colorterm, Some(term)),
+                    ColorSupport::TrueColor,
+                    "TERM={term}, COLORTERM={colorterm:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn colorterm_24bit_is_truecolor() {
         assert_eq!(
             detect_color_support_from_env(Some("24bit"), Some("xterm-256color")),
@@ -389,7 +418,10 @@ mod tests {
             Some("xterm"),
             Some("linux"),
             Some("screen"),
+            Some("tmux"),
             Some("dumb"),
+            Some("screen.xterm-ghostty"),
+            Some("xterm-kitty-unknown"),
         ] {
             assert_eq!(
                 detect_color_support_from_env(None, term),
