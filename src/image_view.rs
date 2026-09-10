@@ -18,6 +18,8 @@ use ratatui_image::Resize;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 
+use crate::theme::{self, ColorSupport};
+
 /// Extensions treated as images and previewed instead of opened as text.
 /// These are the formats the `image` crate decodes out of the box.
 const IMAGE_EXTENSIONS: &[&str] = &[
@@ -97,7 +99,7 @@ impl ImagePreview {
     /// small images remain at native size. In particular, a tall image is
     /// reduced enough to fit its full height rather than being clipped below
     /// the viewport.
-    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, color_support: ColorSupport) {
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -132,6 +134,23 @@ impl ImagePreview {
             // The protocol was fitted to this exact area, so leaving clipping
             // disabled guarantees the complete image remains visible.
             frame.render_widget(Image::new(protocol), area);
+            // Half-blocks are ordinary cells with RGB foreground/background
+            // pixels. Adapt both after rendering, including cached protocols.
+            // Native graphics protocols and their placeholder cells must be
+            // left untouched.
+            if color_support != ColorSupport::TrueColor
+                && matches!(protocol, Protocol::Halfblocks(_))
+            {
+                let buffer = frame.buffer_mut();
+                for y in area.top()..area.bottom() {
+                    for x in area.left()..area.right() {
+                        if let Some(cell) = buffer.cell_mut((x, y)) {
+                            cell.fg = theme::adapt_image_color(color_support, cell.fg);
+                            cell.bg = theme::adapt_image_color(color_support, cell.bg);
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -63,7 +63,7 @@ pub(super) fn snap_char_down(s: &str, mut b: usize) -> usize {
 /// `None` styles render as plain text; spans overlapping `sel` (a byte range
 /// on this line) get the theme's selection background, and spans inside a
 /// search match (`matches`, char ranges with a "current match" flag) get the
-/// match background. On ANSI-16 terminals, RGB styles are mapped; the
+/// match background. On limited-color terminals, RGB styles are mapped; the
 /// truecolor path leaves them unchanged.
 pub(super) fn clip_ops<'a>(
     line: &'a str,
@@ -75,8 +75,8 @@ pub(super) fn clip_ops<'a>(
     color_support: ColorSupport,
 ) -> Vec<Span<'a>> {
     let pal = theme::ui_palette(color_support, PALETTE);
-    let search_current = theme::adapt_color(color_support, SEARCH_CURRENT_BG);
-    let search_other = theme::adapt_color(color_support, SEARCH_OTHER_BG);
+    let search_current = pal.warning;
+    let search_other = pal.selection;
     let mut cols = 0;
     let mut end_char = start_char;
     for c in line.chars().skip(start_char) {
@@ -137,13 +137,13 @@ pub(super) fn clip_ops<'a>(
                 } else {
                     search_other
                 };
-                style = style.bg(bg);
+                style = theme::highlight_style(color_support, style, bg);
             }
             if sel.is_some_and(|(sa, sb)| ca >= sa && cb <= sb) {
                 if style.fg.is_none() {
                     style = style.fg(pal.fg);
                 }
-                style = style.bg(pal.selection);
+                style = theme::highlight_style(color_support, style, pal.selection);
             }
             let text = expand_tabs(&line[ca..cb]);
             if style == Style::default() {

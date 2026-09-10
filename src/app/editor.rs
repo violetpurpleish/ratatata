@@ -20,7 +20,7 @@ impl App {
         if let Some(preview) = &mut self.image {
             let inner = block.inner(area);
             frame.render_widget(block, area);
-            preview.draw(frame, inner);
+            preview.draw(frame, inner, self.color_support);
             return;
         }
 
@@ -167,7 +167,7 @@ impl App {
                             );
                         let caret = Paragraph::new(Span::styled(
                             symbol,
-                            self.paint_style(caret_style.unwrap_or_default().bg(warning)),
+                            self.highlight_style(caret_style.unwrap_or_default(), warning),
                         ));
                         frame.render_widget(caret, Rect::new(cx, cy, 1, 1));
                     }
@@ -269,7 +269,7 @@ impl App {
                         );
                     let caret = Paragraph::new(Span::styled(
                         symbol,
-                        self.paint_style(caret_style.unwrap_or_default().bg(warning)),
+                        self.highlight_style(caret_style.unwrap_or_default(), warning),
                     ));
                     frame.render_widget(caret, Rect::new(cx, cy, 1, 1));
                 }

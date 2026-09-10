@@ -88,8 +88,10 @@ const FOCUS_COLOR: Color = PALETTE.accent;
 const TOPBAR_PILL_BG_HOVER: Color = PALETTE.muted;
 
 /// Background of the current search match (same yellow as the block caret).
+#[cfg(test)]
 const SEARCH_CURRENT_BG: Color = PALETTE.warning;
 /// Background of the other search matches.
+#[cfg(test)]
 const SEARCH_OTHER_BG: Color = PALETTE.selection;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -253,8 +255,8 @@ impl App {
         theme::ui_palette(self.color_support, PALETTE)
     }
 
-    fn paint_style(&self, style: Style) -> Style {
-        theme::adapt_style(self.color_support, style)
+    fn highlight_style(&self, style: Style, bg: Color) -> Style {
+        theme::highlight_style(self.color_support, style, bg)
     }
 
     fn pane_block(&self, title: String, title_fg: Color, focused: bool) -> Block<'static> {

@@ -112,6 +112,24 @@ fn render_buffer(app: &mut App) -> ratatui::buffer::Buffer {
     terminal.backend().buffer().clone()
 }
 
+fn assert_supported_colors(buffer: &ratatui::buffer::Buffer, support: ColorSupport) {
+    for cell in buffer.content() {
+        for color in [cell.fg, cell.bg] {
+            match support {
+                ColorSupport::TrueColor => {}
+                ColorSupport::Indexed256 => assert!(
+                    !matches!(color, Color::Rgb(..)),
+                    "unsupported color: {color:?}"
+                ),
+                ColorSupport::Ansi16 => assert!(
+                    !matches!(color, Color::Rgb(..) | Color::Indexed(16..=255)),
+                    "unsupported color: {color:?}"
+                ),
+            }
+        }
+    }
+}
+
 fn render_sized(app: &mut App, width: u16, height: u16) {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();

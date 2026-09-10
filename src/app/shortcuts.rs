@@ -141,14 +141,18 @@ pub(super) fn pill_spans(
     color_support: ColorSupport,
 ) -> Vec<Span<'static>> {
     let pal = theme::ui_palette(color_support, PALETTE);
-    let hover_bg = theme::adapt_color(color_support, TOPBAR_PILL_BG_HOVER);
+    let hover_bg = if color_support == ColorSupport::Ansi16 {
+        pal.selection
+    } else {
+        theme::adapt_color(color_support, TOPBAR_PILL_BG_HOVER)
+    };
     let mut key_style = Style::default()
         .fg(theme::adapt_color(color_support, action.key_color()))
         .add_modifier(Modifier::BOLD);
     let mut label_style = Style::default().fg(if hovered { pal.fg } else { pal.muted });
     if hovered {
-        key_style = key_style.bg(hover_bg);
-        label_style = label_style.bg(hover_bg);
+        key_style = theme::highlight_style(color_support, key_style, hover_bg);
+        label_style = theme::highlight_style(color_support, label_style, hover_bg);
     }
     vec![
         Span::styled(format!("{} ", action.key_label()), key_style),

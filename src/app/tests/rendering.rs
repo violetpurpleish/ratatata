@@ -462,3 +462,154 @@ fn ansi16_fallback_uses_named_colors_instead_of_rgb() {
     assert_eq!(border.style().fg, Some(FOCUS_COLOR));
     assert_eq!(buf.cell((0, 0)).unwrap().style().bg, Some(PALETTE.bg));
 }
+
+#[test]
+fn ansi16_syntax_keeps_keywords_functions_and_strings_distinct() {
+    let dir = scratch("ansi16-syntax");
+    let file = dir.join("code.rs");
+    fs::write(&file, "fn main() {\n    let msg = \"hi\";\n}\n").unwrap();
+    let mut app = new_app(dir, Some(file)).unwrap();
+    app.set_color_support(ColorSupport::Ansi16);
+    app.focus = Focus::Sidebar; // Keep the caret out of the syntax sample.
+    let buf = render_buffer(&mut app);
+    for (position, expected) in [
+        ((31, 3), Color::LightMagenta),
+        ((34, 3), Color::LightBlue),
+        ((46, 4), Color::LightGreen),
+    ] {
+        assert_eq!(buf.cell(position).unwrap().fg, expected);
+    }
+}
+
+#[test]
+fn ansi16_selected_parent_directory_remains_readable() {
+    let dir = scratch("ansi16-parent");
+    let mut app = new_app(dir, None).unwrap();
+    app.set_color_support(ColorSupport::Ansi16);
+    app.sidebar.selected = app
+        .sidebar
+        .entries
+        .iter()
+        .position(|e| e.kind == Kind::Parent)
+        .unwrap();
+    let buf = render_buffer(&mut app);
+    let cell = buf
+        .cell((app.sidebar_area.x + 3, app.sidebar_area.y + 1))
+        .unwrap();
+    assert_eq!(cell.symbol(), ".");
+    assert_ne!(cell.fg, cell.bg, "selected parent directory is invisible");
+}
+
+#[test]
+fn indexed256_renders_distinct_syntax_without_rgb() {
+    let dir = scratch("indexed256-syntax");
+    let file = dir.join("code.rs");
+    fs::write(&file, "fn main() {\n    let msg = \"hi\";\n}\n").unwrap();
+    let mut app = new_app(dir, Some(file)).unwrap();
+    app.set_color_support(ColorSupport::Indexed256);
+    app.focus = Focus::Sidebar;
+    let buf = render_buffer(&mut app);
+    assert_eq!(buf.cell((0, 0)).unwrap().bg, Color::Indexed(235));
+    for (position, expected) in [((31, 3), 183), ((34, 3), 111), ((46, 4), 151)] {
+        assert_eq!(buf.cell(position).unwrap().fg, Color::Indexed(expected));
+    }
+    assert_supported_colors(&buf, ColorSupport::Indexed256);
+}
+
+#[test]
+fn limited_color_selected_hidden_file_is_not_dimmed() {
+    let dir = scratch("fallback-hidden-selection");
+    fs::write(dir.join(".env"), "").unwrap();
+    for support in [ColorSupport::Ansi16, ColorSupport::Indexed256] {
+        let mut app = new_app(dir.clone(), None).unwrap();
+        app.set_color_support(support);
+        app.handle_key(ctrl('h'));
+        app.sidebar.selected = app
+            .sidebar
+            .entries
+            .iter()
+            .position(|e| e.name == ".env")
+            .unwrap();
+        let buf = render_buffer(&mut app);
+        let cell = buf
+            .cell((
+                app.sidebar_area.x + 3,
+                app.sidebar_area.y + 1 + app.sidebar.selected as u16,
+            ))
+            .unwrap();
+        assert_eq!(cell.symbol(), ".");
+        assert_ne!(cell.fg, cell.bg);
+        assert!(!cell.modifier.contains(Modifier::DIM));
+    }
+}
+
+#[test]
+fn limited_color_text_selection_and_search_keep_text_readable() {
+    for support in [ColorSupport::Ansi16, ColorSupport::Indexed256] {
+        let pal = theme::ui_palette(support, PALETTE);
+        let light_text = if support == ColorSupport::Ansi16 {
+            Color::White
+        } else {
+            Color::Indexed(231)
+        };
+        let dark_text = if support == ColorSupport::Ansi16 {
+            Color::Black
+        } else {
+            Color::Indexed(16)
+        };
+        for foreground in [PALETTE.muted, PALETTE.warning, PALETTE.success] {
+            for (selection, matches, expected_fg, expected_bg) in [
+                (Some((0, 3)), vec![], light_text, pal.selection),
+                (None, vec![(0, 3, false)], light_text, pal.selection),
+                (None, vec![(0, 3, true)], dark_text, pal.warning),
+                // Selection wins over a current search match.
+                (Some((0, 3)), vec![(0, 3, true)], light_text, pal.selection),
+            ] {
+                let spans = clip_ops(
+                    "abc",
+                    &[(Some(Style::default().fg(foreground)), 0..3)],
+                    0,
+                    3,
+                    selection,
+                    &matches,
+                    support,
+                );
+                assert_eq!(spans[0].style.fg, Some(expected_fg));
+                assert_eq!(spans[0].style.bg, Some(expected_bg));
+            }
+        }
+    }
+}
+
+#[test]
+fn limited_color_caret_and_hover_have_contrasting_text() {
+    let dir = scratch("fallback-caret-hover");
+    let file = dir.join("code.rs");
+    fs::write(&file, "fn main() {}\n").unwrap();
+    for support in [ColorSupport::Ansi16, ColorSupport::Indexed256] {
+        for wrap in [false, true] {
+            let mut app = new_app(dir.clone(), Some(file.clone())).unwrap();
+            app.set_color_support(support);
+            app.buffer.wrap = wrap;
+            app.hovered = Some(Shortcut::Save);
+            let buf = render_buffer(&mut app);
+            let caret = buf.cell((31, 3)).unwrap();
+            assert_eq!(caret.symbol(), "f");
+            assert_eq!(caret.bg, app.pal().warning);
+            assert_eq!(
+                caret.fg,
+                if support == ColorSupport::Ansi16 {
+                    Color::Black
+                } else {
+                    Color::Indexed(16)
+                }
+            );
+            let button = topbar_button(&app, Shortcut::Save);
+            for x in button.x..button.right() {
+                let cell = buf.cell((x, button.y)).unwrap();
+                assert_ne!(cell.fg, cell.bg);
+            }
+            assert_supported_colors(&buf, support);
+        }
+    }
+}

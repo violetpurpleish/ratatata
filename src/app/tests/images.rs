@@ -180,6 +180,47 @@ fn preview_renders_halfblock_pixels() {
 }
 
 #[test]
+fn ansi16_halfblock_preview_does_not_emit_rgb() {
+    let dir = scratch("img-ansi16");
+    let file = dir.join("pic.png");
+    write_test_png(&file);
+    let mut app = new_app(dir, Some(file)).unwrap();
+    app.set_color_support(ColorSupport::Ansi16);
+    let buf = render_buffer(&mut app);
+    let cell = buf.cell((29, 2)).unwrap();
+    assert!(matches!(cell.symbol(), "▀" | "▄"));
+    assert_supported_colors(&buf, ColorSupport::Ansi16);
+}
+
+#[test]
+fn halfblock_color_depth_survives_cached_frames_and_resize() {
+    let dir = scratch("img-color-depth");
+    let file = dir.join("pic.png");
+    write_test_png(&file);
+    let mut app = new_app(dir, Some(file)).unwrap();
+    let original = render_buffer(&mut app).cell((29, 2)).unwrap().clone();
+    assert!(matches!(original.fg, Color::Rgb(..)));
+    for support in [ColorSupport::Indexed256, ColorSupport::Ansi16] {
+        app.set_color_support(support);
+        for _ in 0..2 {
+            assert!(app.image.as_ref().unwrap().has_cached_protocol());
+            let buf = render_buffer(&mut app);
+            let pixel = buf.cell((29, 2)).unwrap();
+            assert_eq!(pixel.symbol(), original.symbol());
+            if support == ColorSupport::Indexed256 {
+                assert!(matches!(pixel.fg, Color::Indexed(16..=255)));
+                assert!(matches!(pixel.bg, Color::Indexed(16..=255)));
+            }
+            assert_supported_colors(&buf, support);
+        }
+        render_sized(&mut app, 80, 20);
+        assert_supported_colors(&render_buffer(&mut app), support);
+    }
+    app.set_color_support(ColorSupport::TrueColor);
+    assert_eq!(render_buffer(&mut app).cell((29, 2)).unwrap(), &original);
+}
+
+#[test]
 fn large_preview_is_contained_without_clipping() {
     let dir = scratch("imglarge");
     let file = dir.join("large.png");

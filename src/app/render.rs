@@ -9,10 +9,11 @@ impl App {
         // Paint the terminal with the theme's base color first. Individual
         // widgets and syntax spans then layer their semantic foregrounds and
         // backgrounds over it.
-        frame.render_widget(
-            Block::default().style(Style::default().bg(self.pal().bg)),
-            frame.area(),
-        );
+        let mut base = Style::default().bg(self.pal().bg);
+        if self.color_support != ColorSupport::TrueColor {
+            base = base.fg(self.pal().fg);
+        }
+        frame.render_widget(Block::default().style(base), frame.area());
 
         let pills = self.shortcut_pills();
         let [top_area, main, status_area] = Layout::vertical([
@@ -151,7 +152,7 @@ impl App {
             }
             let selected = i == self.sidebar.selected;
             if selected {
-                style = style.bg(self.pal().selection);
+                style = self.highlight_style(style, self.pal().selection);
             }
             let marker = if selected { "▶ " } else { "  " };
             rows.push(Line::from(vec![

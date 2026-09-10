@@ -40,7 +40,7 @@ Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`
 
 - **Sidebar + editor split** — browse directories on the left, edit files on the right
 - **Clickable shortcut bar** — the keyboard shortcuts are shown as buttons in a bar at the top; click one to run it, hover it for a longer description in the status bar. The keys and the buttons are the same actions, so they always behave identically
-- **Catppuccin Mocha UI theme** — semantic application colors supplied by [ratatui-themes](https://crates.io/crates/ratatui-themes), including themed panels, selections, search matches, caret, status bar and shortcut buttons. Truecolor terminals (Ghostty, `COLORTERM=truecolor`, or a `*-direct` terminfo) keep the RGB theme unchanged. Terminals that do not advertise truecolor (for example xfce4-terminal) map the same semantic palette onto ANSI 16; if a colored focus border would be invisible, the focused pane title is reverse/bold instead. There is no theme toggle, and `NO_COLOR` / `FORCE_COLOR` are ignored so a sandbox cannot grayscale Ghostty.
+- **Catppuccin Mocha UI theme** — semantic application colors supplied by [ratatui-themes](https://crates.io/crates/ratatui-themes), including themed panels, selections, search matches, caret, status bar and shortcut buttons. Truecolor terminals (`COLORTERM=truecolor` / `24bit`, or a `*-direct` terminal name) keep the RGB theme unchanged. Otherwise, terminal names advertising `256color` (such as `xterm-256color`, `screen-256color`, and `tmux-256color`) use the extended color cube and grayscale ramp to approximate the theme. Other terminals use ANSI 16 with deliberate syntax colors, white-on-blue selections, and contrasting text for search matches, hovered shortcuts and the caret. Selected hidden files remain readable instead of dimmed. There is no theme toggle, and `NO_COLOR` / `FORCE_COLOR` are ignored so a sandbox cannot grayscale Ghostty.
 - **Syntax highlighting** — Sublime Text grammars via [syntect](https://github.com/trishume/syntect), detected by extension and first-line heuristics; re-highlights incrementally as you type, only re-parsing lines from the edit point onward
 - **Parinfer Smart Mode** — for `.clj`, `.cljs`, `.cljc`, and `.edn` files, indentation and parentheses stay in sync as you type (a user edit and the automatic adjustment undo together). Cursor-only movement updates the remembered caret without re-running the engine. Other file types are unchanged; incomplete forms (for example an unclosed string) are left as typed.
 - **Clipboard integration** — copy/cut/paste through the system clipboard ([arboard](https://github.com/1Password/arboard)), with bracketed-paste support for terminals that send it
@@ -51,7 +51,7 @@ Installs as the `rat` command (the binary name is set explicitly in `Cargo.toml`
 - **Go to line** — Ctrl+G (or the **line** shortcut button) prompts for a 1-based line number and jumps there, keeping the cursor visible. Invalid input is a status message.
 - **Toggle sidebar** — Ctrl+B (or the **files** shortcut button) hides or shows the file tree so the editor can use the full width. Directory and selection survive. Ctrl+O while the sidebar is hidden shows it and focuses it.
 - **Word wrap** — Ctrl+W wraps long lines at word boundaries (a single unbreakable word still hard-breaks) instead of scrolling horizontally; navigation (arrows, Home/End, PgUp/PgDn, mouse) follows the visual rows, and wrapping re-flows automatically on resize
-- **Image previews** — opening an image file (png, jpg, gif, webp, bmp, …) renders it in the editor pane via the terminal's graphics protocol: kitty graphics where supported (kitty, Ghostty, WezTerm, iTerm2, …), unicode half-blocks elsewhere. Images are contained within the pane without clipping; small images remain at native size, while larger images are scaled using logical cell dimensions. Esc closes the preview and restores the previously open text buffer (including word wrap); closing a preview that was the first thing opened lands on empty untitled
+- **Image previews** — opening an image file (png, jpg, gif, webp, bmp, …) renders it in the editor pane via the terminal's graphics protocol: kitty graphics where supported (kitty, Ghostty, WezTerm, iTerm2, …), unicode half-blocks elsewhere. Half-block pixels use the detected color depth (RGB, 256 colors, or ANSI 16), independently of the syntax palette; native graphics retain their original colors. Images are contained within the pane without clipping; small images remain at native size, while larger images are scaled using logical cell dimensions. Esc closes the preview and restores the previously open text buffer (including word wrap); closing a preview that was the first thing opened lands on empty untitled
 - **Hide dotfiles** — the sidebar hides names starting with `.` by default (`..` is always listed). Ctrl+H (or the **hidden** shortcut button) toggles them. Hidden entries are dimmed when shown.
 - **Safe saves** — writes are staged beside the destination and published after a complete, synced write. Existing symlinks are retained and their targets updated; existing permissions and Unix ownership are preserved. Save-as asks before replacing an existing file and keeps failed filenames editable.
 - **Line endings** — CRLF files remain CRLF when edited, with carriage returns kept out of the editable text. Unedited files round-trip exactly; editing files with mixed LF/CRLF endings normalizes their separators to CRLF.
@@ -110,7 +110,7 @@ rat -V | --version
 cargo test
 ```
 
-The test suite covers buffer editing, undo/redo coalescing, save/save-as flows, dirty-buffer guards, sidebar navigation and hide/show, mouse interactions, image-preview opening/closing/restoring, unwrapped-line clipping, truecolor vs ANSI-16 palettes, hide-dotfiles listing, find and replace, go-to-line, Parinfer Smart Mode on Clojure-family files, and headless rendering (including syntax-highlight colors) via ratatui's `TestBackend`.
+The test suite covers buffer editing, undo/redo coalescing, save/save-as flows, dirty-buffer guards, sidebar navigation and hide/show, mouse interactions, image-preview opening/closing/restoring, unwrapped-line clipping, truecolor/256-color/ANSI-16 palettes, selection and highlight contrast, image color depth across cached frames and resizing, hide-dotfiles listing, find and replace, go-to-line, Parinfer Smart Mode on Clojure-family files, and headless rendering (including syntax-highlight colors) via ratatui's `TestBackend`.
 
 ## How it works
 
@@ -131,7 +131,7 @@ src/
 │                 shared fixtures live in buffer/tests.rs
 ├── sidebar.rs    scrollable directory listing (dirs first, ".." entry,
 │                 optional hide-dotfiles)
-├── theme.rs      truecolor detection and ANSI 16 fallback for the UI palette
+├── theme.rs      color-depth detection, UI/syntax palettes and image quantization
 ├── image_view.rs image previews: decode via the `image` crate, render
 │                 through the kitty/sixel/iTerm2 protocols (or half-blocks)
 │                 via ratatui-image
