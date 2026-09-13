@@ -26,7 +26,7 @@ use two_face::theme::{EmbeddedLazyThemeSet, EmbeddedThemeName};
 
 fn syntax_set() -> &'static SyntaxSet {
     static SET: OnceLock<SyntaxSet> = OnceLock::new();
-    SET.get_or_init(SyntaxSet::load_defaults_newlines)
+    SET.get_or_init(two_face::syntax::extra_newlines)
 }
 
 fn theme() -> &'static Theme {
@@ -275,6 +275,50 @@ mod tests {
     fn detects_rust_by_extension() {
         let h = highlighter("src/main.rs");
         assert_eq!(h.syntax_name(), "Rust");
+    }
+
+    #[test]
+    fn detects_typescript_and_tsx_by_extension() {
+        for (name, syntax) in [
+            ("src/main.ts", "TypeScript"),
+            ("src/App.tsx", "TypeScriptReact"),
+        ] {
+            let h = highlighter(name);
+            assert_eq!(h.syntax_name(), syntax, "{name} should use {syntax}");
+        }
+    }
+
+    #[test]
+    fn detects_languages_from_the_extra_grammar_bundle() {
+        for (name, syntax) in [
+            ("Cargo.toml", "TOML"),
+            ("Dockerfile", "Dockerfile"),
+            ("main.swift", "Swift"),
+            ("shader.wgsl", "WGSL"),
+            ("Component.vue", "Vue Component"),
+            ("build.zig", "Zig"),
+            ("Main.kt", "Kotlin"),
+            ("schema.proto", "Protocol Buffer"),
+        ] {
+            let h = highlighter(name);
+            assert_eq!(h.syntax_name(), syntax, "{name} should use {syntax}");
+        }
+    }
+
+    #[test]
+    fn typescript_and_tsx_are_actually_highlighted() {
+        for (name, sample) in [
+            ("main.ts", "interface User { name: string }"),
+            ("App.tsx", "const button = <Button>Save</Button>;"),
+        ] {
+            let lines = lines_of(sample);
+            let mut h = highlighter(name);
+            let ops = styled_ranges(&mut h, &lines, 0);
+            assert!(
+                ops.iter().any(|(style, _)| style.is_some()),
+                "{name} should contain highlighted ranges"
+            );
+        }
     }
 
     #[test]
